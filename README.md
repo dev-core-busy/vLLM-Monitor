@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.9.0-blue)
+![Version](https://img.shields.io/badge/version-0.9.1-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -159,16 +159,19 @@ Kopfzeile (`0` = wird gerade aktualisiert). Die JSON-API unter
 
 ## Als Dienst betreiben (systemd)
 
-**Am einfachsten** über das mitgelieferte `setup.sh`:
+**Am einfachsten** über das interaktive `setup.sh` (Menü, keine Parameter):
 
 ```bash
-./setup.sh install <ZIEL-IP> "9081:Qwen,9082:Gemma" 0.0.0.0 8899
-./setup.sh status
-./setup.sh uninstall
+./setup.sh
 ```
 
-Das legt beide systemd-**User**-Services an, startet sie und aktiviert Linger
-(Autostart nach Reboot). Alternativ von Hand — Beispiel für den Collector:
+Das Menü bietet: **Abhängigkeitsprüfung**, **Installation** (fragt Ziel-IP,
+Instanzen, Bind und Port ab, legt beide systemd-**User**-Services an, startet sie
+und aktiviert Linger für Autostart nach Reboot) sowie **vollständige
+Deinstallation** (Dienste entfernen, optional Datenbank/Einstellungen/Linger).
+Zuletzt genutzte Werte werden als Vorgabe gemerkt.
+
+Alternativ von Hand — Beispiel für den Collector:
 
 ```ini
 # ~/.config/systemd/user/vllm-collector.service

@@ -4,6 +4,15 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.9.1] – 2026-07-09
+
+### Geändert
+- **`setup.sh` ist jetzt menügeführt** (keine Parameter mehr): Abhängigkeitsprüfung
+  (python3 ≥ 3.8, Standardmodule, systemd-User-Bus, Dateien), interaktive
+  Installation mit Abfrage von Ziel-IP/Instanzen/Bind/Port und gemerkten
+  Vorgaben, sowie vollständige Deinstallation (optional inkl. Datenbank,
+  Einstellungen und Linger).
+
 ## [0.9.0] – 2026-07-09
 
 Großer Dashboard-Ausbau.

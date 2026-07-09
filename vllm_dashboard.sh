@@ -31,7 +31,7 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
 DEFAULT_PORT = 8899
