@@ -1,0 +1,16 @@
+# Laufzeit-/Messdaten
+vllm_metrics.db
+*.db-wal
+*.db-shm
+*.log
+
+# Lokales / Sensibles (nicht veröffentlichen)
+session.sh
+.claude/
+.*_last_ip
+id_ed25519*
+*.pem
+
+# Python
+__pycache__/
+*.pyc
