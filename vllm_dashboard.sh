@@ -25,11 +25,14 @@ Nur Python-Standardbibliothek (http.server, sqlite3) – Chart.js via CDN.
 import os
 import sys
 import json
+import math
+import time
+import html
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
 DEFAULT_PORT = 8899
@@ -55,35 +58,67 @@ AVG_LAT = {
 # Datenaufbereitung
 # ---------------------------------------------------------------------------
 
+def _clean(v):
+    """None / NaN / Inf -> None (sonst wird das JSON ungültig)."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _sanitize(p):
+    return {k: (v if k == "t" else _clean(v)) for k, v in p.items()}
+
+
 def build_series(range_s):
     if not os.path.exists(DB_PATH):
         return {"error": "Keine Datenbank – läuft der Collector?", "models": {}}
 
-    import time
     now = int(time.time())
     since = now - range_s
+    # Downsampling: pro Reihe ~800 Zielpunkte -> Bucket-Breite in Sekunden
+    bucket = max(1, range_s // 800)
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT * FROM samples WHERE ts >= ? ORDER BY model, ts", (since,)
-    ).fetchall()
+    # Je Zeit-Bucket und Modell den JÜNGSTEN Datenpunkt (bewahrt Counter-
+    # Monotonie, damit die Raten korrekt bleiben).
+    in_window = conn.execute("""
+        SELECT s.* FROM samples s
+        JOIN (SELECT model, MAX(ts) AS mts
+                FROM samples WHERE ts >= ?
+               GROUP BY model, ts / ?) g
+          ON s.model = g.model AND s.ts = g.mts
+        ORDER BY s.model, s.ts
+    """, (since, bucket)).fetchall()
+    # Ankerpunkt je Modell direkt VOR dem Fenster – nur zur Delta-Berechnung
+    # des ersten sichtbaren Punktes (nicht angezeigt).
+    anchors = conn.execute("""
+        SELECT s.* FROM samples s
+        JOIN (SELECT model, MAX(ts) AS mts
+                FROM samples WHERE ts < ? GROUP BY model) a
+          ON s.model = a.model AND s.ts = a.mts
+    """, (since,)).fetchall()
     conn.close()
 
+    anchor_by_model = {r["model"]: r for r in anchors}
     models = {}
-    for r in rows:
+    for r in in_window:
         models.setdefault(r["model"], []).append(r)
 
     out = {}
     for model, pts in models.items():
         series = []
-        prev = None
+        prev = anchor_by_model.get(model)   # Seed: Punkt vor dem Fenster
         for r in pts:
             p = {
                 "t": r["ts"] * 1000,
                 "running": r["requests_running"],
                 "waiting": r["requests_waiting"],
-                "kv": (r["kv_cache_usage"] or 0.0) * 100.0,   # in %
+                "kv": (_clean(r["kv_cache_usage"]) or 0.0) * 100.0,   # in %
             }
             if prev is not None:
                 dt = r["ts"] - prev["ts"]
@@ -101,7 +136,7 @@ def build_series(range_s):
                         dc = (r[ccol] or 0) - (prev[ccol] or 0)
                         ds = (r[scol] or 0) - (prev[scol] or 0)
                         p[field] = round(scale * ds / dc, 2) if dc > 0 and ds >= 0 else None
-            series.append(p)
+            series.append(_sanitize(p))
             prev = r
         out[model] = series
 
@@ -128,9 +163,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(build_series(range_s)).encode("utf-8")
             self._send(200, "application/json", body)
         elif parsed.path in ("/", "/index.html"):
-            sub = ("– " + LABEL) if LABEL else ""
-            html = PAGE.replace("__SUBTITLE__", sub).replace("__VERSION__", __version__)
-            self._send(200, "text/html; charset=utf-8", html.encode("utf-8"))
+            sub = ("– " + html.escape(LABEL)) if LABEL else ""
+            page = PAGE.replace("__SUBTITLE__", sub).replace("__VERSION__", __version__)
+            self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
         else:
             self._send(404, "text/plain", b"not found")
 

@@ -29,7 +29,7 @@ import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib import request, error
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -300,14 +300,6 @@ def scan_ports(ip, ports):
             except Exception:
                 pass
     return sorted(open_ports)
-
-
-def host_alive(ip):
-    """Grobe Erreichbarkeit ueber einen schnellen Connect-Versuch."""
-    for p in (22, 80, 443, 3128, 9082, 8000, 11434):
-        if port_open(ip, p, timeout=1.0):
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------

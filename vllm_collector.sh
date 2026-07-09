@@ -28,7 +28,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -104,17 +104,28 @@ _running = True
 # Datenbank
 # ---------------------------------------------------------------------------
 
-def init_db(conn):
+def _ddl(name):
     cols = ",\n            ".join("%s REAL" % c for c in COLUMNS)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS samples (
-            ts    INTEGER NOT NULL,
-            port  INTEGER NOT NULL,
-            model TEXT    NOT NULL,
-            %s,
-            PRIMARY KEY (ts, port)
-        )
-    """ % cols)
+    return ("CREATE TABLE IF NOT EXISTS %s (\n"
+            "            ts    INTEGER NOT NULL,\n"
+            "            port  INTEGER NOT NULL,\n"
+            "            model TEXT    NOT NULL,\n"
+            "            %s,\n"
+            "            PRIMARY KEY (ts, port, model)\n"
+            "        )" % (name, cols))
+
+
+def init_db(conn):
+    conn.execute(_ddl("samples"))
+    # Migration: alter PK (ts, port) -> (ts, port, model), damit mehrere
+    # Modelle auf demselben Port nicht dieselbe Zeile überschreiben.
+    info = conn.execute("PRAGMA table_info(samples)").fetchall()
+    pk = {row[1] for row in info if row[5] > 0}   # row[5] = pk-Position
+    if pk and pk != {"ts", "port", "model"}:
+        conn.execute("ALTER TABLE samples RENAME TO _samples_old")
+        conn.execute(_ddl("samples"))
+        conn.execute("INSERT OR IGNORE INTO samples SELECT * FROM _samples_old")
+        conn.execute("DROP TABLE _samples_old")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_model_ts ON samples(model, ts)")
     conn.commit()
 
@@ -181,6 +192,7 @@ def extract(samples):
     Rückgabe: { model_name: {spalte: wert, ...}, ... }
     """
     per_model = {}
+    kv_acc = {}   # model -> [summe, anzahl] für Mittelwert der KV-Cache-Auslastung
 
     def bucket(model):
         return per_model.setdefault(model, {c: None for c in COLUMNS})
@@ -193,7 +205,13 @@ def extract(samples):
         if name in GAUGE_COUNTER:
             col = GAUGE_COUNTER[name]
             b = bucket(model)
-            b[col] = (b[col] or 0.0) + val   # über evtl. mehrere Serien summieren
+            if col == "kv_cache_usage":
+                # Prozentwert: über mehrere Engines mitteln, nicht summieren
+                acc = kv_acc.setdefault(model, [0.0, 0])
+                acc[0] += val
+                acc[1] += 1
+            else:
+                b[col] = (b[col] or 0.0) + val   # Counter/Requests: summieren
 
         elif name == "vllm:request_success_total":
             b = bucket(model)
@@ -208,6 +226,10 @@ def extract(samples):
                     b = bucket(model); b[sum_col] = (b[sum_col] or 0.0) + val
                 elif name == base + "_count":
                     b = bucket(model); b[cnt_col] = (b[cnt_col] or 0.0) + val
+
+    for model, (s, c) in kv_acc.items():
+        if c:
+            bucket(model)["kv_cache_usage"] = s / c
 
     return per_model
 

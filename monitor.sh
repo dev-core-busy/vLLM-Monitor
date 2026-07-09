@@ -45,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib import request, error
 from datetime import datetime, timezone
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -386,6 +386,9 @@ def collect_vllm_info(schemes, ip, port):
         "/metrics",
     ])
 
+    # Doppelte Pfade entfernen (Reihenfolge bleibt erhalten) -> keine doppelten Requests
+    base_paths = list(dict.fromkeys(base_paths))
+
     data = fetch_all(schemes, ip, port, base_paths)
 
     # Ergebnisse strukturieren
@@ -395,6 +398,17 @@ def collect_vllm_info(schemes, ip, port):
             if key in data:
                 r = data[key]
                 results[path] = {**r, "scheme": scheme}
+
+    # /metrics ist Prometheus-TEXT, kein JSON -> roh holen (http_json liefert sonst data=None)
+    for scheme in schemes:
+        code, headers, body, elapsed = http_request(
+            scheme, ip, port, "/metrics", timeout=METRICS_TIMEOUT)
+        if code == 200 and body:
+            results["/metrics"] = {
+                "data": body, "headers": headers,
+                "elapsed_ms": elapsed, "scheme": scheme, "raw": True,
+            }
+            break
 
     # Health direkt mit http_request (http_json verwarft leere Bodies – /health antwortet oft mit 200 + leer)
     for scheme in schemes:
