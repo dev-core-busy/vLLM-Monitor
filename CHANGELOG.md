@@ -4,6 +4,25 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.9.2] – 2026-07-09
+
+### Behoben
+- **Kacheln verschiebbar:** komplette Neuimplementierung als *schwebendes* Ziehen
+  (Kachel hebt sich an und folgt der Maus) mit Platzhalter-Lücke; Landepunkt per
+  Treffer-Test statt Nächste-Mitte-Distanz → kein zufälliges Springen mehr.
+- **Alarm-Glocke / Statuszeile:** fehlendes `#status`-Element ergänzt (führte zu
+  einem stillen Fehler bei jedem Klick/Update); Glocke gibt jetzt klare
+  Rückmeldung. Sichere-Herkunft-Erkennung via `window.isSecureContext` – über
+  http/LAN erscheint ein verständlicher Hinweis statt „nicht erlaubt".
+- **Live-Countdown:** zeigt „aktualisiert vor N s" (zählt hoch, springt bei jedem
+  SSE-Push zurück) statt bei 0 s einzufrieren.
+
+### Geändert
+- Mouseover-Tooltips für alle Bedienelemente der oberen Leiste.
+- `Cache-Control: no-store`, damit kein veralteter Stand aus dem Browser-Cache läuft.
+- Effizienz: Fadenkreuz zeichnet nur bei Positionsänderung neu; `capacityOf`
+  einmal je Reihe statt je Datenpunkt.
+
 ## [0.9.1] – 2026-07-09
 
 ### Geändert

@@ -31,7 +31,7 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
 DEFAULT_PORT = 8899
@@ -283,6 +283,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -337,6 +338,15 @@ PAGE = r"""<!DOCTYPE html>
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;}
   .card h2{font-size:12px;margin:0 0 6px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;}
   canvas{max-height:240px;}
+  .card h2.handle,.kpi h3.handle{cursor:grab;user-select:none;touch-action:none;
+    margin:-10px -12px 6px;padding:6px 12px;border-radius:10px 10px 0 0;background:rgba(127,127,127,.06);}
+  .kpi h3.handle{margin:-12px -14px 8px;padding:8px 14px;}
+  .card h2.handle:hover,.kpi h3.handle:hover{background:rgba(88,166,255,.12);}
+  .card h2.handle:active,.kpi h3.handle:active{cursor:grabbing;}
+  .card h2.handle::before,.kpi h3.handle::before{content:"⠿ ";color:var(--muted);opacity:.7;}
+  .dragging{opacity:.97;box-shadow:0 12px 34px rgba(0,0,0,.55);outline:2px solid var(--accent);
+    border-radius:10px;transform:scale(1.02);cursor:grabbing;}
+  .placeholder-slot{border:2px dashed var(--accent);border-radius:10px;background:rgba(88,166,255,.08);}
   table{width:100%;border-collapse:collapse;font-size:12px;}
   th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--grid);}
   th{color:var(--muted);font-weight:600;}
@@ -348,8 +358,8 @@ PAGE = r"""<!DOCTYPE html>
 <header>
   <h1>vLLM Monitor <span style="color:var(--muted)">__SUBTITLE__</span></h1>
   <span style="font-size:11px;color:var(--muted)">v__VERSION__</span>
-  <label class="ctl">Zeitraum
-    <select id="range">
+  <label class="ctl" title="Zeitfenster, das in allen Diagrammen dargestellt wird. Bei großen Fenstern werden die Daten automatisch verdichtet (Downsampling).">Zeitraum
+    <select id="range" title="Zeitfenster der Diagramme (15 min bis 7 Tage)">
       <option value="900">15 min</option>
       <option value="3600" selected>1 h</option>
       <option value="21600">6 h</option>
@@ -357,25 +367,30 @@ PAGE = r"""<!DOCTYPE html>
       <option value="604800">7 Tage</option>
     </select>
   </label>
-  <label class="ctl">Latenz
-    <select id="pct"><option value="p50">P50</option><option value="p95" selected>P95</option><option value="p99">P99</option></select>
-  </label>
-  <label class="ctl">Aktualisierung
-    <select id="mode">
-      <option value="live" selected>Live (SSE)</option>
-      <option value="5">alle 5 s</option>
-      <option value="15">alle 15 s</option>
-      <option value="60">alle 60 s</option>
-      <option value="off">Aus</option>
+  <label class="ctl" title="Welches Latenz-Perzentil in den Panels TTFT / E2E / ITL und den KPI-Karten gezeigt wird. P95 = 95 % der Requests sind schneller; P99 zeigt Ausreißer, P50 den Median.">Latenz
+    <select id="pct" title="Latenz-Perzentil für die Latenz-Panels und KPI-Karten">
+      <option value="p50" title="Median – die Hälfte der Requests ist schneller">P50</option>
+      <option value="p95" selected title="95 % der Requests sind schneller (typischer SLA-Wert)">P95</option>
+      <option value="p99" title="99 % der Requests sind schneller – zeigt Ausreißer/Spitzen">P99</option>
     </select>
   </label>
-  <button id="reload">Neu laden</button>
-  <button id="resetzoom" title="Zoom zurücksetzen">Zoom ⟲</button>
-  <button id="export">Export CSV</button>
-  <button id="exportjson">JSON</button>
-  <button id="theme" title="Hell/Dunkel">◐</button>
-  <button id="notif" title="Alarm-Benachrichtigungen">🔔</button>
+  <label class="ctl" title="Wie sich das Dashboard aktualisiert: Live schiebt Daten per Server-Sent-Events (Push), oder festes Poll-Intervall, oder ganz aus.">Aktualisierung
+    <select id="mode" title="Aktualisierungsmodus des Dashboards">
+      <option value="live" selected title="Live-Push vom Server (SSE) – niedrigste Verzögerung">Live (SSE)</option>
+      <option value="5" title="Alle 5 Sekunden neu abfragen">alle 5 s</option>
+      <option value="15" title="Alle 15 Sekunden neu abfragen">alle 15 s</option>
+      <option value="60" title="Alle 60 Sekunden neu abfragen">alle 60 s</option>
+      <option value="off" title="Keine automatische Aktualisierung – nur per „Neu laden“">Aus</option>
+    </select>
+  </label>
+  <button id="reload" title="Daten und Instanz-Konfiguration sofort neu laden">Neu laden</button>
+  <button id="resetzoom" title="Zoom/Verschieben in allen Diagrammen zurücksetzen (Mausrad = Zoom, Ziehen = Verschieben)">Zoom ⟲</button>
+  <button id="export" title="Aktuell angezeigte Zeitreihen als CSV-Datei herunterladen">Export CSV</button>
+  <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">JSON</button>
+  <button id="theme" title="Zwischen hellem und dunklem Design umschalten (wird gespeichert)">◐</button>
+  <button id="notif" title="Browser-Benachrichtigungen bei Warnungen (KV-Cache voll, Fehler, Instanz offline) erlauben">🔔</button>
   <span id="countdown"></span>
+  <span id="status" style="flex-basis:100%;text-align:right"></span>
 </header>
 
 <div class="kpis" id="kpis"></div>
@@ -413,6 +428,78 @@ let charts={}, lastData=null, lastConfig=null, hoverX=null, resets=[];
 const shortModel=m=>m.split("/").pop();
 const css=v=>getComputedStyle(document.body).getPropertyValue(v).trim();
 
+// --- Verschiebbare Kacheln (Drag & Drop, Reihenfolge in localStorage) ---
+function orderBy(items,saved,idOf){
+  if(!saved||!saved.length)return items;
+  const map=new Map(items.map(x=>[idOf(x),x]));
+  const out=[];
+  saved.forEach(id=>{if(map.has(id)){out.push(map.get(id));map.delete(id);}});
+  map.forEach(v=>out.push(v));
+  return out;
+}
+function saveOrder(container,key){
+  const ids=[...container.children].map(c=>c.dataset.id).filter(Boolean);
+  localStorage.setItem(key,JSON.stringify(ids));
+}
+function afterElement(container,x,y,ph){
+  // Treffer-Test: über welcher Karte steht der Zeiger? -> davor/danach einsortieren.
+  // Kein Sprung, wenn der Zeiger über der Lücke oder zwischen den Karten liegt.
+  const cards=[...container.querySelectorAll(":scope > [data-id]:not(.dragging)")];
+  if(!cards.length) return null;
+  for(const c of cards){
+    const b=c.getBoundingClientRect();
+    if(x>=b.left && x<=b.right && y>=b.top && y<=b.bottom){
+      return (x < b.left + b.width/2) ? c : c.nextElementSibling;
+    }
+  }
+  const first=cards[0].getBoundingClientRect();
+  const last=cards[cards.length-1].getBoundingClientRect();
+  if(y > last.bottom) return null;       // unterhalb aller Karten -> ans Ende
+  if(y < first.top)   return cards[0];   // oberhalb aller Karten -> vor die erste
+  return ph;                             // dazwischen -> Platzhalter nicht bewegen
+}
+function makeSortable(container,onSave){
+  container.querySelectorAll(".handle").forEach(h=>{
+    if(h._sortBound)return; h._sortBound=true;
+    h.addEventListener("pointerdown",e=>{
+      if(e.button!==0)return;
+      const el=h.closest("[data-id]"); if(!el)return;
+      e.preventDefault();
+      const rect=el.getBoundingClientRect();
+      const offX=e.clientX-rect.left, offY=e.clientY-rect.top;
+      // Platzhalter-Lücke einsetzen, Karte "anheben" (schwebt, folgt der Maus)
+      const ph=document.createElement("div");
+      ph.className="placeholder-slot"; ph.style.height=rect.height+"px";
+      container.insertBefore(ph,el);
+      window._dragging=true; el.classList.add("dragging");
+      el.style.position="fixed"; el.style.width=rect.width+"px";
+      el.style.left=(e.clientX-offX)+"px"; el.style.top=(e.clientY-offY)+"px";
+      el.style.zIndex="1000"; el.style.pointerEvents="none";
+      document.body.appendChild(el);   // aus dem Raster nehmen -> keine Sibling-Rückkopplung
+      const move=ev=>{
+        ev.preventDefault();
+        el.style.left=(ev.clientX-offX)+"px";
+        el.style.top=(ev.clientY-offY)+"px";
+        const ref=afterElement(container,ev.clientX,ev.clientY,ph);
+        if(ref!==ph){ if(ref)container.insertBefore(ph,ref); else container.appendChild(ph); }
+      };
+      const up=()=>{
+        document.removeEventListener("pointermove",move);
+        document.removeEventListener("pointerup",up);
+        document.removeEventListener("pointercancel",up);
+        container.insertBefore(el,ph); ph.remove();
+        el.classList.remove("dragging");
+        el.style.position=el.style.width=el.style.left=el.style.top=el.style.zIndex=el.style.pointerEvents="";
+        window._dragging=false;
+        onSave&&onSave();
+      };
+      document.addEventListener("pointermove",move,{passive:false});
+      document.addEventListener("pointerup",up);
+      document.addEventListener("pointercancel",up);
+    });
+  });
+}
+
 // Plugin: synchrones Fadenkreuz + Counter-Reset-Marker
 const overlay={id:"overlay",afterDraw(c){
   const {ctx,chartArea:a,scales:{x}}=c;
@@ -432,7 +519,8 @@ function mkChart(spec){
   charts[spec.id]=new Chart(ctx,{type:"line",data:{datasets:[]},plugins:[overlay],
     options:{animation:false,responsive:true,maintainAspectRatio:false,
       interaction:{mode:"index",intersect:false},
-      onHover:(e,els,c)=>{const p=c.scales.x.getValueForPixel(e.x);hoverX=p;Object.values(charts).forEach(o=>o.draw());},
+      onHover:(e,els,c)=>{const p=c.scales.x.getValueForPixel(e.x);if(p===hoverX)return;hoverX=p;
+        requestAnimationFrame(()=>Object.values(charts).forEach(o=>o.draw()));},
       scales:{
         x:{type:"linear",ticks:{callback:v=>new Date(v).toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit"}),maxRotation:0,color:css("--muted")},grid:{color:css("--grid")}},
         y:{beginAtZero:true,...yMax,ticks:{color:css("--muted")},grid:{color:css("--grid")}}
@@ -460,10 +548,11 @@ function datasets(models,spec){
   const ds=[];
   names.forEach((name,mi)=>{
     const color=COLORS[mi%COLORS.length];
+    const cap=spec.id==="kvtok"?capacityOf(name):null;
     fieldsFor(spec).forEach(f=>{
       const data=models[name].map(p=>{
         let y=p[f.k];
-        if(spec.id==="kvtok"){const cap=capacityOf(name);y=(cap&&p.kv!=null)?Math.round(p.kv/100*cap):null;}
+        if(spec.id==="kvtok"){y=(cap&&p.kv!=null)?Math.round(p.kv/100*cap):null;}
         return {x:p.t,y};
       }).filter(p=>p.y!==null&&p.y!==undefined);
       ds.push({label:shortModel(name)+(f.l?" · "+f.l:""),data,borderColor:color,backgroundColor:color,
@@ -476,22 +565,24 @@ function datasets(models,spec){
 function num(v,d){return v==null?"–":(typeof v==="number"?(Number.isInteger(v)?v:v.toFixed(d==null?1:d)):v);}
 
 function renderKPIs(){
-  if(!lastData)return;
+  if(!lastData||window._dragging)return;   // laufendes Verschieben nicht stören
   const wrap=document.getElementById("kpis");wrap.innerHTML="";
   const alerts=[];
-  Object.keys(lastData.models).sort().forEach(model=>{
+  const saved=JSON.parse(localStorage.getItem("vllm_kpi_order")||"null");
+  const pct=document.getElementById("pct").value;
+  orderBy(Object.keys(lastData.models).sort(),saved,m=>m).forEach(model=>{
     const s=lastData.models[model];const last=s.length?s[s.length-1]:{};
     const inst=lastConfig?lastConfig.instances.find(x=>x.model===model):null;
     const online=inst?inst.online:true;
     const kv=last.kv||0, wait=last.waiting||0, err=last.error_ps||0;
-    const kvBad=kv>90, waitWarn=wait>0, errBad=err>0;
+    const kvBad=kv>90, errBad=err>0;
     if(!online)alerts.push(shortModel(model)+": offline");
     if(kvBad)alerts.push(shortModel(model)+": KV "+kv.toFixed(0)+"%");
     if(errBad)alerts.push(shortModel(model)+": Fehler");
-    const pct=document.getElementById("pct").value;
     const el=document.createElement("div");
     el.className="kpi"+((kvBad||errBad||!online)?" alert":"");
-    el.innerHTML=`<h3><span class="dot ${online?"on":"off"}"></span>${shortModel(model)}
+    el.dataset.id=model;
+    el.innerHTML=`<h3 class="handle"><span class="dot ${online?"on":"off"}"></span>${shortModel(model)}
         <span style="margin-left:auto;font-size:11px;color:var(--muted)">${online?"online":"offline"}</span></h3>
       <div class="row">
         <div class="metric"><b>${num(last.running,0)}</b>aktiv${wait?` / ${num(wait,0)} wartend`:""}</div>
@@ -502,6 +593,7 @@ function renderKPIs(){
       </div>`;
     wrap.appendChild(el);
   });
+  makeSortable(wrap,()=>saveOrder(wrap,"vllm_kpi_order"));
   window._alerts=alerts;maybeNotify(alerts);
 }
 
@@ -536,7 +628,7 @@ async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).js
 async function fetchOnce(){try{applySeries(await(await fetch("/api/series?range="+rangeVal())).json());}catch(e){document.getElementById("status").textContent="Fehler: "+e;}}
 
 // --- Refresh-Steuerung: Live (SSE) oder Intervall ---
-let es=null, remaining=0, period=0;
+let es=null, remaining=0, period=0, lastMsg=Date.now();
 const rangeVal=()=>document.getElementById("range").value;
 const cd=document.getElementById("countdown");
 function setCd(t,cls){cd.className=cls||"";cd.textContent=t;}
@@ -547,9 +639,9 @@ function startRefresh(){
   const mode=document.getElementById("mode").value;
   if(mode==="off"){setCd("Aktualisierung aus","paused");fetchOnce();return;}
   if(mode==="live"){
-    period=__PUSH__; remaining=period;
+    lastMsg=Date.now();
     es=new EventSource("/api/stream?range="+rangeVal());
-    es.onmessage=e=>{applySeries(JSON.parse(e.data));remaining=period;};
+    es.onmessage=e=>{applySeries(JSON.parse(e.data));lastMsg=Date.now();};
     es.onerror=()=>{stopAll();document.getElementById("mode").value="15";startRefresh();};
     fetchOnce();
   }else{
@@ -559,10 +651,14 @@ function startRefresh(){
 setInterval(()=>{
   const mode=document.getElementById("mode").value;
   if(mode==="off")return;
+  if(mode==="live"){
+    const secs=Math.max(0,Math.round((Date.now()-lastMsg)/1000));
+    setCd("↻ Live · aktualisiert vor "+secs+" s", secs<=1?"now":"");
+    return;
+  }
   remaining-=1;
-  if(mode!=="live"&&remaining<=0){fetchOnce();remaining=period;setCd("↻ 0 s – aktualisiert","now");return;}
-  const label=mode==="live"?"Live – nächster Push":"nächste Aktualisierung";
-  setCd("↻ "+label+" in "+Math.max(0,remaining)+" s",mode==="live"?"now":"");
+  if(remaining<=0){fetchOnce();remaining=period;setCd("↻ 0 s – aktualisiert","now");return;}
+  setCd("↻ nächste Aktualisierung in "+remaining+" s","");
 },1000);
 
 // --- Export ---
@@ -578,10 +674,12 @@ function exportCSV(){
 }
 
 // --- Notifications ---
+function notifyAvailable(){return (typeof window.Notification!=="undefined" && !!window.Notification
+  && typeof window.Notification.requestPermission==="function");}
 function maybeNotify(alerts){
-  if(!alerts.length||Notification.permission!=="granted")return;
+  if(!alerts.length||!notifyAvailable()||Notification.permission!=="granted")return;
   const key=alerts.join("|");if(key===window._lastNotifKey)return;window._lastNotifKey=key;
-  new Notification("vLLM Monitor – Warnung",{body:alerts.join("\n")});
+  try{new Notification("vLLM Monitor – Warnung",{body:alerts.join("\n")});}catch(e){}
 }
 
 // --- Theme ---
@@ -594,13 +692,20 @@ function applyTheme(t){document.body.dataset.theme=t;localStorage.setItem("vllm_
 // --- Init ---
 function buildGrid(){
   const g=document.getElementById("charts");
-  CHARTS.forEach(spec=>{const d=document.createElement("div");d.className="card";
-    d.innerHTML=`<h2>${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;g.appendChild(d);});
-  // GPU-Hardware-Platzhalter (#15)
-  const gpu=document.createElement("div");gpu.className="card";
-  gpu.innerHTML=`<h2>GPU-Hardware</h2><div class="placeholder">SM-Auslastung, VRAM, Temperatur, Watt –
-    noch nicht verfügbar.<br>Benötigt einen DCGM-/node-Exporter auf dem Zielhost (Roadmap).</div>`;
-  g.appendChild(gpu);
+  const saved=JSON.parse(localStorage.getItem("vllm_chart_order")||"null");
+  const gpuSpec={id:"gpu",gpu:true,title:"GPU-Hardware"};
+  orderBy(CHARTS.concat([gpuSpec]),saved,s=>s.id).forEach(spec=>{
+    const d=document.createElement("div");d.className="card";d.dataset.id=spec.id;
+    if(spec.gpu){
+      d.innerHTML=`<h2 class="handle">GPU-Hardware</h2>
+        <div class="placeholder">SM-Auslastung, VRAM, Temperatur, Watt – noch nicht verfügbar.<br>
+        Benötigt einen DCGM-/node-Exporter auf dem Zielhost (Roadmap).</div>`;
+    }else{
+      d.innerHTML=`<h2 class="handle">${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;
+    }
+    g.appendChild(d);
+  });
+  makeSortable(g,()=>saveOrder(g,"vllm_chart_order"));
   CHARTS.forEach(mkChart);
 }
 
@@ -614,7 +719,32 @@ document.getElementById("resetzoom").onclick=()=>Object.values(charts).forEach(c
 document.getElementById("export").onclick=exportCSV;
 document.getElementById("exportjson").onclick=()=>lastData&&download("vllm_metrics.json",JSON.stringify(lastData,null,2),"application/json");
 document.getElementById("theme").onclick=()=>applyTheme(document.body.dataset.theme==="dark"?"light":"dark");
-document.getElementById("notif").onclick=()=>Notification.requestPermission();
+document.getElementById("notif").onclick=()=>{
+  const st=document.getElementById("status");
+  const say=t=>{ if(st)st.textContent=t; };
+  // Notifications brauchen einen sicheren Kontext (HTTPS oder http://localhost).
+  if(!window.isSecureContext || !notifyAvailable()){
+    alert("Browser-Benachrichtigungen brauchen einen sicheren Kontext (HTTPS oder http://localhost).\n\n"+
+          "Du rufst das Dashboard über http://"+location.hostname+" auf – dort lässt der Browser sie nicht zu "+
+          "(deshalb 'nicht erlaubt').\n\nAlternativen: das Dashboard per HTTPS bereitstellen, oder direkt auf der "+
+          "Maschine über http://localhost:"+location.port+" öffnen.\n\nDie farbigen Alarm-Rahmen an den Kacheln "+
+          "funktionieren unabhängig davon.");
+    say("Benachrichtigungen über http://"+location.hostname+" nicht möglich (nur HTTPS/localhost).");
+    return;
+  }
+  if(Notification.permission==="granted"){ say("Benachrichtigungen sind bereits aktiv."); alert("Benachrichtigungen sind bereits aktiv."); return; }
+  if(Notification.permission==="denied"){
+    alert("Benachrichtigungen sind im Browser für diese Seite blockiert.\n\nBitte über das Schloss-/Info-Symbol "+
+          "in der Adressleiste unter 'Benachrichtigungen' auf 'Zulassen' setzen.");
+    say("Benachrichtigungen im Browser blockiert – bitte in den Seiteneinstellungen erlauben."); return;
+  }
+  Notification.requestPermission().then(p=>{
+    if(p==="granted"){ say("Benachrichtigungen aktiviert.");
+      try{new Notification("vLLM Monitor",{body:"Benachrichtigungen sind jetzt aktiv."});}catch(e){}
+      alert("Benachrichtigungen aktiviert."); }
+    else { say("Benachrichtigungen: "+p); alert("Benachrichtigungen wurden nicht erlaubt ("+p+")."); }
+  });
+};
 fetchConfig();
 startRefresh();
 setInterval(fetchConfig,30000);

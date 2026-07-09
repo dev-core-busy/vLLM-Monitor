@@ -45,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib import request, error
 from datetime import datetime, timezone
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 # ---------------------------------------------------------------------------
 # Konfiguration
