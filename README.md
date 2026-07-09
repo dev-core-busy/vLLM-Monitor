@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.8.1-blue)
+![Version](https://img.shields.io/badge/version-0.9.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -51,6 +51,11 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
   und JSON-Export für eine einzelne Instanz.
 - 🧰 **Null Abhängigkeiten** – reine Standardbibliothek, läuft überall wo
   Python 3.8+ vorhanden ist.
+- 🚦 **KPI-Karten & Alarme** – Farbampeln je Instanz, Schwellwert-Warnungen
+  (KV %, Fehler, offline) mit optionaler Browser-Benachrichtigung.
+- 📐 **Latenz-Perzentile P50/P95/P99** (TTFT/E2E/ITL) aus den Histogramm-Buckets.
+- ⚡ **Live-Push (SSE)**, Zoom/Pan, synchrones Fadenkreuz, Counter-Reset-Marker,
+  CSV-/JSON-Export, Hell/Dunkel, Health-Übersicht & KV-Kapazität je Instanz.
 
 ## Architektur
 

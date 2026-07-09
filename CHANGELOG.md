@@ -4,6 +4,30 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.9.0] – 2026-07-09
+
+Großer Dashboard-Ausbau.
+
+### Neu
+- **KPI-Statuskarten** je Instanz mit Farbampeln und **Schwellwert-Alarmen**
+  (KV %, Fehler, offline) inkl. optionaler Browser-Benachrichtigung.
+- **Latenz-Perzentile P50/P95/P99** (TTFT/E2E/ITL) aus Histogramm-Buckets,
+  umschaltbar; ersetzt die reinen Mittelwerte.
+- Neue Panels: **Preemptions/s**, **Wartend nach Grund** (capacity/deferred),
+  **Requests nach Ergebnis** (stop/error/abort/length), **KV-Belegung in Tokens**
+  relativ zur Kapazität.
+- **Instanz-Übersicht** (Health, vLLM-Version, KV-Kapazität, max_model_len,
+  gpu_mem, Prefix-Cache) über die neue `config`-Tabelle und `/api/config`.
+- **Live-Push per Server-Sent-Events** (`/api/stream`) statt reinem Polling;
+  Aktualisierungsmodus wählbar (Live / 5 / 15 / 60 s / Aus).
+- **Zoom & Pan** (Mausrad/Drag), **synchrones Fadenkreuz** über alle Charts,
+  **Counter-Reset-Marker** (vLLM-Neustart).
+- **CSV-/JSON-Export**, **Hell/Dunkel-Umschalter**, **Modell-Toggle** (Legende),
+  responsives Layout, GPU-Hardware-Platzhalter (DCGM-Roadmap).
+- Collector: `host`-Spalte (Multi-Host-fähig), Histogramm-Buckets,
+  `waiting_by_reason`, `request_success` nach `finished_reason`, `config`-Tabelle
+  mit Health – inkl. automatischer Schema-Migration.
+
 ## [0.8.1] – 2026-07-09
 
 ### Behoben
