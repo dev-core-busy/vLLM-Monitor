@@ -33,7 +33,7 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -345,11 +345,14 @@ PAGE = r"""<!DOCTYPE html>
     --bg:#0f1419; --panel:#161b22; --border:#30363d; --grid:#21262d;
     --fg:#e6e6e6; --muted:#8b949e; --accent:#58a6ff;
     --ok:#3fb950; --warn:#d29922; --bad:#f85149;
+    --tile-min:430px; --card-h:240px;
   }
   [data-theme="light"]{
     --bg:#f6f8fa; --panel:#ffffff; --border:#d0d7de; --grid:#eaeef2;
     --fg:#1f2328; --muted:#57606a; --accent:#0969da;
   }
+  [data-density="kompakt"]{--tile-min:330px; --card-h:185px;}
+  [data-density="dicht"]{--tile-min:235px; --card-h:135px;}
   *{box-sizing:border-box}
   body{font-family:system-ui,sans-serif;margin:0;background:var(--bg);color:var(--fg);}
   header{padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--border);
@@ -359,6 +362,19 @@ PAGE = r"""<!DOCTYPE html>
                 border-radius:6px;padding:5px 9px;font-size:12px;cursor:pointer;}
   button:hover{border-color:var(--accent);}
   label.ctl{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:5px;}
+  .menuwrap{position:relative;display:inline-flex;}
+  .menu{position:absolute;top:125%;right:0;background:var(--panel);border:1px solid var(--border);
+    border-radius:8px;padding:8px;display:none;flex-direction:column;gap:6px;z-index:30;min-width:190px;
+    box-shadow:0 8px 24px rgba(0,0,0,.45);}
+  .menu.open{display:flex;}
+  .menu .mrow{display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:12px;}
+  .menu button{width:100%;text-align:left;}
+  .densgroup{display:inline-flex;gap:3px;align-items:center;}
+  .dbtn{padding:3px 5px;line-height:0;}
+  .dbtn .dg{width:22px;height:17px;display:block;fill:var(--muted);}
+  .dbtn:hover .dg{fill:var(--fg);}
+  .dbtn.active{border-color:var(--accent);}
+  .dbtn.active .dg{fill:var(--accent);}
   #countdown{margin-left:auto;font-size:12px;font-variant-numeric:tabular-nums;color:var(--accent);
              min-width:150px;text-align:right;}
   #countdown.now{color:var(--ok);} #countdown.paused{color:var(--muted);}
@@ -371,7 +387,7 @@ PAGE = r"""<!DOCTYPE html>
   .kpi .row{display:flex;flex-wrap:wrap;gap:12px;}
   .metric{font-size:12px;color:var(--muted);} .metric b{display:block;font-size:17px;color:var(--fg);}
   .metric.warn b{color:var(--warn);} .metric.bad b{color:var(--bad);}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:14px;padding:14px 16px;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(var(--tile-min),1fr));gap:14px;padding:14px 16px;}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;position:relative;}
   .card h2{font-size:12px;margin:0 0 6px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;}
   .cardbtns{position:absolute;top:5px;right:7px;display:flex;gap:3px;z-index:6;}
@@ -384,7 +400,7 @@ PAGE = r"""<!DOCTYPE html>
   .card.maximized canvas{max-height:calc(100vh - 90px);}
   .hidden-card{display:none !important;}
   #instcard.collapsed #insttable{display:none;}
-  canvas{max-height:240px;}
+  canvas{max-height:var(--card-h);}
   .card h2.handle,.kpi h3.handle{cursor:grab;user-select:none;touch-action:none;
     margin:-10px -12px 6px;padding:6px 12px;border-radius:10px 10px 0 0;background:rgba(127,127,127,.06);}
   .kpi h3.handle{margin:-12px -14px 8px;padding:8px 14px;}
@@ -399,6 +415,10 @@ PAGE = r"""<!DOCTYPE html>
   th{color:var(--muted);font-weight:600;}
   .placeholder{color:var(--muted);font-size:12px;padding:18px 4px;text-align:center;}
   #status{font-size:11px;color:var(--muted);}
+  #legend{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;padding:12px 16px 0;}
+  .lchip{display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;color:var(--fg);user-select:none;}
+  .lchip.off{opacity:.4;text-decoration:line-through;}
+  .ldot{width:11px;height:11px;border-radius:50%;display:inline-block;flex:0 0 auto;}
   #secbtn.insecure{border-color:var(--bad);color:var(--bad);}
   #secbtn.secure{border-color:var(--ok);color:var(--ok);}
   #secbanner{background:rgba(248,81,73,.14);color:var(--bad);border-bottom:1px solid var(--bad);
@@ -436,13 +456,11 @@ PAGE = r"""<!DOCTYPE html>
       <option value="604800">7 Tage</option>
     </select>
   </label>
-  <label class="ctl" title="Welches Latenz-Perzentil in den Panels TTFT / E2E / ITL und den KPI-Karten gezeigt wird. P95 = 95 % der Requests sind schneller; P99 zeigt Ausreißer, P50 den Median.">Latenz
-    <select id="pct" title="Latenz-Perzentil für die Latenz-Panels und KPI-Karten">
-      <option value="p50" title="Median – die Hälfte der Requests ist schneller">P50</option>
-      <option value="p95" selected title="95 % der Requests sind schneller (typischer SLA-Wert)">P95</option>
-      <option value="p99" title="99 % der Requests sind schneller – zeigt Ausreißer/Spitzen">P99</option>
-    </select>
-  </label>
+  <span class="densgroup" title="Kacheldichte – mehr Punkte = mehr, kleinere Kacheln">
+    <button class="dbtn" data-d="dicht" title="Klein, viele Kacheln (5×4)"><svg class="dg" viewBox="0 0 26 20"><circle cx="4.3" cy="4.0" r="1.3"/><circle cx="8.7" cy="4.0" r="1.3"/><circle cx="13.0" cy="4.0" r="1.3"/><circle cx="17.3" cy="4.0" r="1.3"/><circle cx="21.7" cy="4.0" r="1.3"/><circle cx="4.3" cy="8.0" r="1.3"/><circle cx="8.7" cy="8.0" r="1.3"/><circle cx="13.0" cy="8.0" r="1.3"/><circle cx="17.3" cy="8.0" r="1.3"/><circle cx="21.7" cy="8.0" r="1.3"/><circle cx="4.3" cy="12.0" r="1.3"/><circle cx="8.7" cy="12.0" r="1.3"/><circle cx="13.0" cy="12.0" r="1.3"/><circle cx="17.3" cy="12.0" r="1.3"/><circle cx="21.7" cy="12.0" r="1.3"/><circle cx="4.3" cy="16.0" r="1.3"/><circle cx="8.7" cy="16.0" r="1.3"/><circle cx="13.0" cy="16.0" r="1.3"/><circle cx="17.3" cy="16.0" r="1.3"/><circle cx="21.7" cy="16.0" r="1.3"/></svg></button>
+    <button class="dbtn" data-d="kompakt" title="Mittel (4×3)"><svg class="dg" viewBox="0 0 26 20"><circle cx="5.2" cy="5.0" r="1.7"/><circle cx="10.4" cy="5.0" r="1.7"/><circle cx="15.6" cy="5.0" r="1.7"/><circle cx="20.8" cy="5.0" r="1.7"/><circle cx="5.2" cy="10.0" r="1.7"/><circle cx="10.4" cy="10.0" r="1.7"/><circle cx="15.6" cy="10.0" r="1.7"/><circle cx="20.8" cy="10.0" r="1.7"/><circle cx="5.2" cy="15.0" r="1.7"/><circle cx="10.4" cy="15.0" r="1.7"/><circle cx="15.6" cy="15.0" r="1.7"/><circle cx="20.8" cy="15.0" r="1.7"/></svg></button>
+    <button class="dbtn" data-d="normal" title="Große Kacheln (3×2)"><svg class="dg" viewBox="0 0 26 20"><circle cx="6.5" cy="6.7" r="2.2"/><circle cx="13.0" cy="6.7" r="2.2"/><circle cx="19.5" cy="6.7" r="2.2"/><circle cx="6.5" cy="13.3" r="2.2"/><circle cx="13.0" cy="13.3" r="2.2"/><circle cx="19.5" cy="13.3" r="2.2"/></svg></button>
+  </span>
   <label class="ctl" title="Wie sich das Dashboard aktualisiert: Live schiebt Daten per Server-Sent-Events (Push), oder festes Poll-Intervall, oder ganz aus.">Aktualisierung
     <select id="mode" title="Aktualisierungsmodus des Dashboards">
       <option value="live" selected title="Live-Push vom Server (SSE) – niedrigste Verzögerung">Live (SSE)</option>
@@ -454,12 +472,24 @@ PAGE = r"""<!DOCTYPE html>
   </label>
   <button id="reload" title="Daten und Instanz-Konfiguration sofort neu laden">Neu laden</button>
   <button id="resetzoom" title="Zoom/Verschieben in allen Diagrammen zurücksetzen (Mausrad = Zoom, Ziehen = Verschieben)">Zoom ⟲</button>
-  <button id="export" title="Aktuell angezeigte Zeitreihen als CSV-Datei herunterladen">Export CSV</button>
-  <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">JSON</button>
   <button id="theme" title="Zwischen hellem und dunklem Design umschalten (wird gespeichert)">◐</button>
   <button id="notif" title="Browser-Benachrichtigungen bei Warnungen (KV-Cache voll, Fehler, Instanz offline) erlauben">🔔</button>
   <button id="secbtn" title="Verbindungssicherheit & Zertifikat">🔒</button>
   <button id="restore" title="Ausgeblendete Kacheln wieder einblenden" style="display:none">Ausgeblendet: 0 ⟲</button>
+  <div class="menuwrap">
+    <button id="gear" title="Weitere Optionen (Latenz-Perzentil, Export)">⚙</button>
+    <div id="gearmenu" class="menu">
+      <label class="mrow" title="Latenz-Perzentil für die Panels TTFT/E2E/ITL und die KPI-Karten. P95 = 95 % der Requests sind schneller; P99 zeigt Ausreißer, P50 den Median.">Latenz-Perzentil
+        <select id="pct">
+          <option value="p50">P50</option>
+          <option value="p95" selected>P95</option>
+          <option value="p99">P99</option>
+        </select>
+      </label>
+      <button id="export" title="Aktuell angezeigte Zeitreihen als CSV-Datei herunterladen">⬇ Export CSV</button>
+      <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">⬇ Export JSON</button>
+    </div>
+  </div>
   <span id="countdown"></span>
   <span id="status" style="flex-basis:100%;text-align:right"></span>
 </header>
@@ -475,6 +505,7 @@ PAGE = r"""<!DOCTYPE html>
   </tr></thead><tbody></tbody></table>
 </div>
 
+<div id="legend" title="Farb-Zuordnung der Modelle – Klick blendet ein Modell in allen Diagrammen aus/ein"></div>
 <div class="grid" id="charts"></div>
 
 <div id="secbanner" style="display:none">
@@ -572,6 +603,26 @@ function getCookie(name){
   return m?decodeURIComponent(m[1]):null;
 }
 const store={ get:k=>getCookie(k), set:(k,v)=>setCookie(k,v,365), del:k=>setCookie(k,"",-1) };
+
+// --- Stabile Modell-Farben + gemeinsame Legende (statt Legende je Diagramm) ---
+let modelColors={};
+const colorFor=m=>modelColors[m]||COLORS[0];
+function computeColors(models){
+  modelColors={}; Object.keys(models).sort().forEach((m,i)=>modelColors[m]=COLORS[i%COLORS.length]);
+}
+const hiddenModels=new Set(JSON.parse(store.get("vllm_hidden_models")||"[]"));
+const saveHiddenModels=()=>store.set("vllm_hidden_models",JSON.stringify([...hiddenModels]));
+function renderLegend(models){
+  const el=document.getElementById("legend"); if(!el)return;
+  el.innerHTML="";
+  Object.keys(models).sort().forEach(m=>{
+    const chip=document.createElement("span");
+    chip.className="lchip"+(hiddenModels.has(m)?" off":"");
+    chip.innerHTML='<span class="ldot" style="background:'+colorFor(m)+'"></span>'+shortModel(m);
+    chip.onclick=()=>{ hiddenModels.has(m)?hiddenModels.delete(m):hiddenModels.add(m); saveHiddenModels(); if(lastData)applySeries(lastData); };
+    el.appendChild(chip);
+  });
+}
 
 // --- Verschiebbare Kacheln (Drag & Drop, Reihenfolge in Cookie) ---
 function orderBy(items,saved,idOf){
@@ -671,7 +722,7 @@ function mkChart(spec){
         y:{beginAtZero:true,...yMax,ticks:{color:css("--muted")},grid:{color:css("--grid")}}
       },
       plugins:{
-        legend:{labels:{color:css("--fg"),boxWidth:11,font:{size:10}}},
+        legend:{display:false},
         zoom:{pan:{enabled:true,mode:"x"},zoom:{wheel:{enabled:true},drag:{enabled:false},pinch:{enabled:true},mode:"x"}},
         annotation:false
       }}});
@@ -692,7 +743,8 @@ function datasets(models,spec){
   const names=Object.keys(models).sort();
   const ds=[];
   names.forEach((name,mi)=>{
-    const color=COLORS[mi%COLORS.length];
+    if(hiddenModels.has(name))return;
+    const color=colorFor(name);
     const cap=spec.id==="kvtok"?capacityOf(name):null;
     fieldsFor(spec).forEach(f=>{
       const data=models[name].map(p=>{
@@ -768,6 +820,8 @@ function applySeries(j){
   lastData=j;
   resets=[];
   Object.values(j.models).forEach(s=>s.forEach(p=>{if(p.reset)resets.push(p.t);}));
+  computeColors(j.models);
+  renderLegend(j.models);
   CHARTS.forEach(spec=>{charts[spec.id].data.datasets=datasets(j.models,spec);charts[spec.id].update();});
   renderKPIs();
   const n=Object.values(j.models).reduce((a,s)=>a+s.length,0);
@@ -837,7 +891,7 @@ function applyTheme(t){document.body.dataset.theme=t;store.set("vllm_theme",t);
   // Chart-Farben neu setzen
   Object.values(charts).forEach(c=>{c.options.scales.x.ticks.color=css("--muted");c.options.scales.x.grid.color=css("--grid");
     c.options.scales.y.ticks.color=css("--muted");c.options.scales.y.grid.color=css("--grid");
-    c.options.plugins.legend.labels.color=css("--fg");c.update();});}
+    c.update();});}
 
 // --- Init ---
 function buildGrid(){
@@ -894,6 +948,20 @@ document.addEventListener("keydown",e=>{
 
 buildGrid();
 applyTheme(store.get("vllm_theme")||"dark");
+function applyDensity(d){
+  document.body.dataset.density=d; store.set("vllm_density",d);
+  document.querySelectorAll(".dbtn").forEach(b=>b.classList.toggle("active", b.dataset.d===d));
+  setTimeout(()=>Object.values(charts).forEach(c=>{try{c.resize();}catch(e){}}),60);
+}
+document.querySelectorAll(".dbtn").forEach(b=>b.onclick=()=>applyDensity(b.dataset.d));
+applyDensity(store.get("vllm_density")||"normal");
+// ⚙-Menü (Latenz-Perzentil + Export)
+(function(){
+  const gear=document.getElementById("gear"), gmenu=document.getElementById("gearmenu");
+  gear.onclick=e=>{ e.stopPropagation(); gmenu.classList.toggle("open"); };
+  gmenu.querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>gmenu.classList.remove("open")));
+  document.addEventListener("click",e=>{ if(!gmenu.contains(e.target)&&e.target!==gear) gmenu.classList.remove("open"); });
+})();
 document.getElementById("range").onchange=()=>{fetchConfig();startRefresh();};
 document.getElementById("pct").onchange=()=>{if(lastData)applySeries(lastData);};
 document.getElementById("mode").onchange=startRefresh;

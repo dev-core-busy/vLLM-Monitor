@@ -4,6 +4,18 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.10.1] – 2026-07-10
+
+### Neu
+- **Kacheldichte** über drei Punktraster-Icons (5×4 / 4×3 / 3×2) umschaltbar –
+  kleinere Kacheln zeigen mehr gleichzeitig; Auswahl im Cookie gemerkt.
+- **⚙-Menü** bündelt Latenz-Perzentil und CSV-/JSON-Export (spart Platz in der
+  Toolbar).
+- **Gemeinsame Modell-Legende** über den Diagrammen statt einer Legende je
+  Kachel (spart besonders im dichten Modus Platz); Klick blendet ein Modell in
+  allen Diagrammen aus/ein (im Cookie gemerkt). Modell-Farben sind jetzt stabil.
+- **Instanz-Tabelle einklappbar** (Button rechts, Zustand im Cookie).
+
 ## [0.10.0] – 2026-07-10
 
 ### Neu
