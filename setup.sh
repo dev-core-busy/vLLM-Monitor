@@ -14,6 +14,8 @@ UNIT_DIR="$HOME/.config/systemd/user"
 PY="$(command -v python3 || true)"
 CONF="$HOME/.vllm_monitor_setup"
 DB="$DIR/vllm_metrics.db"
+CERT="$DIR/tls_cert.pem"
+KEY="$DIR/tls_key.pem"
 SERVICES=(vllm-collector.service vllm-dashboard.service)
 
 # Farben (nur wenn Terminal)
@@ -75,6 +77,12 @@ check_deps() {
         fi
     fi
 
+    if command -v openssl >/dev/null 2>&1; then
+        ok "openssl vorhanden (für HTTPS/Zertifikat)"
+    else
+        warn "openssl fehlt – HTTPS/Zertifikat nicht verfügbar (HTTP funktioniert weiterhin)"
+    fi
+
     local missing=0
     for f in vllm_collector.sh vllm_dashboard.sh; do
         if [ -f "$DIR/$f" ]; then ok "$f vorhanden"; else bad "$f fehlt in $DIR"; missing=1; fi
@@ -99,6 +107,25 @@ ask() {  # $1=Prompt  $2=Default  -> echo Antwort
 }
 
 # ---------------------------------------------------------------------------
+# TLS-Zertifikat (self-signed) erzeugen
+# ---------------------------------------------------------------------------
+gen_cert() {  # $1 = IP/Hostname für den Common Name / SAN
+    local ip="$1"
+    if ! command -v openssl >/dev/null 2>&1; then
+        bad "openssl nicht gefunden – kann kein Zertifikat erzeugen."; return 1
+    fi
+    local san="IP:127.0.0.1,DNS:localhost"
+    if valid_ip "$ip"; then san="IP:$ip,$san"; else san="DNS:$ip,$san"; fi
+    if openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEY" -out "$CERT" -days 3650 \
+        -subj "/CN=$ip" -addext "subjectAltName=$san" 2>/dev/null; then
+        chmod 600 "$KEY"; chmod 644 "$CERT"
+        ok "Self-signed Zertifikat erzeugt (SAN: $san), 10 Jahre gültig."
+    else
+        bad "Zertifikat-Erzeugung fehlgeschlagen."; return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Installation
 # ---------------------------------------------------------------------------
 do_install() {
@@ -109,15 +136,16 @@ do_install() {
     fi
 
     # gemerkte Werte laden
-    local D_IP="" D_TARGETS="9081:Qwen,9082:Gemma" D_BIND="0.0.0.0" D_PORT="8899"
+    local D_IP="" D_TARGETS="9081:Qwen,9082:Gemma" D_BIND="0.0.0.0" D_PORT="8899" D_HTTPS="n"
     [ -f "$CONF" ] && . "$CONF" 2>/dev/null
     D_IP="${VLLM_HOST:-$D_IP}"
     D_TARGETS="${VLLM_TARGETS:-$D_TARGETS}"
     D_BIND="${VLLM_BIND:-$D_BIND}"
     D_PORT="${VLLM_PORT:-$D_PORT}"
+    D_HTTPS="${VLLM_HTTPS:-$D_HTTPS}"
 
     echo
-    local ip targets bind port
+    local ip targets bind port https="n" ans
     while true; do
         ip="$(ask "Ziel-IP des vLLM-Hosts" "$D_IP")"
         if valid_ip "$ip"; then break; fi
@@ -126,6 +154,21 @@ do_install() {
     targets="$(ask "Instanzen (port:label,port:label)" "$D_TARGETS")"
     bind="$(ask "Dashboard-Bind (0.0.0.0=Netz, 127.0.0.1=nur lokal)" "$D_BIND")"
     port="$(ask "Dashboard-Port" "$D_PORT")"
+    # Zertifikat muss auf die Adresse lauten, die der BROWSER aufruft (Dashboard-Host)
+    local dash_ip="$bind"
+    [ "$bind" = "0.0.0.0" ] && dash_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [ -z "$dash_ip" ] && dash_ip="127.0.0.1"
+
+    ans="$(ask "HTTPS aktivieren? (self-signed; nötig für Benachrichtigungen im Netz) [j/n]" "$D_HTTPS")"
+    if [[ "${ans,,}" == "j" ]]; then
+        https="j"
+        if [ -f "$CERT" ] && [ -f "$KEY" ]; then
+            ask "Vorhandenes Zertifikat neu erzeugen (für $dash_ip)? [j/N]" "n" | grep -qi '^j' && gen_cert "$dash_ip"
+            ok "HTTPS aktiv (Zertifikat: $CERT)."
+        else
+            gen_cert "$dash_ip" || { https="n"; warn "Fahre ohne HTTPS fort."; }
+        fi
+    fi
 
     # merken
     cat > "$CONF" <<EOF
@@ -133,6 +176,7 @@ VLLM_HOST=$ip
 VLLM_TARGETS=$targets
 VLLM_BIND=$bind
 VLLM_PORT=$port
+VLLM_HTTPS=$https
 EOF
 
     mkdir -p "$UNIT_DIR"
@@ -156,6 +200,9 @@ RestartSec=10
 WantedBy=default.target
 EOF
 
+    local tls_env=""
+    [ "$https" = "j" ] && tls_env="Environment=VLLM_TLS_CERT=$CERT"$'\n'"Environment=VLLM_TLS_KEY=$KEY"
+
     cat > "$UNIT_DIR/vllm-dashboard.service" <<EOF
 [Unit]
 Description=vLLM Monitoring-Dashboard (Port $port)
@@ -165,6 +212,7 @@ After=vllm-collector.service
 Type=simple
 WorkingDirectory=$DIR
 Environment=VLLM_LABEL=$ip
+${tls_env}
 ExecStart=$PY $DIR/vllm_dashboard.sh $port $bind
 Restart=always
 RestartSec=10
@@ -175,8 +223,10 @@ EOF
 
     echo
     systemctl --user daemon-reload
-    if systemctl --user enable --now "${SERVICES[@]}" 2>/dev/null; then
-        ok "Dienste installiert und gestartet."
+    systemctl --user enable "${SERVICES[@]}" 2>/dev/null
+    # restart (nicht nur start), damit geänderte Unit-Env auch bei laufendem Dienst greift
+    if systemctl --user restart "${SERVICES[@]}" 2>/dev/null; then
+        ok "Dienste installiert und (neu) gestartet."
     else
         bad "Dienste konnten nicht gestartet werden – siehe: systemctl --user status ${SERVICES[0]}"
         return 1
@@ -191,11 +241,13 @@ EOF
         fi
     fi
 
-    local shown="$bind"
+    local shown="$bind" scheme="http"
     [ "$bind" = "0.0.0.0" ] && shown="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [ "$https" = "j" ] && scheme="https"
     echo
     echo "${G}${B}Fertig.${N}  Ziel: $ip   Instanzen: $targets"
-    echo "Dashboard:  ${B}http://${shown:-127.0.0.1}:$port${N}"
+    echo "Dashboard:  ${B}${scheme}://${shown:-127.0.0.1}:$port${N}"
+    [ "$https" = "j" ] && warn "Self-signed: der Browser zeigt einmalig eine Zertifikatswarnung – Ausnahme bestätigen."
     [ "$bind" = "0.0.0.0" ] && warn "Ohne Auth im Netz erreichbar – ggf. per Firewall einschränken."
 }
 
@@ -225,6 +277,11 @@ do_uninstall() {
     read -rp "Gemerkte Einstellungen ($CONF) löschen? [j/N]: " a || true
     if [[ "${a,,}" == "j" ]]; then rm -f "$CONF"; ok "Einstellungen gelöscht."; fi
 
+    if [ -f "$CERT" ] || [ -f "$KEY" ]; then
+        read -rp "TLS-Zertifikat ($CERT / Key) löschen? [j/N]: " a || true
+        if [[ "${a,,}" == "j" ]]; then rm -f "$CERT" "$KEY"; ok "Zertifikat gelöscht."; fi
+    fi
+
     rm -rf "$DIR/__pycache__"
 
     read -rp "Linger deaktivieren (Autostart abschalten)? [j/N]: " a || true
@@ -252,8 +309,10 @@ do_status() {
     [ "$any" = 0 ] && warn "Nicht installiert."
     if [ -f "$CONF" ]; then
         . "$CONF" 2>/dev/null
-        echo "  ${DIM}Ziel: ${VLLM_HOST:-?}  Port: ${VLLM_PORT:-?}  Bind: ${VLLM_BIND:-?}${N}"
+        local sch="http"; [ "${VLLM_HTTPS:-n}" = "j" ] && sch="https"
+        echo "  ${DIM}Ziel: ${VLLM_HOST:-?}  URL: ${sch}://…:${VLLM_PORT:-?}  Bind: ${VLLM_BIND:-?}${N}"
     fi
+    [ -f "$CERT" ] && ok "TLS-Zertifikat vorhanden ($CERT)" || echo "  ${DIM}Kein TLS-Zertifikat.${N}"
 }
 
 # ---------------------------------------------------------------------------
@@ -269,14 +328,18 @@ menu() {
         echo "  2) Deinstallieren (vollständig)"
         echo "  3) Status anzeigen"
         echo "  4) Abhängigkeiten prüfen"
+        echo "  5) TLS-Zertifikat (neu) erzeugen"
         echo "  0) Beenden"
-        local c; read -rp "Auswahl: " c || exit 0
+        local c ipp; read -rp "Auswahl: " c || exit 0
         echo
         case "$c" in
             1) do_install; pause;;
             2) do_uninstall; pause;;
             3) do_status; pause;;
             4) check_deps; pause;;
+            5) [ -f "$CONF" ] && . "$CONF" 2>/dev/null
+               ipp="$(ask "IP/Hostname für das Zertifikat" "${VLLM_HOST:-127.0.0.1}")"; gen_cert "$ipp"
+               warn "Nach dem Erzeugen ggf. neu installieren (Punkt 1) und HTTPS wählen."; pause;;
             0) exit 0;;
             *) warn "Ungültige Auswahl.";;
         esac

@@ -17,12 +17,14 @@ Bedienung:
   python3 vllm_dashboard.sh                 – http://127.0.0.1:8899
   python3 vllm_dashboard.sh 8899 0.0.0.0    – im Netzwerk erreichbar
   VLLM_LABEL=... setzt den Untertitel.
+  VLLM_TLS_CERT=cert.pem VLLM_TLS_KEY=key.pem ...  – aktiviert HTTPS.
 
 Nur Python-Standardbibliothek – Chart.js/Zoom-Plugin via CDN.
 """
 
 import os
 import sys
+import ssl
 import json
 import math
 import time
@@ -31,11 +33,12 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
 DEFAULT_PORT = 8899
 LABEL = os.environ.get("VLLM_LABEL", "")
+CERT_PATH = None            # wird in main() gesetzt, wenn TLS aktiv ist
 PUSH_INTERVAL = 5           # SSE-Push-Takt (Sekunden)
 STALE_AFTER = 90            # Instanz gilt als offline, wenn älter (Sekunden)
 
@@ -254,12 +257,38 @@ class Handler(BaseHTTPRequestHandler):
             self._json(build_config())
         elif parsed.path == "/api/stream":
             self._stream(_range_from(qs))
+        elif parsed.path == "/api/cert":
+            self._send_cert()
         elif parsed.path in ("/", "/index.html"):
             sub = ("– " + html.escape(LABEL)) if LABEL else ""
-            page = PAGE.replace("__SUBTITLE__", sub).replace("__VERSION__", __version__)
+            page = (PAGE.replace("__SUBTITLE__", sub)
+                        .replace("__VERSION__", __version__)
+                        .replace("__TLSAVAIL__", "1" if CERT_PATH else "0"))
             self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
         else:
             self._send(404, "text/plain", b"not found")
+
+    def _send_cert(self):
+        if CERT_PATH and os.path.exists(CERT_PATH):
+            try:
+                with open(CERT_PATH, "rb") as f:
+                    data = f.read()
+            except OSError:
+                self._send(500, "text/plain", b"cert read error")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", "attachment; filename=vllm-monitor.crt")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            self._send(404, "text/plain; charset=utf-8",
+                       "Kein TLS-Zertifikat konfiguriert (HTTP-Modus).".encode("utf-8"))
 
     def _json(self, obj):
         self._send(200, "application/json", json.dumps(obj).encode("utf-8"))
@@ -335,8 +364,17 @@ PAGE = r"""<!DOCTYPE html>
   .metric{font-size:12px;color:var(--muted);} .metric b{display:block;font-size:17px;color:var(--fg);}
   .metric.warn b{color:var(--warn);} .metric.bad b{color:var(--bad);}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:14px;padding:14px 16px;}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;position:relative;}
   .card h2{font-size:12px;margin:0 0 6px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;}
+  .cardbtns{position:absolute;top:5px;right:7px;display:flex;gap:3px;z-index:6;}
+  .cbtn{background:var(--panel);border:1px solid var(--border);color:var(--muted);border-radius:5px;
+        width:22px;height:20px;font-size:13px;line-height:1;padding:0;cursor:pointer;}
+  .cbtn:hover{color:var(--fg);border-color:var(--accent);}
+  .cbtn.close:hover{color:var(--bad);border-color:var(--bad);}
+  .card.maximized{position:fixed;inset:14px;z-index:2000;margin:0;overflow:auto;
+    box-shadow:0 0 0 100vmax rgba(0,0,0,.55);}
+  .card.maximized canvas{max-height:calc(100vh - 90px);}
+  .hidden-card{display:none !important;}
   canvas{max-height:240px;}
   .card h2.handle,.kpi h3.handle{cursor:grab;user-select:none;touch-action:none;
     margin:-10px -12px 6px;padding:6px 12px;border-radius:10px 10px 0 0;background:rgba(127,127,127,.06);}
@@ -352,6 +390,28 @@ PAGE = r"""<!DOCTYPE html>
   th{color:var(--muted);font-weight:600;}
   .placeholder{color:var(--muted);font-size:12px;padding:18px 4px;text-align:center;}
   #status{font-size:11px;color:var(--muted);}
+  #secbtn.insecure{border-color:var(--bad);color:var(--bad);}
+  #secbtn.secure{border-color:var(--ok);color:var(--ok);}
+  #secbanner{background:rgba(248,81,73,.14);color:var(--bad);border-bottom:1px solid var(--bad);
+    padding:8px 16px;font-size:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  #secbanner button{font-size:12px;}
+  .modal-ov{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:3000;display:none;
+    align-items:flex-start;justify-content:center;padding:40px 14px;overflow:auto;}
+  .modal-card{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+    max-width:560px;width:100%;padding:20px 22px;color:var(--fg);}
+  .modal-card h2{margin:0 0 12px;font-size:18px;}
+  .modal-card p{font-size:13px;color:var(--muted);line-height:1.6;}
+  .dlbtn{display:inline-flex;align-items:center;gap:8px;background:var(--accent);color:#fff;
+    border:none;border-radius:8px;padding:9px 14px;font-size:13px;text-decoration:none;margin:6px 0 14px;cursor:pointer;}
+  .tabs{display:flex;gap:4px;margin-bottom:10px;}
+  .tab{font-size:12px;}
+  .tab.active{border-color:var(--accent);color:var(--accent);}
+  .tabc ol{font-size:13px;line-height:1.7;padding-left:18px;margin:0;}
+  .tabc pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;
+    font-size:12px;overflow-x:auto;}
+  .tabc code{background:var(--grid);padding:1px 5px;border-radius:4px;}
+  #certstatus{font-size:13px;line-height:1.6;background:var(--bg);border:1px solid var(--border);
+    border-radius:8px;padding:10px 12px;margin-bottom:12px;}
 </style>
 </head>
 <body>
@@ -389,6 +449,8 @@ PAGE = r"""<!DOCTYPE html>
   <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">JSON</button>
   <button id="theme" title="Zwischen hellem und dunklem Design umschalten (wird gespeichert)">◐</button>
   <button id="notif" title="Browser-Benachrichtigungen bei Warnungen (KV-Cache voll, Fehler, Instanz offline) erlauben">🔔</button>
+  <button id="secbtn" title="Verbindungssicherheit & Zertifikat">🔒</button>
+  <button id="restore" title="Ausgeblendete Kacheln wieder einblenden" style="display:none">Ausgeblendet: 0 ⟲</button>
   <span id="countdown"></span>
   <span id="status" style="flex-basis:100%;text-align:right"></span>
 </header>
@@ -404,6 +466,53 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 
 <div class="grid" id="charts"></div>
+
+<div id="secbanner" style="display:none">
+  <span>⚠️ Unverschlüsselte Verbindung (HTTP) – Browser-Benachrichtigungen sind hier nicht möglich.</span>
+  <button id="secbanner-btn">Zertifikat / HTTPS</button>
+  <button id="secbanner-x" title="Ausblenden">×</button>
+</div>
+
+<div id="certmodal" class="modal-ov">
+  <div class="modal-card">
+    <h2>🔒 Verbindung & SSL-Zertifikat</h2>
+    <div id="certstatus"></div>
+    <p>Selbstsigniertes Zertifikat – einmalig als <b>vertrauenswürdig</b> installieren, damit der Browser
+       die Verbindung als sicher einstuft (und Benachrichtigungen erlaubt).</p>
+    <a id="certdl" href="/api/cert" download="vllm-monitor.crt" class="dlbtn">⬇ Zertifikat herunterladen (vllm-monitor.crt)</a>
+    <div class="tabs">
+      <button class="tab active" data-tab="win">Windows</button>
+      <button class="tab" data-tab="linux">Linux</button>
+      <button class="tab" data-tab="browser">Firefox/Browser</button>
+    </div>
+    <div id="tab-win" class="tabc">
+      <ol>
+        <li>Zertifikat <code>vllm-monitor.crt</code> herunterladen.</li>
+        <li>Doppelklick / Rechtsklick → <b>Zertifikat installieren</b>.</li>
+        <li>Speicherort <b>Lokaler Computer</b> (oder Aktueller Benutzer) wählen.</li>
+        <li><b>Alle Zertifikate in folgendem Speicher speichern</b> → Durchsuchen →
+            <b>Vertrauenswürdige Stammzertifizierungsstellen</b>.</li>
+        <li>Fertigstellen und <b>Browser komplett neu starten</b>.</li>
+      </ol>
+    </div>
+    <div id="tab-linux" class="tabc" hidden>
+      <ol><li>System-weit als vertrauenswürdige CA hinterlegen:</li></ol>
+      <pre>sudo cp vllm-monitor.crt /usr/local/share/ca-certificates/vllm-monitor.crt
+sudo update-ca-certificates</pre>
+      <p style="margin:6px 0 0">Danach den Browser neu starten. (Chrome/Chromium nutzen den System-Store.)</p>
+    </div>
+    <div id="tab-browser" class="tabc" hidden>
+      <ol>
+        <li>Browser-Einstellungen öffnen, nach <b>Zertifikate</b> suchen.</li>
+        <li>Reiter <b>Zertifizierungsstellen</b> → <b>Importieren</b>.</li>
+        <li>Datei <code>vllm-monitor.crt</code> auswählen.</li>
+        <li>Haken bei <b>Dieser CA für die Identifizierung von Websites vertrauen</b> setzen.</li>
+        <li>Bestätigen und die Seite neu laden.</li>
+      </ol>
+    </div>
+    <button id="certclose" style="margin-top:14px">Schließen</button>
+  </div>
+</div>
 
 <script>
 const COLORS=["#58a6ff","#f778ba","#3fb950","#d29922","#a371f7","#ff7b72"];
@@ -694,20 +803,52 @@ function buildGrid(){
   const g=document.getElementById("charts");
   const saved=JSON.parse(localStorage.getItem("vllm_chart_order")||"null");
   const gpuSpec={id:"gpu",gpu:true,title:"GPU-Hardware"};
+  const btns=`<div class="cardbtns"><button class="cbtn max" title="Maximieren (Esc schließt)">⛶</button>`+
+             `<button class="cbtn close" title="Kachel ausblenden">×</button></div>`;
   orderBy(CHARTS.concat([gpuSpec]),saved,s=>s.id).forEach(spec=>{
     const d=document.createElement("div");d.className="card";d.dataset.id=spec.id;
     if(spec.gpu){
-      d.innerHTML=`<h2 class="handle">GPU-Hardware</h2>
+      d.innerHTML=btns+`<h2 class="handle">GPU-Hardware</h2>
         <div class="placeholder">SM-Auslastung, VRAM, Temperatur, Watt – noch nicht verfügbar.<br>
         Benötigt einen DCGM-/node-Exporter auf dem Zielhost (Roadmap).</div>`;
     }else{
-      d.innerHTML=`<h2 class="handle">${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;
+      d.innerHTML=btns+`<h2 class="handle">${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;
     }
     g.appendChild(d);
   });
   makeSortable(g,()=>saveOrder(g,"vllm_chart_order"));
+  wireCardButtons(g);
+  applyHidden();
   CHARTS.forEach(mkChart);
 }
+
+// --- Maximieren / Ausblenden ---
+const loadHidden=()=>{try{return JSON.parse(localStorage.getItem("vllm_hidden")||"[]");}catch(e){return [];}};
+const saveHidden=h=>localStorage.setItem("vllm_hidden",JSON.stringify(h));
+function applyHidden(){
+  const h=loadHidden();
+  document.querySelectorAll("#charts > [data-id]").forEach(c=>c.classList.toggle("hidden-card",h.includes(c.dataset.id)));
+  const btn=document.getElementById("restore");
+  if(btn){ const n=h.length; btn.style.display=n?"":"none"; btn.textContent="Ausgeblendet: "+n+" ⟲"; }
+}
+function toggleMax(card,id){
+  const on=card.classList.toggle("maximized");
+  document.body.style.overflow=on?"hidden":"";
+  const c=charts[id]; if(c) setTimeout(()=>{try{c.resize();}catch(e){}},60);
+}
+function wireCardButtons(container){
+  if(container._btnwired)return; container._btnwired=true;
+  container.addEventListener("click",e=>{
+    const b=e.target.closest(".cbtn"); if(!b)return;
+    const card=b.closest("[data-id]"); if(!card)return;
+    if(b.classList.contains("max")) toggleMax(card,card.dataset.id);
+    else if(b.classList.contains("close")){ const h=loadHidden(); if(!h.includes(card.dataset.id)){h.push(card.dataset.id);saveHidden(h);} if(card.classList.contains("maximized"))toggleMax(card,card.dataset.id); applyHidden(); }
+  });
+}
+// Esc beendet die Maximierung
+document.addEventListener("keydown",e=>{
+  if(e.key==="Escape"){const m=document.querySelector(".card.maximized");if(m)toggleMax(m,m.dataset.id);}
+});
 
 buildGrid();
 applyTheme(localStorage.getItem("vllm_theme")||"dark");
@@ -719,6 +860,7 @@ document.getElementById("resetzoom").onclick=()=>Object.values(charts).forEach(c
 document.getElementById("export").onclick=exportCSV;
 document.getElementById("exportjson").onclick=()=>lastData&&download("vllm_metrics.json",JSON.stringify(lastData,null,2),"application/json");
 document.getElementById("theme").onclick=()=>applyTheme(document.body.dataset.theme==="dark"?"light":"dark");
+document.getElementById("restore").onclick=()=>{ saveHidden([]); applyHidden(); };
 document.getElementById("notif").onclick=()=>{
   const st=document.getElementById("status");
   const say=t=>{ if(st)st.textContent=t; };
@@ -748,11 +890,81 @@ document.getElementById("notif").onclick=()=>{
 fetchConfig();
 startRefresh();
 setInterval(fetchConfig,30000);
+
+// --- Verbindungssicherheit & Zertifikat ---
+(function(){
+  const https=location.protocol==="https:";
+  const local=["localhost","127.0.0.1","[::1]",""].includes(location.hostname);
+  const tlsAvail="__TLSAVAIL__"==="1";
+  const badge=document.getElementById("secbtn");
+  badge.textContent=https?"🔒":"⚠️";
+  badge.className=https?"secure":"insecure";
+  badge.title=https?"Verbindung verschlüsselt (HTTPS) – Zertifikat verwalten"
+                    :"Unverschlüsselt (HTTP) – klicken für Zertifikat/HTTPS";
+  const banner=document.getElementById("secbanner");
+  if(!https && !local) banner.style.display="flex";
+  const modal=document.getElementById("certmodal");
+  function openModal(){
+    const s=document.getElementById("certstatus");
+    if(https){
+      s.innerHTML='<b style="color:var(--ok)">✔ Verbindung ist verschlüsselt (HTTPS).</b><br>'+
+        'Zeigt der Browser dennoch eine Warnung, ist das self-signed Zertifikat noch nicht als '+
+        'vertrauenswürdig installiert – unten herunterladen und installieren.';
+    }else{
+      s.innerHTML='<b style="color:var(--bad)">✖ Unverschlüsselte Verbindung (HTTP).</b><br>'+
+        (tlsAvail?('HTTPS ist auf dem Server verfügbar – öffne stattdessen <code>https://'+location.host+'</code>.')
+                 :('HTTPS ist nicht aktiviert. Auf dem Server per <code>./setup.sh</code> aktivieren (Menü → HTTPS).'));
+    }
+    document.getElementById("certdl").style.display=tlsAvail?"":"none";
+    modal.style.display="flex";
+  }
+  badge.onclick=openModal;
+  document.getElementById("secbanner-btn").onclick=openModal;
+  document.getElementById("secbanner-x").onclick=()=>banner.style.display="none";
+  document.getElementById("certclose").onclick=()=>modal.style.display="none";
+  modal.onclick=e=>{ if(e.target===modal) modal.style.display="none"; };
+  // Download per fetch->Blob: umgeht Chromes Sperre für Downloads über noch
+  // nicht vertrauenswürdige (self-signed) HTTPS-Verbindungen ("Netzwerkfehler").
+  document.getElementById("certdl").onclick=function(e){
+    e.preventDefault();
+    const st=document.getElementById("status");
+    fetch("/api/cert").then(r=>{ if(!r.ok) throw new Error("HTTP "+r.status); return r.blob(); })
+      .then(b=>{ const u=URL.createObjectURL(b); const a=document.createElement("a");
+        a.href=u; a.download="vllm-monitor.crt"; document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(()=>URL.revokeObjectURL(u),1500);
+        if(st) st.textContent="Zertifikat heruntergeladen (vllm-monitor.crt)."; })
+      .catch(err=>alert("Download fehlgeschlagen: "+err+"\n\nAlternativ direkt öffnen:\n"+location.origin+"/api/cert"));
+  };
+  modal.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
+    modal.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+    t.classList.add("active");
+    ["win","linux","browser"].forEach(k=>document.getElementById("tab-"+k).hidden=(k!==t.dataset.tab));
+  });
+})();
 </script>
 </body>
 </html>
 """
 PAGE = PAGE.replace("__PUSH__", str(PUSH_INTERVAL))
+
+
+class DashServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer mit optionalem TLS. Der TLS-Handshake wird pro
+    Verbindung im jeweiligen Handler-Thread ausgeführt (do_handshake_on_connect
+    =False), damit eine langsame/haltende Verbindung (z.B. SSE) die zentrale
+    accept()-Schleife nicht blockiert."""
+    daemon_threads = True
+    ssl_ctx = None
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        if self.ssl_ctx is not None:
+            sock = self.ssl_ctx.wrap_socket(sock, server_side=True,
+                                            do_handshake_on_connect=False)
+        return sock, addr
+
+    def handle_error(self, request, client_address):
+        pass  # TLS-Handshake-Fehler einzelner Clients nicht ins Log spammen
 
 
 def main():
@@ -763,9 +975,30 @@ def main():
         except ValueError:
             pass
     bind = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("VLLM_DASH_BIND", "127.0.0.1")
-    srv = ThreadingHTTPServer((bind, port), Handler)
+    srv = DashServer((bind, port), Handler)
+
+    # TLS: aktiv, sobald VLLM_TLS_CERT + VLLM_TLS_KEY gesetzt sind und existieren.
+    scheme = "http"
+    cert = os.environ.get("VLLM_TLS_CERT")
+    key = os.environ.get("VLLM_TLS_KEY")
+    if cert and key and os.path.exists(cert) and os.path.exists(key):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            ctx.load_cert_chain(certfile=cert, keyfile=key)
+        except ssl.SSLError as e:
+            print("  [!] TLS-Zertifikat/Key konnte nicht geladen werden: %s" % e)
+            sys.exit(1)
+        srv.ssl_ctx = ctx      # pro Verbindung umhüllen, nicht den Listen-Socket
+        scheme = "https"
+        global CERT_PATH
+        CERT_PATH = cert       # für den Zertifikat-Download (/api/cert)
+    elif cert or key:
+        print("  [!] Für HTTPS müssen BEIDE gesetzt sein: VLLM_TLS_CERT und VLLM_TLS_KEY – starte als HTTP.")
+
     shown = bind if bind not in ("0.0.0.0", "") else "<diese-IP>"
-    print("vLLM-Dashboard %s läuft:  http://%s:%d  (Bind %s)" % (__version__, shown, port, bind))
+    print("vLLM-Dashboard %s läuft:  %s://%s:%d  (Bind %s)" % (__version__, scheme, shown, port, bind))
+    if scheme == "https":
+        print("  [i] Self-signed? Der Browser zeigt einmalig eine Warnung – Ausnahme bestätigen.")
     if bind in ("0.0.0.0", ""):
         print("  [!] Ohne Auth im Netzwerk erreichbar – ggf. per Firewall einschränken.")
     print("DB: %s   (Strg+C zum Beenden)" % DB_PATH)

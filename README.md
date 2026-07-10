@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.9.2-blue)
+![Version](https://img.shields.io/badge/version-0.9.3-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -250,6 +250,29 @@ CORS/OPTIONS, Embeddings/Rerank …) und stellt sie je nach erkanntem Servertyp
   Netz sichtbar – dann per Firewall/Reverse-Proxy absichern.
 - Die Tools senden **keine** Daten nach außen; alle Metriken bleiben lokal in
   der SQLite-DB.
+
+### HTTPS
+
+Das Dashboard kann direkt TLS sprechen (ohne Reverse-Proxy). Am einfachsten über
+`./setup.sh` → Installation → *„HTTPS aktivieren?"* (bzw. Menüpunkt 5 zum
+Erzeugen des Zertifikats). Manuell:
+
+```bash
+# self-signed Zertifikat für die Adresse erzeugen, unter der das Dashboard läuft
+openssl req -x509 -newkey rsa:2048 -nodes -keyout tls_key.pem -out tls_cert.pem \
+  -days 3650 -subj "/CN=<dashboard-ip>" \
+  -addext "subjectAltName=IP:<dashboard-ip>,IP:127.0.0.1,DNS:localhost"
+
+VLLM_TLS_CERT=tls_cert.pem VLLM_TLS_KEY=tls_key.pem \
+  python3 vllm_dashboard.sh 8899 0.0.0.0
+```
+
+Bei self-signed Zertifikaten zeigt der Browser einmalig eine Warnung (Ausnahme
+bestätigen). HTTPS ist außerdem **Voraussetzung für Browser-Benachrichtigungen**:
+diese sind nur in einem *secure context* (HTTPS oder `http://localhost`) erlaubt.
+Der TLS-Handshake läuft pro Verbindung im Handler-Thread, damit langlebige
+SSE-Verbindungen die Annahme neuer Verbindungen nicht blockieren.
+`tls_*.pem` sind per `.gitignore` vom Repo ausgeschlossen.
 
 ## Lizenz
 

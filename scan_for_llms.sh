@@ -29,7 +29,7 @@ import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib import request, error
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 # ---------------------------------------------------------------------------
 # Konfiguration

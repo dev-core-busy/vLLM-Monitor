@@ -4,6 +4,26 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.9.3] – 2026-07-10
+
+### Neu
+- **HTTPS** direkt im Dashboard (stdlib `ssl`, ohne Reverse-Proxy) über
+  `VLLM_TLS_CERT` + `VLLM_TLS_KEY`. Der TLS-Handshake läuft pro Verbindung im
+  Handler-Thread, damit langlebige SSE-Verbindungen die Annahme neuer
+  Verbindungen nicht blockieren.
+- **`setup.sh`**: Option „HTTPS aktivieren?" mit Erzeugung eines self-signed
+  Zertifikats (SAN = Dashboard-Adresse + `127.0.0.1` + `localhost`), separater
+  Menüpunkt zum (Neu-)Erzeugen, `openssl` in der Abhängigkeitsprüfung,
+  Deinstallation kann Zertifikat mitentfernen.
+- **Zertifikats-Handling im Dashboard**: Sicherheits-Badge (🔒/⚠️), Warnbanner
+  bei HTTP, Endpoint `GET /api/cert` (Download) und Install-Modal mit Anleitung
+  für Windows/Linux/Firefox. Download per `fetch`→Blob, um Chromes Sperre für
+  Downloads über noch nicht vertrauenswürdige (self-signed) Verbindungen zu
+  umgehen.
+- **Pro Kachel**: Buttons zum **Maximieren** (Vollbild-Overlay, Esc schließt)
+  und **Ausblenden**; ausgeblendete Kacheln lassen sich per Toolbar-Button wieder
+  einblenden (gemerkt via localStorage).
+
 ## [0.9.2] – 2026-07-09
 
 ### Behoben
