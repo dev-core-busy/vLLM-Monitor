@@ -4,6 +4,26 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.10.0] – 2026-07-10
+
+### Neu
+- **Ollama-Unterstützung** (eigener Datenpfad, da kein Prometheus): Health
+  (`/api/version`), geladenes Modell + **VRAM** (`/api/ps`), installierte Modelle
+  (`/api/tags`) und ein optionaler **synthetischer Probe** (`/api/generate`) →
+  Tokens/s und Latenz-Perzentile (TTFT/E2E/ITL) aus synthetisierten Histogrammen.
+  Konfig: `VLLM_OLLAMA_TARGETS`, `VLLM_OLLAMA_PROBE`, `VLLM_OLLAMA_PROMPT`.
+- **Ollama-Autoscan** (`VLLM_OLLAMA_AUTOSCAN`): Standard-Endpunkte werden bei
+  jedem Scrape geprüft; ein gefundenes Ollama wird automatisch mitüberwacht und
+  im Dashboard eingeblendet.
+- **STT-Server** (faster-whisper o. ä.): `/health` → Online-Status + aktive
+  Sessions + Modell/Device (`VLLM_STT_TARGETS`).
+- Dashboard: **VRAM-Belegung-Panel** (GB), **Typ-Spalte** (vllm/ollama/stt) und
+  VRAM in der Instanz-Tabelle; **Instanz-Tabelle einklappbar** (Button rechts,
+  Zustand im Cookie).
+- Neue DB-Spalten `vram_bytes` (samples) und `kind` (config) mit additiver
+  Migration; DB-Pfad per `VLLM_DB` überschreibbar.
+- `setup.sh`: Abfragen für Ollama- und STT-Instanzen.
+
 ## [0.9.4] – 2026-07-10
 
 ### Neu

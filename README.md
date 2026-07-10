@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.9.4-blue)
+![Version](https://img.shields.io/badge/version-0.10.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -127,6 +127,11 @@ Der Collector wird vollständig über **Umgebungsvariablen** gesteuert:
 | `VLLM_INTERVAL` | `15` | Sekunden zwischen zwei Scrapes |
 | `VLLM_RETENTION_DAYS` | `30` | Aufbewahrungsdauer; ältere Daten werden gelöscht |
 | `VLLM_HTTP_TIMEOUT` | `15` | Timeout pro `/metrics`-Abruf (Sekunden) |
+| `VLLM_DB` | *(Projektordner)* | Alternativer Pfad zur SQLite-Datei |
+| `VLLM_OLLAMA_TARGETS` | *(leer)* | Ollama-Instanzen `host:port:label,…` (Health/VRAM + Probe) |
+| `VLLM_OLLAMA_PROBE` | `1` | Synthetischen Ollama-Probe (`/api/generate`) an/aus |
+| `VLLM_OLLAMA_AUTOSCAN` | `<host>:11434,127.0.0.1:11434` | Endpunkte, die auf ein Ollama geprüft und automatisch eingebunden werden (`""` = aus) |
+| `VLLM_STT_TARGETS` | *(leer)* | STT-Server (faster-whisper) `host:port:label,…` (nur `/health`) |
 
 Dashboard:
 

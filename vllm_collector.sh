@@ -33,7 +33,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.9.4"
+__version__ = "0.10.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -64,7 +64,64 @@ RETENTION_DAYS = int(os.environ.get("VLLM_RETENTION_DAYS", "30"))
 HTTP_TIMEOUT = float(os.environ.get("VLLM_HTTP_TIMEOUT", "15"))
 PURGE_EVERY = 240
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
+DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
+
+
+# --- Ollama (anderes API als vLLM: kein Prometheus /metrics) ---
+def _parse_ollama(spec):
+    """"127.0.0.1:11434:llama3, 11434:mistral" -> [{host,port,label}, ...]"""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split(":")
+        if len(bits) >= 3:
+            host, port, label = bits[0], int(bits[1]), ":".join(bits[2:])
+        elif len(bits) == 2:
+            host, port, label = HOST, int(bits[0]), bits[1]
+        else:
+            host, port, label = HOST, int(bits[0]), "ollama"
+        out.append({"host": host, "port": port, "label": label.strip()})
+    return out
+
+
+OLLAMA_TARGETS = _parse_ollama(os.environ.get("VLLM_OLLAMA_TARGETS", ""))
+OLLAMA_PROBE = os.environ.get("VLLM_OLLAMA_PROBE", "1").lower() not in ("0", "false", "no", "off")
+OLLAMA_PROMPT = os.environ.get("VLLM_OLLAMA_PROMPT", "Antworte knapp in einem Satz: Hallo.")
+OLLAMA_NUM_PREDICT = int(os.environ.get("VLLM_OLLAMA_NUM_PREDICT", "24"))
+
+# le-Grenzen (Sekunden) für synthetische Latenz-Histogramme der Ollama-Probes
+OLL_LE = {
+    "ttft": [.001, .005, .01, .02, .04, .06, .08, .1, .25, .5, .75, 1, 2.5, 5, 7.5, 10, 20, 40, 80, 160, 640, 2560],
+    "e2e":  [.3, .5, .8, 1, 1.5, 2, 2.5, 5, 10, 15, 20, 30, 40, 50, 60, 120, 240, 480, 960, 1920, 7680],
+    "itl":  [.01, .025, .05, .075, .1, .15, .2, .3, .4, .5, .75, 1, 2.5, 5, 7.5, 10, 20, 40, 80],
+}
+_oll_acc = {}   # (host,port,model) -> laufende Summen/Buckets der Probes
+
+# STT-Server (z.B. faster-whisper) – nur /health (Status + aktive Sessions)
+STT_TARGETS = _parse_ollama(os.environ.get("VLLM_STT_TARGETS", ""))
+
+
+def _parse_hostports(spec):
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            h, p = part.rsplit(":", 1)
+            out.append((h, int(p)))
+        else:
+            out.append((part, 11434))
+    return out
+
+
+# Ollama-Autoscan: diese host:port werden bei jedem Scrape geprüft und – falls
+# ein Ollama antwortet – automatisch mitüberwacht ("" schaltet es ab).
+OLLAMA_AUTOSCAN = _parse_hostports(
+    os.environ.get("VLLM_OLLAMA_AUTOSCAN", "%s:11434,127.0.0.1:11434" % HOST))
 
 # Einfache Gauges/Counter (ein Wert je Modell bzw. über Serien summiert)
 GAUGE_COUNTER = {
@@ -96,6 +153,7 @@ NUM_COLUMNS = [
     "requests_success_total", "requests_error_total",
 ] + ["req_%s" % r for r in FINISHED_REASONS] + [
     "ttft_sum", "ttft_count", "e2e_sum", "e2e_count", "itl_sum", "itl_count",
+    "vram_bytes",
 ]
 # JSON-Textspalten (Histogramm-Buckets als {le: kumulativ})
 JSON_COLUMNS = ["ttft_buckets", "e2e_buckets", "itl_buckets"]
@@ -159,12 +217,23 @@ def init_db(conn):
             PRIMARY KEY (host, port, model)
         )
     """)
+    # Additive Migration: fehlende Spalten nachrüsten (z.B. vram_bytes, kind)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(samples)")}
+    for c in NUM_COLUMNS:
+        if c not in have:
+            conn.execute("ALTER TABLE samples ADD COLUMN %s REAL" % c)
+    for c in JSON_COLUMNS:
+        if c not in have:
+            conn.execute("ALTER TABLE samples ADD COLUMN %s TEXT" % c)
+    have_c = {r[1] for r in conn.execute("PRAGMA table_info(config)")}
+    if "kind" not in have_c:
+        conn.execute("ALTER TABLE config ADD COLUMN kind TEXT")
     conn.commit()
 
 
-def store_sample(conn, ts, port, model, values):
+def store_sample(conn, ts, host, port, model, values):
     cols = ["ts", "host", "port", "model"] + NUM_COLUMNS + JSON_COLUMNS
-    row = [ts, HOST, port, model] + [values.get(c) for c in (NUM_COLUMNS + JSON_COLUMNS)]
+    row = [ts, host, port, model] + [values.get(c) for c in (NUM_COLUMNS + JSON_COLUMNS)]
     conn.execute(
         "INSERT OR REPLACE INTO samples (%s) VALUES (%s)"
         % (",".join(cols), ",".join("?" for _ in cols)),
@@ -172,21 +241,21 @@ def store_sample(conn, ts, port, model, values):
     )
 
 
-def store_config(conn, port, model, cfg):
+def store_config(conn, host, port, model, cfg):
     conn.execute("""
         INSERT OR REPLACE INTO config
         (host, port, model, updated, up, num_gpu_blocks, block_size, max_model_len,
-         gpu_memory_utilization, kv_cache_dtype, enable_prefix_caching, version)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (HOST, port, model, int(time.time()), cfg.get("up", 1),
+         gpu_memory_utilization, kv_cache_dtype, enable_prefix_caching, version, kind)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (host, port, model, int(time.time()), cfg.get("up", 1),
           cfg.get("num_gpu_blocks"), cfg.get("block_size"), cfg.get("max_model_len"),
           cfg.get("gpu_memory_utilization"), cfg.get("kv_cache_dtype"),
-          cfg.get("enable_prefix_caching"), cfg.get("version")))
+          cfg.get("enable_prefix_caching"), cfg.get("version"), cfg.get("kind", "vllm")))
 
 
-def mark_down(conn, port, label):
+def mark_down(conn, host, port):
     conn.execute("UPDATE config SET up=0, updated=? WHERE host=? AND port=?",
-                 (int(time.time()), HOST, port))
+                 (int(time.time()), host, port))
 
 
 def purge_old(conn):
@@ -314,6 +383,163 @@ def extract_config(samples):
 
 
 # ---------------------------------------------------------------------------
+# Ollama
+# ---------------------------------------------------------------------------
+
+def http_get(host, port, path, timeout=None):
+    url = "http://%s:%d%s" % (host, port, path)
+    req = request.Request(url, headers={"User-Agent": "vllm_collector/%s" % __version__})
+    try:
+        resp = request.urlopen(req, timeout=timeout or HTTP_TIMEOUT)
+        return resp.read().decode("utf-8", "replace")
+    except (error.URLError, OSError):
+        return None
+
+
+def get_json(host, port, path, timeout=None):
+    t = http_get(host, port, path, timeout)
+    if not t:
+        return None
+    try:
+        return json.loads(t)
+    except ValueError:
+        return None
+
+
+def _oll_new():
+    a = {"gen": 0.0, "prompt": 0.0, "req_ok": 0.0}
+    for k in ("ttft", "e2e", "itl"):
+        a[k + "_sum"] = 0.0
+        a[k + "_n"] = 0.0
+        h = {str(le): 0.0 for le in OLL_LE[k]}
+        h["+Inf"] = 0.0
+        a[k + "_h"] = h
+    return a
+
+
+def _oll_bump(acc, k, x):
+    acc[k + "_sum"] += x
+    acc[k + "_n"] += 1
+    h = acc[k + "_h"]
+    for le in OLL_LE[k]:
+        if x <= le:
+            h[str(le)] += 1
+    h["+Inf"] += 1
+
+
+def ollama_probe(host, port, model):
+    """Kleiner /api/generate-Aufruf -> Latenz/Token-Kennzahlen (Ollama liefert ns)."""
+    body = json.dumps({"model": model, "prompt": OLLAMA_PROMPT, "stream": False,
+                       "options": {"num_predict": OLLAMA_NUM_PREDICT}}).encode("utf-8")
+    req = request.Request("http://%s:%d/api/generate" % (host, port), data=body,
+                          headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        resp = request.urlopen(req, timeout=max(HTTP_TIMEOUT, 60))
+        d = json.loads(resp.read().decode("utf-8", "replace"))
+    except (error.URLError, OSError, ValueError):
+        return None
+    ec = d.get("eval_count") or 0
+    ed = d.get("eval_duration") or 0
+    ld = d.get("load_duration") or 0
+    pd = d.get("prompt_eval_duration") or 0
+    pc = d.get("prompt_eval_count") or 0
+    td = d.get("total_duration") or 0
+    ns = 1e9
+    return {"eval_count": ec, "prompt_eval_count": pc,
+            "ttft": (ld + pd) / ns, "e2e": td / ns,
+            "itl": (ed / ns / ec) if ec else 0.0}
+
+
+def scrape_ollama(conn, ts, tgt, verbose=True):
+    host, port = tgt["host"], tgt["port"]
+    ver = get_json(host, port, "/api/version")
+    if ver is None:
+        mark_down(conn, host, port)
+        if verbose:
+            print("  [!] Ollama %s:%d nicht erreichbar." % (host, port))
+        return 0
+    version = ver.get("version")
+    ps = get_json(host, port, "/api/ps") or {}
+    tags = get_json(host, port, "/api/tags") or {}
+    loaded = ps.get("models") or []
+    model, vram = None, None
+    if loaded:
+        m0 = loaded[0]
+        model = m0.get("name") or m0.get("model")
+        vram = m0.get("size_vram")
+    elif tags.get("models"):
+        model = tags["models"][0].get("name") or tags["models"][0].get("model")
+    if not model:
+        model = tgt["label"]
+
+    values = {c: None for c in (NUM_COLUMNS + JSON_COLUMNS)}
+    if vram is not None:
+        values["vram_bytes"] = float(vram)
+
+    if OLLAMA_PROBE:
+        pr = ollama_probe(host, port, model)
+        if pr:
+            acc = _oll_acc.setdefault((host, port, model), _oll_new())
+            acc["gen"] += pr["eval_count"]
+            acc["prompt"] += pr["prompt_eval_count"]
+            acc["req_ok"] += 1
+            _oll_bump(acc, "ttft", pr["ttft"])
+            _oll_bump(acc, "e2e", pr["e2e"])
+            if pr["itl"] > 0:
+                _oll_bump(acc, "itl", pr["itl"])
+            values["generation_tokens_total"] = acc["gen"]
+            values["prompt_tokens_total"] = acc["prompt"]
+            values["requests_success_total"] = acc["req_ok"]
+            values["req_stop"] = acc["req_ok"]
+            values["ttft_sum"], values["ttft_count"] = acc["ttft_sum"], acc["ttft_n"]
+            values["e2e_sum"], values["e2e_count"] = acc["e2e_sum"], acc["e2e_n"]
+            values["itl_sum"], values["itl_count"] = acc["itl_sum"], acc["itl_n"]
+            values["ttft_buckets"] = json.dumps(acc["ttft_h"])
+            values["e2e_buckets"] = json.dumps(acc["e2e_h"])
+            values["itl_buckets"] = json.dumps(acc["itl_h"])
+
+    store_sample(conn, ts, host, port, model, values)
+    store_config(conn, host, port, model, {"up": 1, "version": version, "kind": "ollama"})
+    if verbose:
+        print("  [+] (ollama) %-32s vram=%s gen=%s" % (
+            model, _fmt(values.get("vram_bytes")), _fmt(values.get("generation_tokens_total"))))
+    return 1
+
+
+def scrape_stt(conn, ts, tgt, verbose=True):
+    """STT-Server (faster-whisper o.ä.): /health -> Status + aktive Sessions."""
+    host, port = tgt["host"], tgt["port"]
+    h = get_json(host, port, "/health")
+    if h is None:
+        mark_down(conn, host, port)
+        if verbose:
+            print("  [!] STT %s:%d nicht erreichbar." % (host, port))
+        return 0
+    mp = h.get("modelPath") or ""
+    model = os.path.basename(mp) or tgt["label"] or "stt"
+    values = {c: None for c in (NUM_COLUMNS + JSON_COLUMNS)}
+    values["requests_running"] = float(h.get("activeSessions") or 0)
+    store_sample(conn, ts, host, port, model, values)
+    ver = "/".join(x for x in (h.get("device"), h.get("computeType")) if x)
+    up = 1 if h.get("status") == "ok" else 0
+    store_config(conn, host, port, model, {"up": up, "version": ver, "kind": "stt"})
+    if verbose:
+        print("  [+] (stt)    %-32s sessions=%s" % (model, _fmt(values["requests_running"])))
+    return 1
+
+
+def discover_ollama():
+    """Autoscan: erreichbare Ollama-Endpunkte finden, die nicht konfiguriert sind."""
+    found = []
+    for host, port in OLLAMA_AUTOSCAN:
+        if any(t["host"] == host and t["port"] == port for t in OLLAMA_TARGETS):
+            continue
+        if get_json(host, port, "/api/version", timeout=1.5) is not None:
+            found.append({"host": host, "port": port, "label": "ollama"})
+    return found
+
+
+# ---------------------------------------------------------------------------
 # Scrape-Zyklus
 # ---------------------------------------------------------------------------
 
@@ -324,7 +550,7 @@ def scrape_once(conn, verbose=True):
         port = tgt["port"]
         text = fetch_text(port, "/metrics")
         if text is None:
-            mark_down(conn, port, tgt["label"])
+            mark_down(conn, HOST, port)
             continue
         samples = parse_prometheus(text)
         per_model = extract(samples)
@@ -352,18 +578,34 @@ def scrape_once(conn, verbose=True):
                 print("  [!] Port %d: keine model_name-Metriken." % port)
             continue
         for model, values in per_model.items():
-            store_sample(conn, ts, port, model, values)
+            store_sample(conn, ts, HOST, port, model, values)
             mc = dict(cfg)
             mc["up"] = 1
             mc["max_model_len"] = maxlen.get(model)
             mc["version"] = version
-            store_config(conn, port, model, mc)
+            mc["kind"] = "vllm"
+            store_config(conn, HOST, port, model, mc)
             total += 1
             if verbose:
                 print("  [+] %-40s run=%s kv=%s gen=%s"
                       % (model, _fmt(values.get("requests_running")),
                          _fmt(values.get("kv_cache_usage")),
                          _fmt(values.get("generation_tokens_total"))))
+
+    # Ollama-Instanzen (konfiguriert + automatisch entdeckt)
+    for tgt in OLLAMA_TARGETS + discover_ollama():
+        try:
+            total += scrape_ollama(conn, ts, tgt, verbose)
+        except Exception as e:
+            print("  [!] Ollama-Fehler %s:%d: %s" % (tgt["host"], tgt["port"], e))
+
+    # STT-Server (nur /health)
+    for tgt in STT_TARGETS:
+        try:
+            total += scrape_stt(conn, ts, tgt, verbose)
+        except Exception as e:
+            print("  [!] STT-Fehler %s:%d: %s" % (tgt["host"], tgt["port"], e))
+
     conn.commit()
     return total
 

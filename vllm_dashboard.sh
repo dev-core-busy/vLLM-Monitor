@@ -33,9 +33,10 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.9.4"
+__version__ = "0.10.0"
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
+DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
 DEFAULT_PORT = 8899
 LABEL = os.environ.get("VLLM_LABEL", "")
 CERT_PATH = None            # wird in main() gesetzt, wenn TLS aktiv ist
@@ -60,6 +61,7 @@ GAUGES = {
     "waiting_capacity": "waiting_capacity",
     "waiting_deferred": "waiting_deferred",
     "preemptions_total": "preemptions",
+    "vram_bytes": "vram_bytes",
 }
 # Histogramm-Bucket-Spalte -> (Feld-Präfix, Skalierung auf Anzeigeeinheit)
 HISTOS = {
@@ -218,15 +220,21 @@ def build_config():
         age = (now - last) if last else None
         online = bool(c["up"]) and age is not None and age <= STALE_AFTER
         cap = (c["num_gpu_blocks"] or 0) * (c["block_size"] or 0)
+        kind = c["kind"] if "kind" in c.keys() and c["kind"] else "vllm"
+        # aktuelle VRAM-Belegung (falls vorhanden, z.B. Ollama)
+        vram = conn.execute(
+            "SELECT vram_bytes FROM samples WHERE host=? AND port=? AND model=? "
+            "ORDER BY ts DESC LIMIT 1", (c["host"], c["port"], c["model"])).fetchone()
         inst.append({
             "host": c["host"], "port": c["port"], "model": c["model"],
-            "online": online, "age": age,
+            "kind": kind, "online": online, "age": age,
             "num_gpu_blocks": c["num_gpu_blocks"], "block_size": c["block_size"],
             "capacity_tokens": cap, "max_model_len": c["max_model_len"],
             "gpu_memory_utilization": c["gpu_memory_utilization"],
             "kv_cache_dtype": c["kv_cache_dtype"],
             "enable_prefix_caching": c["enable_prefix_caching"],
             "version": c["version"],
+            "vram_bytes": (vram[0] if vram else None),
         })
     conn.close()
     return {"now": now * 1000, "instances": inst}
@@ -375,6 +383,7 @@ PAGE = r"""<!DOCTYPE html>
     box-shadow:0 0 0 100vmax rgba(0,0,0,.55);}
   .card.maximized canvas{max-height:calc(100vh - 90px);}
   .hidden-card{display:none !important;}
+  #instcard.collapsed #insttable{display:none;}
   canvas{max-height:240px;}
   .card h2.handle,.kpi h3.handle{cursor:grab;user-select:none;touch-action:none;
     margin:-10px -12px 6px;padding:6px 12px;border-radius:10px 10px 0 0;background:rgba(127,127,127,.06);}
@@ -457,11 +466,12 @@ PAGE = r"""<!DOCTYPE html>
 
 <div class="kpis" id="kpis"></div>
 
-<div class="card" style="margin:14px 16px 0">
+<div class="card" id="instcard" style="margin:14px 16px 0">
+  <div class="cardbtns"><button class="cbtn" id="insttoggle" title="Ein-/Ausklappen">▾</button></div>
   <h2>Instanzen</h2>
   <table id="insttable"><thead><tr>
-    <th>Status</th><th>Instanz</th><th>Modell</th><th>vLLM</th>
-    <th>KV-Kapazität</th><th>max_model_len</th><th>gpu_mem</th><th>Prefix-Cache</th>
+    <th>Status</th><th>Typ</th><th>Instanz</th><th>Modell</th><th>Version</th>
+    <th>KV-Kap. / VRAM</th><th>max_model_len</th><th>gpu_mem</th><th>Prefix-Cache</th>
   </tr></thead><tbody></tbody></table>
 </div>
 
@@ -523,6 +533,8 @@ const CHARTS=[
   desc:"Belegung des KV-Caches – des GPU-Speichers für die Kontexte laufender Requests.\n100 % = voll: neue oder lange Anfragen müssen warten oder werden verdrängt.\nDauerhaft hohe Werte deuten auf einen Speicherengpass hin."},
  {id:"kvtok",title:"KV-Belegung (Tokens, rel. zur Kapazität)",fields:[{k:"kv_tokens"}],
   desc:"Belegte KV-Cache-Tokens, absolut statt in Prozent.\nBezugsgröße ist die Kapazität num_gpu_blocks × block_size.\nZeigt, wie viel Kontext gleichzeitig im GPU-Speicher liegt."},
+ {id:"vram",title:"VRAM-Belegung (GB)",fields:[{k:"vram_bytes"}],
+  desc:"Vom geladenen Modell belegter GPU-Speicher in GB.\nQuelle: Ollama /api/ps (size_vram). Für Ollama-Instanzen.\nBei vLLM nicht verfügbar – dort bleibt das Panel leer."},
  {id:"req",title:"Requests aktiv / wartend",fields:[{k:"running",l:"aktiv"},{k:"waiting",l:"wartend",dash:[4,3]}],
   desc:"Anzahl der gerade verarbeiteten (aktiv) und in der Warteschlange\nstehenden (wartend) Anfragen dieses Modells.\nWartend > 0 heißt: die Instanz ist an der Kapazitätsgrenze."},
  {id:"waitreason",title:"Wartend nach Grund",fields:[{k:"waiting_capacity",l:"capacity"},{k:"waiting_deferred",l:"deferred",dash:[4,3]}],
@@ -686,6 +698,7 @@ function datasets(models,spec){
       const data=models[name].map(p=>{
         let y=p[f.k];
         if(spec.id==="kvtok"){y=(cap&&p.kv!=null)?Math.round(p.kv/100*cap):null;}
+        else if(spec.id==="vram"){y=(p.vram_bytes!=null)?Math.round(p.vram_bytes/1e7)/100:null;}
         return {x:p.t,y};
       }).filter(p=>p.y!==null&&p.y!==undefined);
       ds.push({label:shortModel(name)+(f.l?" · "+f.l:""),data,borderColor:color,backgroundColor:color,
@@ -735,10 +748,14 @@ function renderInstances(){
   if(!lastConfig)return;
   lastConfig.instances.forEach(i=>{
     const tr=document.createElement("tr");
-    const cap=i.capacity_tokens?Math.round(i.capacity_tokens).toLocaleString("de-DE")+" Tok":"–";
+    let capcell="–";
+    if(i.capacity_tokens){capcell=Math.round(i.capacity_tokens).toLocaleString("de-DE")+" Tok"
+      +(i.kv_cache_dtype?` <span style="color:var(--muted)">(${i.kv_cache_dtype})</span>`:"");}
+    else if(i.vram_bytes){capcell=(i.vram_bytes/1e9).toFixed(2)+" GB VRAM";}
     tr.innerHTML=`<td><span class="dot ${i.online?"on":"off"}"></span> ${i.online?"online":"offline"}</td>
+      <td>${i.kind||"vllm"}</td>
       <td>${i.host}:${i.port}</td><td>${shortModel(i.model)}</td><td>${i.version||"–"}</td>
-      <td>${cap}${i.kv_cache_dtype?` <span style="color:var(--muted)">(${i.kv_cache_dtype})</span>`:""}</td>
+      <td>${capcell}</td>
       <td>${i.max_model_len?Number(i.max_model_len).toLocaleString("de-DE"):"–"}</td>
       <td>${i.gpu_memory_utilization!=null?i.gpu_memory_utilization:"–"}</td>
       <td>${i.enable_prefix_caching==="True"?"an":"aus"}</td>`;
@@ -886,6 +903,14 @@ document.getElementById("export").onclick=exportCSV;
 document.getElementById("exportjson").onclick=()=>lastData&&download("vllm_metrics.json",JSON.stringify(lastData,null,2),"application/json");
 document.getElementById("theme").onclick=()=>applyTheme(document.body.dataset.theme==="dark"?"light":"dark");
 document.getElementById("restore").onclick=()=>{ saveHidden([]); applyHidden(); };
+// Instanzen-Karte einklappbar (Zustand im Cookie)
+(function(){
+  const ic=document.getElementById("instcard"), it=document.getElementById("insttoggle");
+  const sync=()=>{ it.textContent = ic.classList.contains("collapsed") ? "▸" : "▾"; };
+  if(store.get("vllm_inst_collapsed")==="1") ic.classList.add("collapsed");
+  sync();
+  it.onclick=()=>{ store.set("vllm_inst_collapsed", ic.classList.toggle("collapsed")?"1":"0"); sync(); };
+})();
 document.getElementById("notif").onclick=()=>{
   const st=document.getElementById("status");
   const say=t=>{ if(st)st.textContent=t; };

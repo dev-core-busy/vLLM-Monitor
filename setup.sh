@@ -136,22 +136,26 @@ do_install() {
     fi
 
     # gemerkte Werte laden
-    local D_IP="" D_TARGETS="9081:Qwen,9082:Gemma" D_BIND="0.0.0.0" D_PORT="8899" D_HTTPS="n"
+    local D_IP="" D_TARGETS="9081:Qwen,9082:Gemma" D_BIND="0.0.0.0" D_PORT="8899" D_HTTPS="n" D_OLLAMA=""
     [ -f "$CONF" ] && . "$CONF" 2>/dev/null
     D_IP="${VLLM_HOST:-$D_IP}"
     D_TARGETS="${VLLM_TARGETS:-$D_TARGETS}"
     D_BIND="${VLLM_BIND:-$D_BIND}"
     D_PORT="${VLLM_PORT:-$D_PORT}"
     D_HTTPS="${VLLM_HTTPS:-$D_HTTPS}"
+    D_OLLAMA="${VLLM_OLLAMA:-$D_OLLAMA}"
+    local D_STT="${VLLM_STT:-}"
 
     echo
-    local ip targets bind port https="n" ans
+    local ip targets bind port https="n" ans ollama stt
     while true; do
         ip="$(ask "Ziel-IP des vLLM-Hosts" "$D_IP")"
         if valid_ip "$ip"; then break; fi
         bad "Ungültige IP-Adresse – bitte erneut."
     done
-    targets="$(ask "Instanzen (port:label,port:label)" "$D_TARGETS")"
+    targets="$(ask "vLLM-Instanzen (port:label,port:label)" "$D_TARGETS")"
+    ollama="$(ask "Ollama-Instanz(en)? host:port:label (leer=keine, Autoscan bleibt aktiv)" "$D_OLLAMA")"
+    stt="$(ask "STT-Server (faster-whisper)? host:port:label (leer=keiner)" "$D_STT")"
     bind="$(ask "Dashboard-Bind (0.0.0.0=Netz, 127.0.0.1=nur lokal)" "$D_BIND")"
     port="$(ask "Dashboard-Port" "$D_PORT")"
     # Zertifikat muss auf die Adresse lauten, die der BROWSER aufruft (Dashboard-Host)
@@ -174,12 +178,19 @@ do_install() {
     cat > "$CONF" <<EOF
 VLLM_HOST=$ip
 VLLM_TARGETS=$targets
+VLLM_OLLAMA=$ollama
+VLLM_STT=$stt
 VLLM_BIND=$bind
 VLLM_PORT=$port
 VLLM_HTTPS=$https
 EOF
 
     mkdir -p "$UNIT_DIR"
+
+    local ollama_env=""
+    [ -n "$ollama" ] && ollama_env="Environment=VLLM_OLLAMA_TARGETS=$ollama"$'\n'"Environment=VLLM_OLLAMA_PROBE=1"
+    local stt_env=""
+    [ -n "$stt" ] && stt_env="Environment=VLLM_STT_TARGETS=$stt"
 
     cat > "$UNIT_DIR/vllm-collector.service" <<EOF
 [Unit]
@@ -192,6 +203,8 @@ Type=simple
 WorkingDirectory=$DIR
 Environment=VLLM_HOST=$ip
 Environment=VLLM_TARGETS=$targets
+${ollama_env}
+${stt_env}
 ExecStart=$PY $DIR/vllm_collector.sh loop
 Restart=always
 RestartSec=10
