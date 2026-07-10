@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.10.1-blue)
+![Version](https://img.shields.io/badge/version-0.11.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -132,6 +132,7 @@ Der Collector wird vollständig über **Umgebungsvariablen** gesteuert:
 | `VLLM_OLLAMA_PROBE` | `1` | Synthetischen Ollama-Probe (`/api/generate`) an/aus |
 | `VLLM_OLLAMA_AUTOSCAN` | `<host>:11434,127.0.0.1:11434` | Endpunkte, die auf ein Ollama geprüft und automatisch eingebunden werden (`""` = aus) |
 | `VLLM_STT_TARGETS` | *(leer)* | STT-Server (faster-whisper) `host:port:label,…` (nur `/health`) |
+| `VLLM_DCGM_TARGETS` | *(leer)* | NVIDIA DCGM-Exporter `host:port,…` (Standard-Port 9400) für GPU-Hardware-Metriken (Auslastung, VRAM, Temperatur, Leistung) |
 
 Dashboard:
 

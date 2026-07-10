@@ -57,11 +57,13 @@ cumulative counters + histogram sum/count). Rates and averages are derived at
 query time in the dashboard, never pre-aggregated — so counter resets (server
 restart) are handled by dropping negative deltas.
 
-**TODO (deferred):** true GPU-hardware metrics (SM %, VRAM, temperature, watts)
-are **not** yet collected — vLLM's `/metrics` only exposes engine-level data,
-and a read-only SSH user on the target host may have no `nvidia-smi` access. Add a
-DCGM/node exporter on the target (or a privileged probe) and a second collector
-source when that becomes available.
+GPU-hardware metrics (SM %, VRAM, temperature, watts) are collected via an
+external **NVIDIA DCGM exporter** (`VLLM_DCGM_TARGETS=host:port`, default port
+9400) — `scrape_dcgm()` parses the `DCGM_FI_DEV_*` Prometheus metrics per GPU
+and stores them as `kind="gpu"` rows; the dashboard renders dedicated GPU panels
+and a GPU KPI card. vLLM's own `/metrics` only exposes engine-level data, so this
+is a separate collector source. **TODO (deferred):** GPU→model attribution
+(which GPU runs which model) — only relevant once more than one GPU is present.
 
 `session.sh` is not a tool — it is a one-line helper that resumes a specific
 Claude Code session (`claude --resume <uuid>`).

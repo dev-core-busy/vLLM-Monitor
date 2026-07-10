@@ -33,7 +33,7 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -62,6 +62,11 @@ GAUGES = {
     "waiting_deferred": "waiting_deferred",
     "preemptions_total": "preemptions",
     "vram_bytes": "vram_bytes",
+    "gpu_util": "gpu_util",
+    "gpu_mem_util": "gpu_mem_util",
+    "gpu_temp": "gpu_temp",
+    "gpu_power": "gpu_power",
+    "vram_total_mb": "vram_total_mb",
 }
 # Histogramm-Bucket-Spalte -> (Feld-Präfix, Skalierung auf Anzeigeeinheit)
 HISTOS = {
@@ -407,6 +412,11 @@ PAGE = r"""<!DOCTYPE html>
   .card h2.handle:hover,.kpi h3.handle:hover{background:rgba(88,166,255,.12);}
   .card h2.handle:active,.kpi h3.handle:active{cursor:grabbing;}
   .card h2.handle::before,.kpi h3.handle::before{content:"⠿ ";color:var(--muted);opacity:.7;}
+  .cpick{margin-left:auto;width:20px;height:20px;padding:0;border:1px solid var(--border);
+    border-radius:5px;background:none;cursor:pointer;flex:0 0 auto;}
+  .cpick::-webkit-color-swatch-wrapper{padding:0;}
+  .cpick::-webkit-color-swatch{border:none;border-radius:4px;}
+  .cpick::-moz-color-swatch{border:none;border-radius:4px;}
   .dragging{opacity:.97;box-shadow:0 12px 34px rgba(0,0,0,.55);outline:2px solid var(--accent);
     border-radius:10px;transform:scale(1.02);cursor:grabbing;}
   .placeholder-slot{border:2px dashed var(--accent);border-radius:10px;background:rgba(88,166,255,.08);}
@@ -565,7 +575,13 @@ const CHARTS=[
  {id:"kvtok",title:"KV-Belegung (Tokens, rel. zur Kapazität)",fields:[{k:"kv_tokens"}],
   desc:"Belegte KV-Cache-Tokens, absolut statt in Prozent.\nBezugsgröße ist die Kapazität num_gpu_blocks × block_size.\nZeigt, wie viel Kontext gleichzeitig im GPU-Speicher liegt."},
  {id:"vram",title:"VRAM-Belegung (GB)",fields:[{k:"vram_bytes"}],
-  desc:"Vom geladenen Modell belegter GPU-Speicher in GB.\nQuelle: Ollama /api/ps (size_vram). Für Ollama-Instanzen.\nBei vLLM nicht verfügbar – dort bleibt das Panel leer."},
+  desc:"Belegter GPU-Speicher in GB.\nQuelle: DCGM (FB_USED je GPU) bzw. Ollama /api/ps (size_vram).\nBei vLLM-Instanzen nicht verfügbar – dort bleibt das Panel leer."},
+ {id:"gpu_util",title:"GPU-Auslastung (%)",fields:[{k:"gpu_util",l:"SM"},{k:"gpu_mem_util",l:"Mem",dash:[4,3]}],max:100,
+  desc:"GPU-Hardware-Auslastung (NVIDIA DCGM).\nSM = Rechenwerk-Auslastung, Mem = Speicher-Kopier-Auslastung.\nNur für GPU-Instanzen (DCGM-Exporter)."},
+ {id:"gpu_temp",title:"GPU-Temperatur (°C)",fields:[{k:"gpu_temp"}],
+  desc:"GPU-Kerntemperatur in °C (NVIDIA DCGM).\nSteigt unter Last; Drosselung droht bei Überhitzung.\nNur für GPU-Instanzen."},
+ {id:"gpu_power",title:"GPU-Leistung (W)",fields:[{k:"gpu_power"}],
+  desc:"Aktuelle Leistungsaufnahme der GPU in Watt (NVIDIA DCGM).\nIndikator für Auslastung/Energieverbrauch.\nNur für GPU-Instanzen."},
  {id:"req",title:"Requests aktiv / wartend",fields:[{k:"running",l:"aktiv"},{k:"waiting",l:"wartend",dash:[4,3]}],
   desc:"Anzahl der gerade verarbeiteten (aktiv) und in der Warteschlange\nstehenden (wartend) Anfragen dieses Modells.\nWartend > 0 heißt: die Instanz ist an der Kapazitätsgrenze."},
  {id:"waitreason",title:"Wartend nach Grund",fields:[{k:"waiting_capacity",l:"capacity"},{k:"waiting_deferred",l:"deferred",dash:[4,3]}],
@@ -606,9 +622,17 @@ const store={ get:k=>getCookie(k), set:(k,v)=>setCookie(k,v,365), del:k=>setCook
 
 // --- Stabile Modell-Farben + gemeinsame Legende (statt Legende je Diagramm) ---
 let modelColors={};
-const colorFor=m=>modelColors[m]||COLORS[0];
+let customColors=JSON.parse(store.get("vllm_colors")||"{}");   // vom Nutzer gewählte Farben
+const colorFor=m=>customColors[m]||modelColors[m]||COLORS[0];
 function computeColors(models){
   modelColors={}; Object.keys(models).sort().forEach((m,i)=>modelColors[m]=COLORS[i%COLORS.length]);
+}
+function setColor(m,c,rebuild){
+  customColors[m]=c; store.set("vllm_colors",JSON.stringify(customColors));
+  if(!lastData)return;
+  renderLegend(lastData.models);   // Legende + Diagramme live aktualisieren
+  CHARTS.forEach(spec=>{charts[spec.id].data.datasets=datasets(lastData.models,spec);charts[spec.id].update();});
+  if(rebuild)renderKPIs();         // KPI-Karten nur neu bauen, wenn Picker zu ist (sonst schließt er)
 }
 const hiddenModels=new Set(JSON.parse(store.get("vllm_hidden_models")||"[]"));
 const saveHiddenModels=()=>store.set("vllm_hidden_models",JSON.stringify([...hiddenModels]));
@@ -763,7 +787,7 @@ function datasets(models,spec){
 function num(v,d){return v==null?"–":(typeof v==="number"?(Number.isInteger(v)?v:v.toFixed(d==null?1:d)):v);}
 
 function renderKPIs(){
-  if(!lastData||window._dragging)return;   // laufendes Verschieben nicht stören
+  if(!lastData||window._dragging||window._picking)return;   // Verschieben/Farbwahl nicht stören
   const wrap=document.getElementById("kpis");wrap.innerHTML="";
   const alerts=[];
   const saved=JSON.parse(store.get("vllm_kpi_order")||"null");
@@ -772,23 +796,40 @@ function renderKPIs(){
     const s=lastData.models[model];const last=s.length?s[s.length-1]:{};
     const inst=lastConfig?lastConfig.instances.find(x=>x.model===model):null;
     const online=inst?inst.online:true;
-    const kv=last.kv||0, wait=last.waiting||0, err=last.error_ps||0;
-    const kvBad=kv>90, errBad=err>0;
+    const kind=inst?inst.kind:"vllm";
+    const kv=last.kv||0, wait=last.waiting||0, err=last.error_ps||0, temp=last.gpu_temp||0;
+    const kvBad=kv>90, errBad=err>0, tempBad=temp>85;
     if(!online)alerts.push(shortModel(model)+": offline");
     if(kvBad)alerts.push(shortModel(model)+": KV "+kv.toFixed(0)+"%");
     if(errBad)alerts.push(shortModel(model)+": Fehler");
-    const el=document.createElement("div");
-    el.className="kpi"+((kvBad||errBad||!online)?" alert":"");
-    el.dataset.id=model;
-    el.innerHTML=`<h3 class="handle"><span class="dot ${online?"on":"off"}"></span>${shortModel(model)}
-        <span style="margin-left:auto;font-size:11px;color:var(--muted)">${online?"online":"offline"}</span></h3>
-      <div class="row">
-        <div class="metric"><b>${num(last.running,0)}</b>aktiv${wait?` / ${num(wait,0)} wartend`:""}</div>
+    if(tempBad)alerts.push(shortModel(model)+": "+temp.toFixed(0)+"°C");
+    let row;
+    if(kind==="gpu"){
+      row=`<div class="metric"><b>${num(last.gpu_util,0)}%</b>GPU-Last</div>
+        <div class="metric"><b>${last.vram_bytes!=null?(last.vram_bytes/1e9).toFixed(0):"–"} GB</b>VRAM</div>
+        <div class="metric ${tempBad?"bad":""}"><b>${num(last.gpu_temp,0)} °C</b>Temp</div>
+        <div class="metric"><b>${num(last.gpu_power,0)} W</b>Leistung</div>`;
+    }else{
+      row=`<div class="metric"><b>${num(last.running,0)}</b>aktiv${wait?` / ${num(wait,0)} wartend`:""}</div>
         <div class="metric ${kvBad?"bad":""}"><b>${kv.toFixed(0)}%</b>KV-Cache</div>
         <div class="metric"><b>${num(last.gen_tps)}</b>gen tok/s</div>
         <div class="metric"><b>${num(last["ttft_"+pct])}</b>TTFT ${pct} (ms)</div>
-        <div class="metric ${errBad?"bad":""}"><b>${num(err,2)}</b>Fehler/s</div>
-      </div>`;
+        <div class="metric ${errBad?"bad":""}"><b>${num(err,2)}</b>Fehler/s</div>`;
+    }
+    const el=document.createElement("div");
+    el.className="kpi"+((kvBad||errBad||tempBad||!online)?" alert":"");
+    el.dataset.id=model;
+    el.innerHTML=`<h3 class="handle"><span class="dot ${online?"on":"off"}"></span>${shortModel(model)}
+        <input type="color" class="cpick" value="${colorFor(model)}" title="Diagramm-Farbe wählen">
+        <span style="font-size:11px;color:var(--muted)">${online?"online":"offline"}</span></h3>
+      <div class="row">${row}</div>`;
+    const pick=el.querySelector(".cpick");
+    // Farbwahl darf kein Verschieben auslösen
+    ["pointerdown","mousedown","click"].forEach(ev=>pick.addEventListener(ev,e=>e.stopPropagation()));
+    // Solange der Picker offen ist, kein Neuzeichnen der Karten (sonst schließt das Popup)
+    pick.addEventListener("focus",()=>{window._picking=true;});
+    pick.addEventListener("blur",()=>{window._picking=false;renderKPIs();});
+    pick.addEventListener("input",e=>setColor(model,e.target.value,false));
     wrap.appendChild(el);
   });
   makeSortable(wrap,()=>saveOrder(wrap,"vllm_kpi_order"));
@@ -897,19 +938,11 @@ function applyTheme(t){document.body.dataset.theme=t;store.set("vllm_theme",t);
 function buildGrid(){
   const g=document.getElementById("charts");
   const saved=JSON.parse(store.get("vllm_chart_order")||"null");
-  const gpuSpec={id:"gpu",gpu:true,title:"GPU-Hardware",
-    desc:"Platzhalter für echte GPU-Hardware-Werte (SM-Auslastung, VRAM,\nTemperatur, Leistungsaufnahme).\nNoch nicht verfügbar – benötigt einen DCGM-/node-Exporter auf dem Zielhost."};
   const btns=`<div class="cardbtns"><button class="cbtn max" title="Maximieren (Esc schließt)">⛶</button>`+
              `<button class="cbtn close" title="Kachel ausblenden">×</button></div>`;
-  orderBy(CHARTS.concat([gpuSpec]),saved,s=>s.id).forEach(spec=>{
+  orderBy(CHARTS,saved,s=>s.id).forEach(spec=>{
     const d=document.createElement("div");d.className="card";d.dataset.id=spec.id;
-    if(spec.gpu){
-      d.innerHTML=btns+`<h2 class="handle" title="${spec.desc||""}">GPU-Hardware</h2>
-        <div class="placeholder">SM-Auslastung, VRAM, Temperatur, Watt – noch nicht verfügbar.<br>
-        Benötigt einen DCGM-/node-Exporter auf dem Zielhost (Roadmap).</div>`;
-    }else{
-      d.innerHTML=btns+`<h2 class="handle" title="${spec.desc||""}">${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;
-    }
+    d.innerHTML=btns+`<h2 class="handle" title="${spec.desc||""}">${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;
     g.appendChild(d);
   });
   makeSortable(g,()=>saveOrder(g,"vllm_chart_order"));

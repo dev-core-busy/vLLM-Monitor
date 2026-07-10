@@ -145,9 +145,10 @@ do_install() {
     D_HTTPS="${VLLM_HTTPS:-$D_HTTPS}"
     D_OLLAMA="${VLLM_OLLAMA:-$D_OLLAMA}"
     local D_STT="${VLLM_STT:-}"
+    local D_DCGM="${VLLM_DCGM:-}"
 
     echo
-    local ip targets bind port https="n" ans ollama stt
+    local ip targets bind port https="n" ans ollama stt dcgm
     while true; do
         ip="$(ask "Ziel-IP des vLLM-Hosts" "$D_IP")"
         if valid_ip "$ip"; then break; fi
@@ -156,6 +157,7 @@ do_install() {
     targets="$(ask "vLLM-Instanzen (port:label,port:label)" "$D_TARGETS")"
     ollama="$(ask "Ollama-Instanz(en)? host:port:label (leer=keine, Autoscan bleibt aktiv)" "$D_OLLAMA")"
     stt="$(ask "STT-Server (faster-whisper)? host:port:label (leer=keiner)" "$D_STT")"
+    dcgm="$(ask "NVIDIA DCGM-Exporter (GPU)? host:port (leer=keiner)" "$D_DCGM")"
     bind="$(ask "Dashboard-Bind (0.0.0.0=Netz, 127.0.0.1=nur lokal)" "$D_BIND")"
     port="$(ask "Dashboard-Port" "$D_PORT")"
     # Zertifikat muss auf die Adresse lauten, die der BROWSER aufruft (Dashboard-Host)
@@ -180,6 +182,7 @@ VLLM_HOST=$ip
 VLLM_TARGETS=$targets
 VLLM_OLLAMA=$ollama
 VLLM_STT=$stt
+VLLM_DCGM=$dcgm
 VLLM_BIND=$bind
 VLLM_PORT=$port
 VLLM_HTTPS=$https
@@ -191,6 +194,8 @@ EOF
     [ -n "$ollama" ] && ollama_env="Environment=VLLM_OLLAMA_TARGETS=$ollama"$'\n'"Environment=VLLM_OLLAMA_PROBE=1"
     local stt_env=""
     [ -n "$stt" ] && stt_env="Environment=VLLM_STT_TARGETS=$stt"
+    local dcgm_env=""
+    [ -n "$dcgm" ] && dcgm_env="Environment=VLLM_DCGM_TARGETS=$dcgm"
 
     cat > "$UNIT_DIR/vllm-collector.service" <<EOF
 [Unit]
@@ -205,6 +210,7 @@ Environment=VLLM_HOST=$ip
 Environment=VLLM_TARGETS=$targets
 ${ollama_env}
 ${stt_env}
+${dcgm_env}
 ExecStart=$PY $DIR/vllm_collector.sh loop
 Restart=always
 RestartSec=10

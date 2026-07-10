@@ -4,6 +4,18 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.11.0] – 2026-07-10
+
+### Neu
+- **GPU-Hardware-Metriken** über einen **NVIDIA DCGM-Exporter**
+  (`VLLM_DCGM_TARGETS=host:port`, Standard-Port 9400): SM-/Speicher-Auslastung,
+  VRAM (belegt/gesamt), Temperatur und Leistungsaufnahme je GPU werden
+  mitgeschrieben. Dashboard zeigt eigene GPU-Panels (Auslastung, Temperatur,
+  Leistung) und eine GPU-KPI-Karte mit Temperatur-Warnung (> 85 °C).
+- **Farbwähler je Instanz**: In jeder KPI-Karte (Modelle **und** GPU) lässt sich
+  über ein Farbfeld die Diagramm-Farbe frei wählen; sie wird sofort in
+  gemeinsamer Legende und allen Diagrammen übernommen und im Cookie gemerkt.
+
 ## [0.10.1] – 2026-07-10
 
 ### Neu

@@ -33,7 +33,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -123,6 +123,17 @@ def _parse_hostports(spec):
 OLLAMA_AUTOSCAN = _parse_hostports(
     os.environ.get("VLLM_OLLAMA_AUTOSCAN", "%s:11434,127.0.0.1:11434" % HOST))
 
+# NVIDIA DCGM-Exporter (GPU-Hardware): host:port,... (Default-Port 9400)
+DCGM_TARGETS = _parse_hostports(os.environ.get("VLLM_DCGM_TARGETS", ""))
+DCGM_METRICS = {
+    "DCGM_FI_DEV_GPU_UTIL":      "gpu_util",       # %
+    "DCGM_FI_DEV_MEM_COPY_UTIL": "gpu_mem_util",   # %
+    "DCGM_FI_DEV_GPU_TEMP":      "gpu_temp",       # °C
+    "DCGM_FI_DEV_POWER_USAGE":   "gpu_power",      # W
+    "DCGM_FI_DEV_FB_USED":       "_fb_used",       # MiB
+    "DCGM_FI_DEV_FB_FREE":       "_fb_free",       # MiB
+}
+
 # Einfache Gauges/Counter (ein Wert je Modell bzw. über Serien summiert)
 GAUGE_COUNTER = {
     "vllm:num_requests_running":        "requests_running",
@@ -154,6 +165,7 @@ NUM_COLUMNS = [
 ] + ["req_%s" % r for r in FINISHED_REASONS] + [
     "ttft_sum", "ttft_count", "e2e_sum", "e2e_count", "itl_sum", "itl_count",
     "vram_bytes",
+    "gpu_util", "gpu_mem_util", "gpu_temp", "gpu_power", "vram_total_mb",
 ]
 # JSON-Textspalten (Histogramm-Buckets als {le: kumulativ})
 JSON_COLUMNS = ["ttft_buckets", "e2e_buckets", "itl_buckets"]
@@ -539,6 +551,52 @@ def discover_ollama():
     return found
 
 
+def scrape_dcgm(conn, ts, host, port, verbose=True):
+    """NVIDIA DCGM-Exporter (/metrics, Prometheus) -> GPU-Hardware je GPU."""
+    text = http_get(host, port, "/metrics")
+    if text is None:
+        mark_down(conn, host, port)
+        if verbose:
+            print("  [!] DCGM %s:%d nicht erreichbar." % (host, port))
+        return 0
+    per_gpu = {}
+    for name, labels, val in parse_prometheus(text):
+        col = DCGM_METRICS.get(name)
+        if not col:
+            continue
+        g = labels.get("gpu")
+        if g is None:
+            continue
+        d = per_gpu.setdefault(g, {"modelName": labels.get("modelName")})
+        d[col] = val
+        if labels.get("modelName"):
+            d["modelName"] = labels.get("modelName")
+    count = 0
+    for g, d in sorted(per_gpu.items()):
+        model = "GPU %s" % g
+        values = {c: None for c in (NUM_COLUMNS + JSON_COLUMNS)}
+        values["gpu_util"] = d.get("gpu_util")
+        values["gpu_mem_util"] = d.get("gpu_mem_util")
+        values["gpu_temp"] = d.get("gpu_temp")
+        values["gpu_power"] = d.get("gpu_power")
+        used, free = d.get("_fb_used"), d.get("_fb_free")
+        if used is not None:
+            values["vram_bytes"] = used * 1048576.0
+            if free is not None:
+                values["vram_total_mb"] = used + free
+        store_sample(conn, ts, host, port, model, values)
+        store_config(conn, host, port, model,
+                     {"up": 1, "version": d.get("modelName") or "GPU", "kind": "gpu"})
+        count += 1
+        if verbose:
+            print("  [+] (gpu)    %-8s util=%s%% vram=%s MiB temp=%s°C power=%sW"
+                  % (model, _fmt(values["gpu_util"]), _fmt(used),
+                     _fmt(values["gpu_temp"]), _fmt(values["gpu_power"])))
+    if not per_gpu and verbose:
+        print("  [!] DCGM %s:%d: keine DCGM_FI_DEV-Metriken gefunden." % (host, port))
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Scrape-Zyklus
 # ---------------------------------------------------------------------------
@@ -605,6 +663,13 @@ def scrape_once(conn, verbose=True):
             total += scrape_stt(conn, ts, tgt, verbose)
         except Exception as e:
             print("  [!] STT-Fehler %s:%d: %s" % (tgt["host"], tgt["port"], e))
+
+    # NVIDIA DCGM-Exporter (GPU-Hardware)
+    for host, port in DCGM_TARGETS:
+        try:
+            total += scrape_dcgm(conn, ts, host, port, verbose)
+        except Exception as e:
+            print("  [!] DCGM-Fehler %s:%d: %s" % (host, port, e))
 
     conn.commit()
     return total
