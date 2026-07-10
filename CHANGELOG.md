@@ -4,6 +4,16 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.11.2] – 2026-07-10
+
+### Geändert
+- Default-Farben angepasst: GPU = rot (`#B80F2E`), Qwen = blau (`#35628B`),
+  faster-whisper = grau (`#9C9D9F`); Gemma bleibt grün.
+
+### Behoben
+- Gewählter **Zeitraum** wird jetzt im Cookie (`vllm_range`) gemerkt und beim
+  nächsten Verbinden wiederhergestellt (statt immer auf 1 h zurückzuspringen).
+
 ## [0.11.1] – 2026-07-10
 
 ### Neu

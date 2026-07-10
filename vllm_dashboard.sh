@@ -33,7 +33,7 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.11.1"
+__version__ = "0.11.2"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -629,10 +629,10 @@ const colorFor=m=>customColors[m]||modelColors[m]||COLORS[0];
 // Feste Default-Farben je Instanz-Typ (überschreibbar per Farbwähler)
 function defaultColorFor(m){
   const s=m.toLowerCase();
-  if(s.startsWith("gpu")||s.includes("dcgm"))return "#d29922";                       // GPU = gelb
-  if(s.includes("qwen"))return "#58a6ff";                                            // Qwen = blau
+  if(s.startsWith("gpu")||s.includes("dcgm"))return "#B80F2E";                        // GPU = rot
+  if(s.includes("qwen"))return "#35628B";                                            // Qwen = blau
   if(s.includes("gemma"))return "#3fb950";                                           // Gemma = grün
-  if(s.includes("whisper")||s.includes("stt")||s.includes("faster"))return "#f778ba";// STT = rosa
+  if(s.includes("whisper")||s.includes("stt")||s.includes("faster"))return "#9C9D9F";// STT = grau/rosa
   return null;
 }
 function computeColors(models){
@@ -1006,7 +1006,7 @@ applyDensity(store.get("vllm_density")||"normal");
   gmenu.querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>gmenu.classList.remove("open")));
   document.addEventListener("click",e=>{ if(!gmenu.contains(e.target)&&e.target!==gear) gmenu.classList.remove("open"); });
 })();
-document.getElementById("range").onchange=()=>{fetchConfig();startRefresh();};
+document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeVal());fetchConfig();startRefresh();};
 document.getElementById("pct").onchange=()=>{if(lastData)applySeries(lastData);};
 document.getElementById("mode").onchange=startRefresh;
 document.getElementById("reload").onclick=()=>{fetchConfig();fetchOnce();};
@@ -1049,6 +1049,11 @@ document.getElementById("notif").onclick=()=>{
     else { say("Benachrichtigungen: "+p); alert("Benachrichtigungen wurden nicht erlaubt ("+p+")."); }
   });
 };
+// Zuletzt gewählten Zeitraum aus dem Cookie wiederherstellen
+(function(){
+  const saved=store.get("vllm_range"), sel=document.getElementById("range");
+  if(saved && [...sel.options].some(o=>o.value===saved)) sel.value=saved;
+})();
 fetchConfig();
 startRefresh();
 setInterval(fetchConfig,30000);
