@@ -33,7 +33,7 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -358,6 +358,7 @@ PAGE = r"""<!DOCTYPE html>
   }
   [data-density="kompakt"]{--tile-min:330px; --card-h:185px;}
   [data-density="dicht"]{--tile-min:235px; --card-h:135px;}
+  [data-density="sehrdicht"]{--tile-min:190px; --card-h:100px;}
   *{box-sizing:border-box}
   body{font-family:system-ui,sans-serif;margin:0;background:var(--bg);color:var(--fg);}
   header{padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--border);
@@ -467,6 +468,7 @@ PAGE = r"""<!DOCTYPE html>
     </select>
   </label>
   <span class="densgroup" title="Kacheldichte – mehr Punkte = mehr, kleinere Kacheln">
+    <button class="dbtn" data-d="sehrdicht" title="Sehr klein, sehr viele Kacheln (6×5)"><svg class="dg" viewBox="0 0 26 20"><circle cx="3.5" cy="2.8" r="1.05"/><circle cx="7.3" cy="2.8" r="1.05"/><circle cx="11.1" cy="2.8" r="1.05"/><circle cx="14.9" cy="2.8" r="1.05"/><circle cx="18.7" cy="2.8" r="1.05"/><circle cx="22.5" cy="2.8" r="1.05"/><circle cx="3.5" cy="6.4" r="1.05"/><circle cx="7.3" cy="6.4" r="1.05"/><circle cx="11.1" cy="6.4" r="1.05"/><circle cx="14.9" cy="6.4" r="1.05"/><circle cx="18.7" cy="6.4" r="1.05"/><circle cx="22.5" cy="6.4" r="1.05"/><circle cx="3.5" cy="10.0" r="1.05"/><circle cx="7.3" cy="10.0" r="1.05"/><circle cx="11.1" cy="10.0" r="1.05"/><circle cx="14.9" cy="10.0" r="1.05"/><circle cx="18.7" cy="10.0" r="1.05"/><circle cx="22.5" cy="10.0" r="1.05"/><circle cx="3.5" cy="13.6" r="1.05"/><circle cx="7.3" cy="13.6" r="1.05"/><circle cx="11.1" cy="13.6" r="1.05"/><circle cx="14.9" cy="13.6" r="1.05"/><circle cx="18.7" cy="13.6" r="1.05"/><circle cx="22.5" cy="13.6" r="1.05"/><circle cx="3.5" cy="17.2" r="1.05"/><circle cx="7.3" cy="17.2" r="1.05"/><circle cx="11.1" cy="17.2" r="1.05"/><circle cx="14.9" cy="17.2" r="1.05"/><circle cx="18.7" cy="17.2" r="1.05"/><circle cx="22.5" cy="17.2" r="1.05"/></svg></button>
     <button class="dbtn" data-d="dicht" title="Klein, viele Kacheln (5×4)"><svg class="dg" viewBox="0 0 26 20"><circle cx="4.3" cy="4.0" r="1.3"/><circle cx="8.7" cy="4.0" r="1.3"/><circle cx="13.0" cy="4.0" r="1.3"/><circle cx="17.3" cy="4.0" r="1.3"/><circle cx="21.7" cy="4.0" r="1.3"/><circle cx="4.3" cy="8.0" r="1.3"/><circle cx="8.7" cy="8.0" r="1.3"/><circle cx="13.0" cy="8.0" r="1.3"/><circle cx="17.3" cy="8.0" r="1.3"/><circle cx="21.7" cy="8.0" r="1.3"/><circle cx="4.3" cy="12.0" r="1.3"/><circle cx="8.7" cy="12.0" r="1.3"/><circle cx="13.0" cy="12.0" r="1.3"/><circle cx="17.3" cy="12.0" r="1.3"/><circle cx="21.7" cy="12.0" r="1.3"/><circle cx="4.3" cy="16.0" r="1.3"/><circle cx="8.7" cy="16.0" r="1.3"/><circle cx="13.0" cy="16.0" r="1.3"/><circle cx="17.3" cy="16.0" r="1.3"/><circle cx="21.7" cy="16.0" r="1.3"/></svg></button>
     <button class="dbtn" data-d="kompakt" title="Mittel (4×3)"><svg class="dg" viewBox="0 0 26 20"><circle cx="5.2" cy="5.0" r="1.7"/><circle cx="10.4" cy="5.0" r="1.7"/><circle cx="15.6" cy="5.0" r="1.7"/><circle cx="20.8" cy="5.0" r="1.7"/><circle cx="5.2" cy="10.0" r="1.7"/><circle cx="10.4" cy="10.0" r="1.7"/><circle cx="15.6" cy="10.0" r="1.7"/><circle cx="20.8" cy="10.0" r="1.7"/><circle cx="5.2" cy="15.0" r="1.7"/><circle cx="10.4" cy="15.0" r="1.7"/><circle cx="15.6" cy="15.0" r="1.7"/><circle cx="20.8" cy="15.0" r="1.7"/></svg></button>
     <button class="dbtn" data-d="normal" title="Große Kacheln (3×2)"><svg class="dg" viewBox="0 0 26 20"><circle cx="6.5" cy="6.7" r="2.2"/><circle cx="13.0" cy="6.7" r="2.2"/><circle cx="19.5" cy="6.7" r="2.2"/><circle cx="6.5" cy="13.3" r="2.2"/><circle cx="13.0" cy="13.3" r="2.2"/><circle cx="19.5" cy="13.3" r="2.2"/></svg></button>
@@ -624,8 +626,17 @@ const store={ get:k=>getCookie(k), set:(k,v)=>setCookie(k,v,365), del:k=>setCook
 let modelColors={};
 let customColors=JSON.parse(store.get("vllm_colors")||"{}");   // vom Nutzer gewählte Farben
 const colorFor=m=>customColors[m]||modelColors[m]||COLORS[0];
+// Feste Default-Farben je Instanz-Typ (überschreibbar per Farbwähler)
+function defaultColorFor(m){
+  const s=m.toLowerCase();
+  if(s.startsWith("gpu")||s.includes("dcgm"))return "#d29922";                       // GPU = gelb
+  if(s.includes("qwen"))return "#58a6ff";                                            // Qwen = blau
+  if(s.includes("gemma"))return "#3fb950";                                           // Gemma = grün
+  if(s.includes("whisper")||s.includes("stt")||s.includes("faster"))return "#f778ba";// STT = rosa
+  return null;
+}
 function computeColors(models){
-  modelColors={}; Object.keys(models).sort().forEach((m,i)=>modelColors[m]=COLORS[i%COLORS.length]);
+  modelColors={}; Object.keys(models).sort().forEach((m,i)=>modelColors[m]=defaultColorFor(m)||COLORS[i%COLORS.length]);
 }
 function setColor(m,c,rebuild){
   customColors[m]=c; store.set("vllm_colors",JSON.stringify(customColors));

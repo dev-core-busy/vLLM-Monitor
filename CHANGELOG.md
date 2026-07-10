@@ -4,6 +4,15 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.11.1] – 2026-07-10
+
+### Neu
+- **Vierte Kacheldichte 6×5** (noch kleinere Kacheln) als weiteres
+  Punktraster-Icon; Auswahl wie gehabt im Cookie gemerkt.
+- **Feste Default-Farben je Instanz**: Qwen = blau, faster-whisper = rosa,
+  Gemma = grün, GPU = gelb (namensbasiert statt nach Sortierung); weiterhin per
+  Farbwähler überschreibbar.
+
 ## [0.11.0] – 2026-07-10
 
 ### Neu
