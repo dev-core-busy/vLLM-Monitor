@@ -4,6 +4,17 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.9.4] – 2026-07-10
+
+### Neu
+- **Erklär-Tooltips**: Beim Überfahren jedes Kachel-Titels erscheint eine
+  3–4-zeilige Erläuterung, *was* das Diagramm zeigt und *wie* man es liest.
+
+### Geändert
+- **Layout-Persistenz in Cookies** statt localStorage: Kachel-Reihenfolge,
+  ausgeblendete Kacheln und Theme werden in Cookies gespeichert
+  (`SameSite=Lax`, 365 Tage) und beim Neuladen wiederhergestellt.
+
 ## [0.9.3] – 2026-07-10
 
 ### Neu

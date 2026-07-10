@@ -33,7 +33,7 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
 DEFAULT_PORT = 8899
@@ -519,25 +519,49 @@ const COLORS=["#58a6ff","#f778ba","#3fb950","#d29922","#a371f7","#ff7b72"];
 if(window.ChartZoom) Chart.register(window.ChartZoom);
 
 const CHARTS=[
- {id:"kv",title:"KV-Cache-Auslastung (%)",fields:[{k:"kv"}],max:100,threshold:90},
- {id:"kvtok",title:"KV-Belegung (Tokens, rel. zur Kapazität)",fields:[{k:"kv_tokens"}]},
- {id:"req",title:"Requests aktiv / wartend",fields:[{k:"running",l:"aktiv"},{k:"waiting",l:"wartend",dash:[4,3]}]},
- {id:"waitreason",title:"Wartend nach Grund",fields:[{k:"waiting_capacity",l:"capacity"},{k:"waiting_deferred",l:"deferred",dash:[4,3]}]},
- {id:"preempt",title:"Preemptions/s",fields:[{k:"preempt_ps"}]},
- {id:"gen",title:"Generierung (Tokens/s)",fields:[{k:"gen_tps"}]},
- {id:"prompt",title:"Prompt-Durchsatz (Tokens/s)",fields:[{k:"prompt_tps"}]},
- {id:"ttft",title:"Time-to-First-Token (ms)",pct:"ttft"},
- {id:"e2e",title:"E2E-Latenz (s)",pct:"e2e"},
- {id:"itl",title:"Inter-Token-Latenz (ms)",pct:"itl"},
- {id:"finish",title:"Requests nach Ergebnis (/s)",fields:[{k:"stop_ps",l:"stop"},{k:"error_ps",l:"error"},{k:"abort_ps",l:"abort",dash:[4,3]},{k:"length_ps",l:"length",dash:[2,2]}]},
- {id:"hit",title:"Prefix-Cache-Hit-Rate (%)",fields:[{k:"hit_rate"}],max:100},
+ {id:"kv",title:"KV-Cache-Auslastung (%)",fields:[{k:"kv"}],max:100,threshold:90,
+  desc:"Belegung des KV-Caches – des GPU-Speichers für die Kontexte laufender Requests.\n100 % = voll: neue oder lange Anfragen müssen warten oder werden verdrängt.\nDauerhaft hohe Werte deuten auf einen Speicherengpass hin."},
+ {id:"kvtok",title:"KV-Belegung (Tokens, rel. zur Kapazität)",fields:[{k:"kv_tokens"}],
+  desc:"Belegte KV-Cache-Tokens, absolut statt in Prozent.\nBezugsgröße ist die Kapazität num_gpu_blocks × block_size.\nZeigt, wie viel Kontext gleichzeitig im GPU-Speicher liegt."},
+ {id:"req",title:"Requests aktiv / wartend",fields:[{k:"running",l:"aktiv"},{k:"waiting",l:"wartend",dash:[4,3]}],
+  desc:"Anzahl der gerade verarbeiteten (aktiv) und in der Warteschlange\nstehenden (wartend) Anfragen dieses Modells.\nWartend > 0 heißt: die Instanz ist an der Kapazitätsgrenze."},
+ {id:"waitreason",title:"Wartend nach Grund",fields:[{k:"waiting_capacity",l:"capacity"},{k:"waiting_deferred",l:"deferred",dash:[4,3]}],
+  desc:"Warum Requests warten:\n'capacity' = keine Scheduling-/Speicherkapazität (echte Last).\n'deferred' = vorübergehende Beschränkung (z. B. KV-Transfer, LoRA-Budget)."},
+ {id:"preempt",title:"Preemptions/s",fields:[{k:"preempt_ps"}],
+  desc:"Rate der verdrängten Requests pro Sekunde.\n> 0 = KV-Cache-Druck: laufende Sequenzen werden pausiert und später\nneu berechnet – das kostet zusätzliche Zeit und Durchsatz."},
+ {id:"gen",title:"Generierung (Tokens/s)",fields:[{k:"gen_tps"}],
+  desc:"Ausgabe-Durchsatz: erzeugte Tokens pro Sekunde über alle Requests.\nKernmaß für die Antwortgeschwindigkeit unter Last.\nSinkt, wenn KV-Cache oder GPU zum Flaschenhals werden."},
+ {id:"prompt",title:"Prompt-Durchsatz (Tokens/s)",fields:[{k:"prompt_tps"}],
+  desc:"Verarbeitete Eingabe-(Prefill-)Tokens pro Sekunde.\nHoch bei langen Prompts oder vielen neuen Anfragen\n(typisch für RAG und Zusammenfassungen)."},
+ {id:"ttft",title:"Time-to-First-Token (ms)",pct:"ttft",
+  desc:"Zeit bis zum ersten Antwort-Token (gewähltes Perzentil).\nMaß für die gefühlte Reaktionszeit des Modells.\nSteigt bei Warteschlange oder langen Eingabe-Prompts."},
+ {id:"e2e",title:"E2E-Latenz (s)",pct:"e2e",
+  desc:"Gesamtdauer eines Requests: von Eingang bis zum letzten Token\n(gewähltes Perzentil). Enthält Warten + Prefill + Generierung.\nWichtigste Nutzer-Kennzahl für die Antwortdauer."},
+ {id:"itl",title:"Inter-Token-Latenz (ms)",pct:"itl",
+  desc:"Durchschnittlicher Abstand zwischen zwei Ausgabe-Tokens\n(gewähltes Perzentil). Bestimmt, wie flüssig die Antwort 'tippt'.\nHohe Werte = ruckelige/langsame Ausgabe."},
+ {id:"finish",title:"Requests nach Ergebnis (/s)",fields:[{k:"stop_ps",l:"stop"},{k:"error_ps",l:"error"},{k:"abort_ps",l:"abort",dash:[4,3]},{k:"length_ps",l:"length",dash:[2,2]}],
+  desc:"Abschlussrate nach Grund pro Sekunde:\nstop = normal beendet, length = Längenlimit erreicht,\nabort = abgebrochen, error = Fehler. error/abort > 0 = Probleme."},
+ {id:"hit",title:"Prefix-Cache-Hit-Rate (%)",fields:[{k:"hit_rate"}],max:100,
+  desc:"Anteil der Prompt-Tokens, die aus dem Prefix-Cache wiederverwendet\nwurden statt neu berechnet zu werden.\nHoch = effizient bei wiederkehrenden Prompt-Anfängen (System-Prompts, RAG)."},
 ];
 
 let charts={}, lastData=null, lastConfig=null, hoverX=null, resets=[];
 const shortModel=m=>m.split("/").pop();
 const css=v=>getComputedStyle(document.body).getPropertyValue(v).trim();
 
-// --- Verschiebbare Kacheln (Drag & Drop, Reihenfolge in localStorage) ---
+// --- Persistenz in Cookies (Layout, ausgeblendete Kacheln, Theme) ---
+function setCookie(name,value,days){
+  let exp="";
+  if(days){const d=new Date();d.setTime(d.getTime()+days*864e5);exp="; expires="+d.toUTCString();}
+  document.cookie=name+"="+encodeURIComponent(value)+exp+"; path=/; SameSite=Lax";
+}
+function getCookie(name){
+  const m=document.cookie.match(new RegExp("(?:^|; )"+name.replace(/([.*+?^${}()|[\]\\])/g,"\\$1")+"=([^;]*)"));
+  return m?decodeURIComponent(m[1]):null;
+}
+const store={ get:k=>getCookie(k), set:(k,v)=>setCookie(k,v,365), del:k=>setCookie(k,"",-1) };
+
+// --- Verschiebbare Kacheln (Drag & Drop, Reihenfolge in Cookie) ---
 function orderBy(items,saved,idOf){
   if(!saved||!saved.length)return items;
   const map=new Map(items.map(x=>[idOf(x),x]));
@@ -548,7 +572,7 @@ function orderBy(items,saved,idOf){
 }
 function saveOrder(container,key){
   const ids=[...container.children].map(c=>c.dataset.id).filter(Boolean);
-  localStorage.setItem(key,JSON.stringify(ids));
+  store.set(key,JSON.stringify(ids));
 }
 function afterElement(container,x,y,ph){
   // Treffer-Test: über welcher Karte steht der Zeiger? -> davor/danach einsortieren.
@@ -677,7 +701,7 @@ function renderKPIs(){
   if(!lastData||window._dragging)return;   // laufendes Verschieben nicht stören
   const wrap=document.getElementById("kpis");wrap.innerHTML="";
   const alerts=[];
-  const saved=JSON.parse(localStorage.getItem("vllm_kpi_order")||"null");
+  const saved=JSON.parse(store.get("vllm_kpi_order")||"null");
   const pct=document.getElementById("pct").value;
   orderBy(Object.keys(lastData.models).sort(),saved,m=>m).forEach(model=>{
     const s=lastData.models[model];const last=s.length?s[s.length-1]:{};
@@ -792,7 +816,7 @@ function maybeNotify(alerts){
 }
 
 // --- Theme ---
-function applyTheme(t){document.body.dataset.theme=t;localStorage.setItem("vllm_theme",t);
+function applyTheme(t){document.body.dataset.theme=t;store.set("vllm_theme",t);
   // Chart-Farben neu setzen
   Object.values(charts).forEach(c=>{c.options.scales.x.ticks.color=css("--muted");c.options.scales.x.grid.color=css("--grid");
     c.options.scales.y.ticks.color=css("--muted");c.options.scales.y.grid.color=css("--grid");
@@ -801,18 +825,19 @@ function applyTheme(t){document.body.dataset.theme=t;localStorage.setItem("vllm_
 // --- Init ---
 function buildGrid(){
   const g=document.getElementById("charts");
-  const saved=JSON.parse(localStorage.getItem("vllm_chart_order")||"null");
-  const gpuSpec={id:"gpu",gpu:true,title:"GPU-Hardware"};
+  const saved=JSON.parse(store.get("vllm_chart_order")||"null");
+  const gpuSpec={id:"gpu",gpu:true,title:"GPU-Hardware",
+    desc:"Platzhalter für echte GPU-Hardware-Werte (SM-Auslastung, VRAM,\nTemperatur, Leistungsaufnahme).\nNoch nicht verfügbar – benötigt einen DCGM-/node-Exporter auf dem Zielhost."};
   const btns=`<div class="cardbtns"><button class="cbtn max" title="Maximieren (Esc schließt)">⛶</button>`+
              `<button class="cbtn close" title="Kachel ausblenden">×</button></div>`;
   orderBy(CHARTS.concat([gpuSpec]),saved,s=>s.id).forEach(spec=>{
     const d=document.createElement("div");d.className="card";d.dataset.id=spec.id;
     if(spec.gpu){
-      d.innerHTML=btns+`<h2 class="handle">GPU-Hardware</h2>
+      d.innerHTML=btns+`<h2 class="handle" title="${spec.desc||""}">GPU-Hardware</h2>
         <div class="placeholder">SM-Auslastung, VRAM, Temperatur, Watt – noch nicht verfügbar.<br>
         Benötigt einen DCGM-/node-Exporter auf dem Zielhost (Roadmap).</div>`;
     }else{
-      d.innerHTML=btns+`<h2 class="handle">${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;
+      d.innerHTML=btns+`<h2 class="handle" title="${spec.desc||""}">${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;
     }
     g.appendChild(d);
   });
@@ -823,8 +848,8 @@ function buildGrid(){
 }
 
 // --- Maximieren / Ausblenden ---
-const loadHidden=()=>{try{return JSON.parse(localStorage.getItem("vllm_hidden")||"[]");}catch(e){return [];}};
-const saveHidden=h=>localStorage.setItem("vllm_hidden",JSON.stringify(h));
+const loadHidden=()=>{try{return JSON.parse(store.get("vllm_hidden")||"[]");}catch(e){return [];}};
+const saveHidden=h=>store.set("vllm_hidden",JSON.stringify(h));
 function applyHidden(){
   const h=loadHidden();
   document.querySelectorAll("#charts > [data-id]").forEach(c=>c.classList.toggle("hidden-card",h.includes(c.dataset.id)));
@@ -851,7 +876,7 @@ document.addEventListener("keydown",e=>{
 });
 
 buildGrid();
-applyTheme(localStorage.getItem("vllm_theme")||"dark");
+applyTheme(store.get("vllm_theme")||"dark");
 document.getElementById("range").onchange=()=>{fetchConfig();startRefresh();};
 document.getElementById("pct").onchange=()=>{if(lastData)applySeries(lastData);};
 document.getElementById("mode").onchange=startRefresh;
