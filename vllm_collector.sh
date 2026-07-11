@@ -33,7 +33,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.12.2"
+__version__ = "0.13.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -63,6 +63,12 @@ INTERVAL = int(os.environ.get("VLLM_INTERVAL", "15"))
 RETENTION_DAYS = int(os.environ.get("VLLM_RETENTION_DAYS", "30"))
 HTTP_TIMEOUT = float(os.environ.get("VLLM_HTTP_TIMEOUT", "15"))
 PURGE_EVERY = 240
+
+# --- Schwellwerte für Alarme (konfigurierbar; das Dashboard liest dieselben Env) ---
+ALERT_KV = float(os.environ.get("VLLM_ALERT_KV", "90"))                    # KV-Cache % (>)
+ALERT_TEMP = float(os.environ.get("VLLM_ALERT_TEMP", "85"))               # GPU-Temperatur °C (>)
+ALERT_ERR = float(os.environ.get("VLLM_ALERT_ERR", "0"))                  # neue Fehler je Scrape (>)
+ALERT_OFFLINE_MIN = float(os.environ.get("VLLM_ALERT_OFFLINE_MIN", "1"))  # Minuten offline bis Alarm
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -240,6 +246,22 @@ def init_db(conn):
     have_c = {r[1] for r in conn.execute("PRAGMA table_info(config)")}
     if "kind" not in have_c:
         conn.execute("ALTER TABLE config ADD COLUMN kind TEXT")
+    # Alarm-Historie: ein Ereignis je Zustandswechsel (raised/cleared)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            host TEXT NOT NULL,
+            port INTEGER NOT NULL,
+            model TEXT,
+            kind TEXT NOT NULL,        -- offline|kv|temp|error
+            state TEXT NOT NULL,       -- raised|cleared
+            severity TEXT,             -- warn|crit
+            value REAL,
+            message TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
     conn.commit()
 
 
@@ -270,9 +292,44 @@ def mark_down(conn, host, port):
                  (int(time.time()), host, port))
 
 
+# --- Alarm-Erkennung: nur Zustandswechsel werden als Ereignis protokolliert ---
+_alert_state = {}   # (host, port, model, kind) -> {"since": ts}
+_down_since = {}    # (host, port) -> ts, seit wann nicht erreichbar
+_prev_err = {}      # (host, port, model) -> requests_error_total (für Delta)
+
+
+def record_alert(conn, ts, host, port, model, kind, active,
+                 value=None, msg="", severity="warn"):
+    """Schreibt ein Ereignis nur beim Wechsel aktiv<->inaktiv."""
+    key = (host, port, model or "", kind)
+    if active and key not in _alert_state:
+        _alert_state[key] = {"since": ts}
+        conn.execute(
+            "INSERT INTO events (ts,host,port,model,kind,state,severity,value,message) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (ts, host, port, model, kind, "raised", severity, value, msg))
+    elif (not active) and key in _alert_state:
+        since = _alert_state.pop(key)["since"]
+        conn.execute(
+            "INSERT INTO events (ts,host,port,model,kind,state,severity,value,message) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (ts, host, port, model, kind, "cleared", severity, value,
+             "behoben nach %s" % _human_dur(ts - since)))
+
+
+def _human_dur(sec):
+    sec = int(sec)
+    if sec < 60:
+        return "%ds" % sec
+    if sec < 3600:
+        return "%dm" % (sec // 60)
+    return "%dh%dm" % (sec // 3600, (sec % 3600) // 60)
+
+
 def purge_old(conn):
     cutoff = int(time.time()) - RETENTION_DAYS * 86400
     conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+    conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
     conn.commit()
 
 
@@ -587,6 +644,10 @@ def scrape_dcgm(conn, ts, host, port, verbose=True):
         store_sample(conn, ts, host, port, model, values)
         store_config(conn, host, port, model,
                      {"up": 1, "version": d.get("modelName") or "GPU", "kind": "gpu"})
+        temp = values.get("gpu_temp")
+        if temp is not None:
+            record_alert(conn, ts, host, port, model, "temp", temp > ALERT_TEMP,
+                         value=temp, msg="GPU %.0f °C" % temp, severity="crit")
         count += 1
         if verbose:
             print("  [+] (gpu)    %-8s util=%s%% vram=%s MiB temp=%s°C power=%sW"
@@ -609,7 +670,14 @@ def scrape_once(conn, verbose=True):
         text = fetch_text(port, "/metrics")
         if text is None:
             mark_down(conn, HOST, port)
+            _down_since.setdefault((HOST, port), ts)
+            if ts - _down_since[(HOST, port)] >= ALERT_OFFLINE_MIN * 60:
+                record_alert(conn, ts, HOST, port, None, "offline", True,
+                             msg="Instanz offline", severity="crit")
             continue
+        # erreichbar -> evtl. bestehenden Offline-Alarm auflösen
+        _down_since.pop((HOST, port), None)
+        record_alert(conn, ts, HOST, port, None, "offline", False, severity="crit")
         samples = parse_prometheus(text)
         per_model = extract(samples)
         cfg = extract_config(samples)
@@ -643,6 +711,19 @@ def scrape_once(conn, verbose=True):
             mc["version"] = version
             mc["kind"] = "vllm"
             store_config(conn, HOST, port, model, mc)
+            # Schwellwert-Alarme (KV-Cache, neue Fehler)
+            kv = values.get("kv_cache_usage")
+            if kv is not None:
+                record_alert(conn, ts, HOST, port, model, "kv", (kv * 100.0) > ALERT_KV,
+                             value=kv * 100.0, msg="KV-Cache %.0f%%" % (kv * 100.0))
+            et = values.get("requests_error_total")
+            if et is not None:
+                prev = _prev_err.get((HOST, port, model))
+                _prev_err[(HOST, port, model)] = et
+                if prev is not None:
+                    new = et - prev
+                    record_alert(conn, ts, HOST, port, model, "error", new > ALERT_ERR,
+                                 value=new, msg="%d neue Fehler" % int(new))
             total += 1
             if verbose:
                 print("  [+] %-40s run=%s kv=%s gen=%s"

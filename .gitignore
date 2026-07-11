@@ -3,6 +3,7 @@ vllm_metrics.db
 *.db-wal
 *.db-shm
 *.log
+reports/
 
 # Lokales / Sensibles (nicht veröffentlichen)
 session.sh

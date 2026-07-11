@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.12.2-blue)
+![Version](https://img.shields.io/badge/version-0.13.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -55,10 +55,22 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
   (KV %, Fehler, offline) mit optionaler Browser-Benachrichtigung.
 - 📐 **Latenz-Perzentile P50/P95/P99** (TTFT/E2E/ITL) aus den Histogramm-Buckets.
 - 🤖 **KI-Auswertung je Diagramm** – der 🔍-Button öffnet ein Analyse-Panel mit
-  lokal berechneten Kennzahlen (Ø/Min/Max/Aktuell/Trend, Modellvergleich) und
-  einer optionalen KI-Bewertung. Die KI läuft über einen frei konfigurierbaren
-  **OpenAI-kompatiblen Chat-Endpunkt** – z. B. direkt eine der überwachten
-  vLLM-Instanzen, sodass keine Daten das Netz verlassen.
+  lokal berechneten Kennzahlen (Ø/Min/Max/Aktuell/Trend, Modellvergleich),
+  **Ausreißer-Erkennung** und **Prognose** sowie einer optionalen KI-Bewertung.
+  Die KI läuft über einen frei konfigurierbaren **OpenAI-kompatiblen
+  Chat-Endpunkt** – z. B. direkt eine der überwachten vLLM-Instanzen, sodass
+  keine Daten das Netz verlassen. Zusätzlich ein **KI-Gesamt-Report** über alle
+  Diagramme auf einen Klick.
+- 🚨 **Alarm-Historie** – der Collector protokolliert Zustandswechsel (offline,
+  KV-Cache, GPU-Temp, Fehler) mit Dauer; Schwellwerte sind konfigurierbar. KPI-
+  Karten zeigen „offline seit X".
+- 🧮 **Anomalie-Erkennung ohne KI** (robuste MAD-Analyse) als rote Marker in
+  allen Diagrammen; **Zeitraum-Vergleich** (vorige Periode / gestern / letzte
+  Woche) als Overlay; **Effizienz-/Kapazitäts-KPIs** (Tokens/Tag, GPU-Stunden,
+  tok/s pro Watt) und Sättigungs-Prognose.
+- 🗓️ **Geplanter KI-Schicht-Report** (`report`-CLI + systemd-Timer) schreibt
+  einen deutschen Betriebs-Report in eine Datei.
+- 📐 **Latenz-Perzentile P50/P95/P99** (TTFT/E2E/ITL) aus den Histogramm-Buckets.
 - ⚡ **Live-Push (SSE)**, Zoom/Pan, synchrones Fadenkreuz, Counter-Reset-Marker,
   CSV-/JSON-Export, Hell/Dunkel, frei wählbare Kachelfarben & -dichte,
   Health-Übersicht & KV-Kapazität je Instanz.
@@ -139,6 +151,10 @@ Der Collector wird vollständig über **Umgebungsvariablen** gesteuert:
 | `VLLM_OLLAMA_AUTOSCAN` | `<host>:11434,127.0.0.1:11434` | Endpunkte, die auf ein Ollama geprüft und automatisch eingebunden werden (`""` = aus) |
 | `VLLM_STT_TARGETS` | *(leer)* | STT-Server (faster-whisper) `host:port:label,…` (nur `/health`) |
 | `VLLM_DCGM_TARGETS` | *(leer)* | NVIDIA DCGM-Exporter `host:port,…` (Standard-Port 9400) für GPU-Hardware-Metriken (Auslastung, VRAM, Temperatur, Leistung) |
+| `VLLM_ALERT_KV` | `90` | Alarm-Schwelle KV-Cache in % (>) |
+| `VLLM_ALERT_TEMP` | `85` | Alarm-Schwelle GPU-Temperatur in °C (>) |
+| `VLLM_ALERT_ERR` | `0` | Alarm-Schwelle: neue Fehler je Scrape (>) |
+| `VLLM_ALERT_OFFLINE_MIN` | `1` | Minuten offline, bis ein Offline-Alarm ausgelöst wird |
 
 Dashboard:
 
@@ -149,7 +165,15 @@ Dashboard:
 | `VLLM_AI_URL` | *(leer)* | KI-Auswertung: OpenAI-kompatibler Chat-Endpunkt (`host:port` oder volle `…/v1/chat/completions`-URL; leer = aus). Gilt für **alle** Frontends. |
 | `VLLM_AI_MODEL` | *(leer)* | Modellname für die KI-Auswertung (lt. `/v1/models`) |
 | `VLLM_AI_KEY` | *(leer)* | Optionaler Bearer-Token (lokales vLLM meist ohne). Wird nie im Browser gespeichert oder ausgeliefert. |
-| `VLLM_AI_MAX_TOKENS` | `1500` | Token-Budget der KI-Antwort (Reasoning-Modelle brauchen mehr) |
+| `VLLM_AI_MAX_TOKENS` | `2000` | Token-Budget der KI-Antwort |
+| `VLLM_AI_NO_THINK` | `0` | `1` schaltet die Denk-Phase von Reasoning-Modellen (Qwen3 u. a.) ab (`chat_template_kwargs.enable_thinking=false`) – liefert direkte, saubere Antworten. Empfohlen bei vLLM. |
+| `VLLM_REPORT_DIR` | `reports/` | Zielordner für geplante KI-Schicht-Reports |
+| `VLLM_REPORT_RANGE` | `28800` | Zeitfenster des Reports in Sekunden (Default 8 h) |
+
+**Geplanter KI-Schicht-Report:** `python3 vllm_dashboard.sh report [sekunden]`
+erzeugt einen deutschen Betriebs-Report (Kennzahlen + Alarme + KI-Bewertung) und
+legt ihn unter `VLLM_REPORT_DIR` ab. `setup.sh` kann dafür einen systemd-Timer
+einrichten (Abfrage `OnCalendar`, z. B. `*-*-* 06,14,22:00`).
 
 Die KI-Auswertung wird **ausschließlich server-seitig** über `VLLM_AI_*`
 konfiguriert (Env bzw. `setup.sh`) – es gibt keine Konfiguration im Browser.

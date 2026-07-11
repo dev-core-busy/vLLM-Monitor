@@ -148,9 +148,10 @@ do_install() {
     local D_DCGM="${VLLM_DCGM:-}"
     local D_AI_URL="${VLLM_AI_URL:-}"
     local D_AI_MODEL="${VLLM_AI_MODEL:-}"
+    local D_REPORT="${VLLM_REPORT:-}"
 
     echo
-    local ip targets bind port https="n" ans ollama stt dcgm ai_url ai_model
+    local ip targets bind port https="n" ans ollama stt dcgm ai_url ai_model report_when
     while true; do
         ip="$(ask "Ziel-IP des vLLM-Hosts" "$D_IP")"
         if valid_ip "$ip"; then break; fi
@@ -163,6 +164,8 @@ do_install() {
     ai_url="$(ask "KI-Auswertung: Chat-Endpunkt (host:port o. .../v1/chat/completions, leer=aus)" "$D_AI_URL")"
     ai_model=""
     [ -n "$ai_url" ] && ai_model="$(ask "KI-Modell (Name lt. /v1/models)" "$D_AI_MODEL")"
+    report_when=""
+    [ -n "$ai_url" ] && report_when="$(ask "Geplanter KI-Schicht-Report? systemd OnCalendar (z.B. '*-*-* 06,14,22:00', leer=aus)" "$D_REPORT")"
     bind="$(ask "Dashboard-Bind (0.0.0.0=Netz, 127.0.0.1=nur lokal)" "$D_BIND")"
     port="$(ask "Dashboard-Port" "$D_PORT")"
     # Zertifikat muss auf die Adresse lauten, die der BROWSER aufruft (Dashboard-Host)
@@ -190,6 +193,7 @@ VLLM_STT=$stt
 VLLM_DCGM=$dcgm
 VLLM_AI_URL=$ai_url
 VLLM_AI_MODEL=$ai_model
+VLLM_REPORT=$report_when
 VLLM_BIND=$bind
 VLLM_PORT=$port
 VLLM_HTTPS=$https
@@ -229,7 +233,7 @@ EOF
     local tls_env=""
     [ "$https" = "j" ] && tls_env="Environment=VLLM_TLS_CERT=$CERT"$'\n'"Environment=VLLM_TLS_KEY=$KEY"
     local ai_env=""
-    [ -n "$ai_url" ] && ai_env="Environment=VLLM_AI_URL=$ai_url"$'\n'"Environment=VLLM_AI_MODEL=$ai_model"
+    [ -n "$ai_url" ] && ai_env="Environment=VLLM_AI_URL=$ai_url"$'\n'"Environment=VLLM_AI_MODEL=$ai_model"$'\n'"Environment=VLLM_AI_NO_THINK=1"
 
     cat > "$UNIT_DIR/vllm-dashboard.service" <<EOF
 [Unit]
@@ -250,9 +254,41 @@ RestartSec=10
 WantedBy=default.target
 EOF
 
+    # Optionaler geplanter KI-Schicht-Report (oneshot service + timer)
+    if [ -n "$report_when" ]; then
+        cat > "$UNIT_DIR/vllm-report.service" <<EOF
+[Unit]
+Description=vLLM KI-Schicht-Report
+
+[Service]
+Type=oneshot
+WorkingDirectory=$DIR
+Environment=VLLM_HOST=$ip
+Environment=VLLM_TARGETS=$targets
+${ai_env}
+ExecStart=$PY $DIR/vllm_dashboard.sh report
+EOF
+        cat > "$UNIT_DIR/vllm-report.timer" <<EOF
+[Unit]
+Description=Zeitplan für den vLLM KI-Schicht-Report
+
+[Timer]
+OnCalendar=$report_when
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    else
+        systemctl --user disable --now vllm-report.timer 2>/dev/null
+        rm -f "$UNIT_DIR/vllm-report.service" "$UNIT_DIR/vllm-report.timer"
+    fi
+
     echo
     systemctl --user daemon-reload
     systemctl --user enable "${SERVICES[@]}" 2>/dev/null
+    [ -n "$report_when" ] && systemctl --user enable --now vllm-report.timer 2>/dev/null \
+        && ok "Report-Timer aktiv: $report_when"
     # restart (nicht nur start), damit geänderte Unit-Env auch bei laufendem Dienst greift
     if systemctl --user restart "${SERVICES[@]}" 2>/dev/null; then
         ok "Dienste installiert und (neu) gestartet."
@@ -290,9 +326,11 @@ do_uninstall() {
     fi
 
     systemctl --user disable --now "${SERVICES[@]}" 2>/dev/null
+    systemctl --user disable --now vllm-report.timer 2>/dev/null
     for s in "${SERVICES[@]}"; do rm -f "$UNIT_DIR/$s"; done
+    rm -f "$UNIT_DIR/vllm-report.service" "$UNIT_DIR/vllm-report.timer"
     systemctl --user daemon-reload
-    systemctl --user reset-failed "${SERVICES[@]}" 2>/dev/null
+    systemctl --user reset-failed "${SERVICES[@]}" vllm-report.timer 2>/dev/null
     ok "Dienste gestoppt, deaktiviert und Unit-Dateien entfernt."
 
     local a

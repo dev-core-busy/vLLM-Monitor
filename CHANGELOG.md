@@ -4,6 +4,35 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.13.0] – 2026-07-11
+
+### Neu
+- **Alarm-Historie:** Der Collector protokolliert Zustandswechsel (offline,
+  KV-Cache, GPU-Temperatur, Fehler) als Ereignisse in einer neuen `events`-
+  Tabelle – jeweils „ausgelöst"/„behoben" mit Dauer. Dashboard: einklappbare
+  Alarm-Historie-Karte + `GET /api/alerts`.
+- **Konfigurierbare Schwellwerte** (statt hart im Code): `VLLM_ALERT_KV`,
+  `VLLM_ALERT_TEMP`, `VLLM_ALERT_ERR`, `VLLM_ALERT_OFFLINE_MIN` – von Collector
+  und Dashboard genutzt, ans Frontend über `/api/config` gereicht.
+- **„Instanz seit X min offline"** in KPI-Karten und Alarmtexten.
+- **Anomalie-Erkennung ohne KI** (robuste Median/MAD-Analyse): Ausreißer im
+  Analyse-Panel + als rote Marker in allen Diagrammen (Toolbar „⚠ Anomalien").
+- **Prognose** je Serie im Analyse-Panel (lineare Extrapolation, ETA bis
+  Sättigung/Schwelle).
+- **Zeitraum-Vergleich** als Overlay (vorige Periode / gestern / letzte Woche)
+  über `GET /api/series?offset=…`.
+- **Effizienz-/Kapazitäts-KPIs** (Tokens/Tag, GPU-Vollast-Std./Tag, tok/s pro
+  Watt) als eigene Karte.
+- **KI-Gesamt-Report** über alle Diagramme auf einen Klick (Toolbar „📋 KI-
+  Report").
+- **Geplanter KI-Schicht-Report:** `vllm_dashboard.sh report [sekunden]` schreibt
+  einen deutschen Betriebs-Report in `VLLM_REPORT_DIR`; `setup.sh` richtet dafür
+  optional einen systemd-Timer ein.
+- **Reasoning-Abschaltung** `VLLM_AI_NO_THINK=1` (`chat_template_kwargs.
+  enable_thinking=false`) für saubere, direkte KI-Antworten; `max_tokens` pro
+  Anfrage überschreibbar; Defaults erhöht (`VLLM_AI_MAX_TOKENS=2000`,
+  `VLLM_AI_TIMEOUT=120`).
+
 ## [0.12.2] – 2026-07-11
 
 ### Geändert

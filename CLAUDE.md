@@ -31,8 +31,20 @@ one or more vLLM instances (host via `VLLM_HOST`, ports/labels via
   The AI call is proxied server-side via `POST /api/analyze` → an
   OpenAI-compatible chat endpoint (`VLLM_AI_URL`/`VLLM_AI_MODEL`/`VLLM_AI_KEY`,
   e.g. one of the monitored vLLM instances). `ai_analyze()` normalizes the URL
-  (accepts `host:port`, `…/v1`, or the full path) and falls back to the
-  `reasoning` field for reasoning models (Qwen3) when `content` is empty.
+  (accepts `host:port`, `…/v1`, or the full path), sets
+  `chat_template_kwargs.enable_thinking=false` when `VLLM_AI_NO_THINK=1`, and
+  falls back to the `reasoning` field for reasoning models (Qwen3) when
+  `content` is empty. The analysis panel also shows deterministic anomaly
+  detection (median/MAD) and a linear forecast; a "📋 KI-Report" button sends an
+  aggregate prompt over all charts. `GET /api/alerts` serves the alert history,
+  `GET /api/series?offset=…` returns a shifted window for period comparison, and
+  `vllm_dashboard.sh report [seconds]` writes a scheduled shift report to
+  `VLLM_REPORT_DIR` (systemd timer via `setup.sh`).
+
+The collector evaluates **configurable alert thresholds** (`VLLM_ALERT_KV/TEMP/
+ERR/OFFLINE_MIN`, also read by the dashboard and exposed in `/api/config`) and
+records state transitions (raised/cleared) into an `events` table — one row per
+change, not per scrape.
 
 Both files are named `*.sh` but are **Python 3** (shebang `#!/usr/bin/env
 python3`) and use **only the standard library** — no `pip install` needed.

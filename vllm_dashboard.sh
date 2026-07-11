@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.12.2"
+__version__ = "0.13.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -48,9 +48,22 @@ PUSH_INTERVAL = 5           # SSE-Push-Takt (Sekunden)
 AI_URL = os.environ.get("VLLM_AI_URL", "")        # z. B. http://host:9081/v1/chat/completions
 AI_MODEL = os.environ.get("VLLM_AI_MODEL", "")
 AI_KEY = os.environ.get("VLLM_AI_KEY", "")
-AI_TIMEOUT = float(os.environ.get("VLLM_AI_TIMEOUT", "90"))
-AI_MAX_TOKENS = int(os.environ.get("VLLM_AI_MAX_TOKENS", "1500"))
+AI_TIMEOUT = float(os.environ.get("VLLM_AI_TIMEOUT", "120"))
+AI_MAX_TOKENS = int(os.environ.get("VLLM_AI_MAX_TOKENS", "2000"))
+# Reasoning-Modelle (Qwen3 u.a.): Denk-Phase abschalten -> saubere, kurze Antwort
+AI_NO_THINK = os.environ.get("VLLM_AI_NO_THINK", "0").lower() not in ("0", "false", "no", "off", "")
 STALE_AFTER = 90            # Instanz gilt als offline, wenn älter (Sekunden)
+
+# Schwellwerte für Alarme (dieselben Env wie der Collector; ans Frontend gereicht)
+ALERT_KV = float(os.environ.get("VLLM_ALERT_KV", "90"))
+ALERT_TEMP = float(os.environ.get("VLLM_ALERT_TEMP", "85"))
+ALERT_ERR = float(os.environ.get("VLLM_ALERT_ERR", "0"))
+ALERT_OFFLINE_MIN = float(os.environ.get("VLLM_ALERT_OFFLINE_MIN", "1"))
+
+# Geplanter Schicht-Report (CLI `report` + systemd-Timer)
+REPORT_DIR = os.environ.get("VLLM_REPORT_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "reports")
+REPORT_RANGE = int(os.environ.get("VLLM_REPORT_RANGE", str(8 * 3600)))
 
 # Counter-Spalten -> Raten-Feld (Δwert / Δt)
 RATES = {
@@ -156,22 +169,23 @@ def _connect():
 # Zeitreihen
 # ---------------------------------------------------------------------------
 
-def build_series(range_s):
+def build_series(range_s, offset_s=0):
     if not os.path.exists(DB_PATH):
         return {"error": "Keine Datenbank – läuft der Collector?", "models": {}}
 
     now = int(time.time())
-    since = now - range_s
+    end = now - offset_s
+    since = end - range_s
     bucket = max(1, range_s // 800)
 
     conn = _connect()
     in_window = conn.execute("""
         SELECT s.* FROM samples s
         JOIN (SELECT model, MAX(ts) AS mts FROM samples
-               WHERE ts >= ? GROUP BY model, ts / ?) g
+               WHERE ts >= ? AND ts < ? GROUP BY model, ts / ?) g
           ON s.model = g.model AND s.ts = g.mts
         ORDER BY s.model, s.ts
-    """, (since, bucket)).fetchall()
+    """, (since, end, bucket)).fetchall()
     anchors = conn.execute("""
         SELECT s.* FROM samples s
         JOIN (SELECT model, MAX(ts) AS mts FROM samples
@@ -191,7 +205,7 @@ def build_series(range_s):
         prev = anchor_by_model.get(model)
         for r in pts:
             p = {
-                "t": r["ts"] * 1000,
+                "t": (r["ts"] + offset_s) * 1000,   # bei Vergleich aufs aktuelle Fenster projiziert
                 "kv": (_clean(r["kv_cache_usage"]) or 0.0) * 100.0,
             }
             for col, field in GAUGES.items():
@@ -218,7 +232,8 @@ def build_series(range_s):
             prev = r
         out[model] = series
 
-    return {"now": now * 1000, "range": range_s, "bucket": bucket, "models": out}
+    return {"now": now * 1000, "range": range_s, "bucket": bucket,
+            "offset": offset_s, "models": out}
 
 
 def build_config():
@@ -255,7 +270,29 @@ def build_config():
     # NIE ausgeliefert – nur, ob server-seitig einer gesetzt ist.
     ai = {"url": AI_URL, "model": AI_MODEL, "key_set": bool(AI_KEY),
           "configured": bool(AI_URL)}
-    return {"now": now * 1000, "instances": inst, "ai": ai}
+    thresholds = {"kv": ALERT_KV, "temp": ALERT_TEMP, "err": ALERT_ERR,
+                  "offline_min": ALERT_OFFLINE_MIN}
+    return {"now": now * 1000, "instances": inst, "ai": ai, "thresholds": thresholds}
+
+
+def build_alerts(limit=100):
+    """Letzte Alarm-Ereignisse (Historie) aus der events-Tabelle."""
+    if not os.path.exists(DB_PATH):
+        return {"events": []}
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT ts,host,port,model,kind,state,severity,value,message "
+            "FROM events ORDER BY ts DESC, id DESC LIMIT ?", (int(limit),)).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return {"events": []}   # Tabelle noch nicht vorhanden (alter Collector)
+    conn.close()
+    ev = [{"ts": r["ts"] * 1000, "host": r["host"], "port": r["port"],
+           "model": r["model"], "kind": r["kind"], "state": r["state"],
+           "severity": r["severity"], "value": r["value"], "message": r["message"]}
+          for r in rows]
+    return {"events": ev, "now": int(time.time()) * 1000}
 
 
 # ---------------------------------------------------------------------------
@@ -301,14 +338,25 @@ def ai_analyze(body):
                          "'KI-Auswertung' einen /v1/chat/completions-Endpunkt eintragen."}
     if not model:
         return {"error": "Kein KI-Modell konfiguriert (⚙-Menü → KI-Auswertung)."}
-    payload = json.dumps({
+    try:
+        max_tokens = int(body.get("max_tokens") or AI_MAX_TOKENS)
+    except (ValueError, TypeError):
+        max_tokens = AI_MAX_TOKENS
+    req_obj = {
         "model": model,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
         "temperature": 0.3,
-        "max_tokens": AI_MAX_TOKENS,
+        "max_tokens": max_tokens,
         "stream": False,
-    }).encode("utf-8")
+    }
+    no_think = body.get("no_think")
+    if no_think is None:
+        no_think = AI_NO_THINK
+    if no_think:
+        # Qwen3 & Co.: Denk-Phase im Chat-Template abschalten -> direkte Antwort
+        req_obj["chat_template_kwargs"] = {"enable_thinking": False}
+    payload = json.dumps(req_obj).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = "Bearer " + key
@@ -353,9 +401,20 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         if parsed.path == "/api/series":
-            self._json(build_series(_range_from(qs)))
+            try:
+                off = int(qs.get("offset", ["0"])[0])
+            except ValueError:
+                off = 0
+            off = max(0, min(off, 30 * 86400))
+            self._json(build_series(_range_from(qs), off))
         elif parsed.path == "/api/config":
             self._json(build_config())
+        elif parsed.path == "/api/alerts":
+            try:
+                lim = int(qs.get("limit", ["100"])[0])
+            except ValueError:
+                lim = 100
+            self._json(build_alerts(min(max(lim, 1), 500)))
         elif parsed.path == "/api/stream":
             self._stream(_range_from(qs))
         elif parsed.path == "/api/cert":
@@ -531,6 +590,12 @@ PAGE = r"""<!DOCTYPE html>
   .abtn.sec{background:var(--panel);color:var(--fg);border:1px solid var(--border);font-weight:400;}
   .hidden-card{display:none !important;}
   #instcard.collapsed #insttable{display:none;}
+  #alertcard.collapsed #alerttable{display:none;}
+  #effcard.collapsed #effbody{display:none!important;}
+  .ev-raised{color:var(--bad);} .ev-cleared{color:var(--ok);}
+  .ev-crit{font-weight:600;}
+  .evbadge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;border:1px solid var(--border);}
+  .activebtn{border-color:var(--accent)!important;color:var(--accent)!important;}
   canvas{max-height:var(--card-h);}
   .card h2.handle,.kpi h3.handle{cursor:grab;user-select:none;touch-action:none;
     margin:-10px -12px 6px;padding:6px 12px;border-radius:10px 10px 0 0;background:rgba(127,127,127,.06);}
@@ -592,6 +657,14 @@ PAGE = r"""<!DOCTYPE html>
       <option value="604800">7 Tage</option>
     </select>
   </label>
+  <label class="ctl" title="Vergleicht das aktuelle Zeitfenster mit einem früheren – als gedämpfte, gestrichelte Linien in allen Diagrammen.">Vergleich
+    <select id="compare" title="Vergleichszeitraum (Overlay)">
+      <option value="0" selected>aus</option>
+      <option value="prev">vorige Periode</option>
+      <option value="86400">gestern</option>
+      <option value="604800">letzte Woche</option>
+    </select>
+  </label>
   <span class="densgroup" title="Kacheldichte – mehr Punkte = mehr, kleinere Kacheln">
     <button class="dbtn" data-d="sehrdicht" title="Sehr klein, sehr viele Kacheln (6×5)"><svg class="dg" viewBox="0 0 26 20"><circle cx="3.5" cy="2.8" r="1.05"/><circle cx="7.3" cy="2.8" r="1.05"/><circle cx="11.1" cy="2.8" r="1.05"/><circle cx="14.9" cy="2.8" r="1.05"/><circle cx="18.7" cy="2.8" r="1.05"/><circle cx="22.5" cy="2.8" r="1.05"/><circle cx="3.5" cy="6.4" r="1.05"/><circle cx="7.3" cy="6.4" r="1.05"/><circle cx="11.1" cy="6.4" r="1.05"/><circle cx="14.9" cy="6.4" r="1.05"/><circle cx="18.7" cy="6.4" r="1.05"/><circle cx="22.5" cy="6.4" r="1.05"/><circle cx="3.5" cy="10.0" r="1.05"/><circle cx="7.3" cy="10.0" r="1.05"/><circle cx="11.1" cy="10.0" r="1.05"/><circle cx="14.9" cy="10.0" r="1.05"/><circle cx="18.7" cy="10.0" r="1.05"/><circle cx="22.5" cy="10.0" r="1.05"/><circle cx="3.5" cy="13.6" r="1.05"/><circle cx="7.3" cy="13.6" r="1.05"/><circle cx="11.1" cy="13.6" r="1.05"/><circle cx="14.9" cy="13.6" r="1.05"/><circle cx="18.7" cy="13.6" r="1.05"/><circle cx="22.5" cy="13.6" r="1.05"/><circle cx="3.5" cy="17.2" r="1.05"/><circle cx="7.3" cy="17.2" r="1.05"/><circle cx="11.1" cy="17.2" r="1.05"/><circle cx="14.9" cy="17.2" r="1.05"/><circle cx="18.7" cy="17.2" r="1.05"/><circle cx="22.5" cy="17.2" r="1.05"/></svg></button>
     <button class="dbtn" data-d="dicht" title="Klein, viele Kacheln (5×4)"><svg class="dg" viewBox="0 0 26 20"><circle cx="4.3" cy="4.0" r="1.3"/><circle cx="8.7" cy="4.0" r="1.3"/><circle cx="13.0" cy="4.0" r="1.3"/><circle cx="17.3" cy="4.0" r="1.3"/><circle cx="21.7" cy="4.0" r="1.3"/><circle cx="4.3" cy="8.0" r="1.3"/><circle cx="8.7" cy="8.0" r="1.3"/><circle cx="13.0" cy="8.0" r="1.3"/><circle cx="17.3" cy="8.0" r="1.3"/><circle cx="21.7" cy="8.0" r="1.3"/><circle cx="4.3" cy="12.0" r="1.3"/><circle cx="8.7" cy="12.0" r="1.3"/><circle cx="13.0" cy="12.0" r="1.3"/><circle cx="17.3" cy="12.0" r="1.3"/><circle cx="21.7" cy="12.0" r="1.3"/><circle cx="4.3" cy="16.0" r="1.3"/><circle cx="8.7" cy="16.0" r="1.3"/><circle cx="13.0" cy="16.0" r="1.3"/><circle cx="17.3" cy="16.0" r="1.3"/><circle cx="21.7" cy="16.0" r="1.3"/></svg></button>
@@ -609,6 +682,8 @@ PAGE = r"""<!DOCTYPE html>
   </label>
   <button id="reload" title="Daten und Instanz-Konfiguration sofort neu laden">Neu laden</button>
   <button id="resetzoom" title="Zoom/Verschieben in allen Diagrammen zurücksetzen (Mausrad = Zoom, Ziehen = Verschieben)">Zoom ⟲</button>
+  <button id="anombtn" title="Ausreißer (robuste MAD-Anomalie-Erkennung) in allen Diagrammen als rote Punkte markieren">⚠ Anomalien</button>
+  <button id="reportbtn" title="KI-Gesamt-Report über alle Diagramme (Kennzahlen, Ausreißer, Prognosen)">📋 KI-Report</button>
   <button id="theme" title="Zwischen hellem und dunklem Design umschalten (wird gespeichert)">◐</button>
   <button id="notif" title="Browser-Benachrichtigungen bei Warnungen (KV-Cache voll, Fehler, Instanz offline) erlauben">🔔</button>
   <button id="secbtn" title="Verbindungssicherheit & Zertifikat">🔒</button>
@@ -642,6 +717,20 @@ PAGE = r"""<!DOCTYPE html>
   </tr></thead><tbody></tbody></table>
 </div>
 
+<div class="card collapsed" id="alertcard" style="margin:14px 16px 0">
+  <div class="cardbtns"><button class="cbtn" id="alerttoggle" title="Ein-/Ausklappen">▸</button></div>
+  <h2>Alarm-Historie <span id="alertcount" style="color:var(--muted);font-weight:400"></span></h2>
+  <table id="alerttable"><thead><tr>
+    <th>Zeit</th><th>Status</th><th>Typ</th><th>Instanz / Modell</th><th>Meldung</th>
+  </tr></thead><tbody></tbody></table>
+</div>
+
+<div class="card collapsed" id="effcard" style="margin:14px 16px 0">
+  <div class="cardbtns"><button class="cbtn" id="efftoggle" title="Ein-/Ausklappen">▸</button></div>
+  <h2>Effizienz & Kapazität <span style="color:var(--muted);font-weight:400;font-size:11px">(Ø über Zeitfenster, hochgerechnet)</span></h2>
+  <div id="effbody" style="display:flex;flex-wrap:wrap;gap:18px;padding-top:4px"></div>
+</div>
+
 <div id="legend" title="Farb-Zuordnung der Modelle – Klick blendet ein Modell in allen Diagrammen aus/ein"></div>
 <div class="grid" id="charts"></div>
 
@@ -652,6 +741,12 @@ PAGE = r"""<!DOCTYPE html>
     <div class="anbody">
       <h4>Kennzahlen (aktuelles Zeitfenster)</h4>
       <div id="an_stats"></div>
+      <div id="an_extra">
+        <h4>Auffälligkeiten (Ausreißer)</h4>
+        <div id="an_anom"></div>
+        <h4>Prognose</h4>
+        <div id="an_fc"></div>
+      </div>
       <h4>KI-Auswertung</h4>
       <div class="aiout" id="an_ai">Noch keine Auswertung generiert.</div>
       <div class="aimeta" id="an_aimeta"></div>
@@ -785,7 +880,7 @@ function setColor(m,c,rebuild){
   customColors[m]=c; store.set("vllm_colors",JSON.stringify(customColors));
   if(!lastData)return;
   renderLegend(lastData.models);   // Legende + Diagramme live aktualisieren
-  CHARTS.forEach(spec=>{charts[spec.id].data.datasets=datasets(lastData.models,spec);charts[spec.id].update();});
+  redrawCharts(lastData.models);
   if(rebuild)renderKPIs();         // KPI-Karten nur neu bauen, wenn Picker zu ist (sonst schließt er)
 }
 const hiddenModels=new Set(JSON.parse(store.get("vllm_hidden_models")||"[]"));
@@ -931,14 +1026,61 @@ function datasets(models,spec){
         else if(spec.id==="vram"){y=(p.vram_bytes!=null)?Math.round(p.vram_bytes/1e7)/100:null;}
         return {x:p.t,y};
       }).filter(p=>p.y!==null&&p.y!==undefined);
+      let anomSet=null;
+      if(window._anomOn){ const a=detectAnomalies(data); if(a.count) anomSet=new Set(a.items.map(i=>i.t)); }
       ds.push({label:shortModel(name)+(f.l?" · "+f.l:""),data,borderColor:color,backgroundColor:color,
-               borderDash:f.dash||[],borderWidth:1.8,pointRadius:0,tension:.25,spanGaps:true});
+               borderDash:f.dash||[],borderWidth:1.8,tension:.25,spanGaps:true,
+               pointRadius: anomSet?(ctx=>{const r=ctx.raw;return r&&anomSet.has(r.x)?3.5:0;}):0,
+               pointBackgroundColor:"#ff4d4f",pointBorderColor:"#ff4d4f"});
     });
   });
   return ds;
 }
 
+// --- Zeitraum-Vergleich: gedämpfte, gestrichelte Overlay-Linien ---
+function hexA(h,a){ const m=/^#?([0-9a-fA-F]{6})$/.exec(h); if(!m)return h;
+  const n=parseInt(m[1],16); return "rgba("+((n>>16)&255)+","+((n>>8)&255)+","+(n&255)+","+a+")"; }
+function compareDatasets(models,spec){
+  const ds=[];
+  Object.keys(models).sort().forEach(name=>{
+    if(hiddenModels.has(name))return;
+    const color=hexA(colorFor(name),0.4);
+    const cap=spec.id==="kvtok"?capacityOf(name):null;
+    fieldsFor(spec).forEach(f=>{
+      const data=models[name].map(p=>{ let y=p[f.k];
+        if(spec.id==="kvtok"){y=(cap&&p.kv!=null)?Math.round(p.kv/100*cap):null;}
+        else if(spec.id==="vram"){y=(p.vram_bytes!=null)?Math.round(p.vram_bytes/1e7)/100:null;}
+        return {x:p.t,y};
+      }).filter(p=>p.y!==null&&p.y!==undefined);
+      ds.push({label:shortModel(name)+(f.l?" · "+f.l:"")+" · Vgl.",data,borderColor:color,
+               backgroundColor:color,borderDash:[5,4],borderWidth:1.2,pointRadius:0,tension:.25,spanGaps:true});
+    });
+  });
+  return ds;
+}
+let compareData=null;
+function compareOffset(){ const v=document.getElementById("compare").value;
+  if(v==="0")return 0; if(v==="prev")return parseInt(rangeVal(),10); return parseInt(v,10)||0; }
+async function fetchCompare(){
+  const off=compareOffset();
+  if(!off){ compareData=null; if(lastData)applySeries(lastData); return; }
+  try{ compareData=await(await fetch("/api/series?range="+rangeVal()+"&offset="+off)).json(); }
+  catch(e){ compareData=null; }
+  if(lastData)applySeries(lastData);
+}
+function withCompare(dsets,spec){
+  if(compareData&&compareData.models&&compareOffset())
+    return dsets.concat(compareDatasets(compareData.models,spec));
+  return dsets;
+}
+function redrawCharts(models){
+  CHARTS.forEach(spec=>{charts[spec.id].data.datasets=withCompare(datasets(models,spec),spec);charts[spec.id].update();});
+}
+
 function num(v,d){return v==null?"–":(typeof v==="number"?(Number.isInteger(v)?v:v.toFixed(d==null?1:d)):v);}
+function durTxt(sec){ if(sec==null)return "–"; sec=Math.floor(sec);
+  if(sec<60)return sec+" s"; if(sec<3600)return Math.floor(sec/60)+" min";
+  const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60); return h+" h"+(m?" "+m+" min":""); }
 
 function renderKPIs(){
   if(!lastData||window._dragging||window._picking)return;   // Verschieben/Farbwahl nicht stören
@@ -951,9 +1093,11 @@ function renderKPIs(){
     const inst=lastConfig?lastConfig.instances.find(x=>x.model===model):null;
     const online=inst?inst.online:true;
     const kind=inst?inst.kind:"vllm";
+    const th=(lastConfig&&lastConfig.thresholds)||{kv:90,temp:85,err:0};
     const kv=last.kv||0, wait=last.waiting||0, err=last.error_ps||0, temp=last.gpu_temp||0;
-    const kvBad=kv>90, errBad=err>0, tempBad=temp>85;
-    if(!online)alerts.push(shortModel(model)+": offline");
+    const kvBad=kv>th.kv, errBad=err>th.err, tempBad=temp>th.temp;
+    const offMin=inst&&!online&&inst.age!=null?Math.floor(inst.age/60):null;
+    if(!online)alerts.push(shortModel(model)+": offline"+(offMin!=null?" seit "+durTxt(inst.age):""));
     if(kvBad)alerts.push(shortModel(model)+": KV "+kv.toFixed(0)+"%");
     if(errBad)alerts.push(shortModel(model)+": Fehler");
     if(tempBad)alerts.push(shortModel(model)+": "+temp.toFixed(0)+"°C");
@@ -975,7 +1119,7 @@ function renderKPIs(){
     el.dataset.id=model;
     el.innerHTML=`<h3 class="handle"><span class="dot ${online?"on":"off"}"></span>${shortModel(model)}
         <input type="color" class="cpick" value="${colorFor(model)}" title="Diagramm-Farbe wählen">
-        <span style="font-size:11px;color:var(--muted)">${online?"online":"offline"}</span></h3>
+        <span style="font-size:11px;color:var(--muted)">${online?"online":("offline"+(offMin!=null?" · seit "+durTxt(inst.age):""))}</span></h3>
       <div class="row">${row}</div>`;
     const pick=el.querySelector(".cpick");
     // Farbwahl darf kein Verschieben auslösen
@@ -1017,8 +1161,9 @@ function applySeries(j){
   Object.values(j.models).forEach(s=>s.forEach(p=>{if(p.reset)resets.push(p.t);}));
   computeColors(j.models);
   renderLegend(j.models);
-  CHARTS.forEach(spec=>{charts[spec.id].data.datasets=datasets(j.models,spec);charts[spec.id].update();});
+  redrawCharts(j.models);
   renderKPIs();
+  renderEfficiency();
   const n=Object.values(j.models).reduce((a,s)=>a+s.length,0);
   document.getElementById("status").textContent="Stand "+new Date(j.now).toLocaleTimeString("de-DE")+" · "+n+" Punkte";
 }
@@ -1171,30 +1316,132 @@ function statsAsText(stats){
     ? "- "+s.label+": Ø "+fmt(s.avg)+", Min "+fmt(s.min)+", Max "+fmt(s.max)+", aktuell "+fmt(s.last)+", Trend "+(s.trend>=0?"+":"")+fmt(s.trend)
     : "- "+s.label+": keine Daten").join("\n");
 }
-function aiPrompt(spec,stats,unit){
+// --- Anomalie-Erkennung (robust, ohne KI): Median ± k·MAD ---
+function detectAnomalies(data,k){
+  k=k||3.5;
+  const ys=data.map(p=>p.y).filter(v=>v!=null&&!isNaN(v));
+  if(ys.length<8)return {count:0,items:[]};
+  const srt=[...ys].sort((a,b)=>a-b), med=srt[srt.length>>1];
+  const dev=ys.map(v=>Math.abs(v-med)).sort((a,b)=>a-b);
+  let scale=(dev[dev.length>>1]||0)*1.4826;
+  if(scale<=1e-9){ const mean=ys.reduce((a,b)=>a+b,0)/ys.length;
+    scale=Math.sqrt(ys.reduce((a,b)=>a+(b-mean)*(b-mean),0)/ys.length); }
+  if(scale<=1e-9)return {count:0,items:[],med};
+  const items=[];
+  data.forEach(p=>{ if(p.y==null||isNaN(p.y))return; if(Math.abs(p.y-med)/scale>k) items.push({t:p.x,y:p.y}); });
+  return {count:items.length,items,med};
+}
+function chartAnoms(spec){
+  if(!lastData)return [];
+  return datasets(lastData.models,spec).map(d=>{
+    const a=detectAnomalies(d.data);
+    return {label:d.label,color:d.borderColor,count:a.count,items:a.items};
+  });
+}
+function renderAnoms(anoms){
+  const withA=anoms.filter(a=>a.count>0);
+  if(!withA.length) return '<div style="color:var(--muted);font-size:12px">Keine Ausreißer im Zeitfenster (robuste MAD-Analyse).</div>';
+  let h='<table class="antab"><thead><tr><th>Serie</th><th>Ausreißer</th><th>zuletzt</th><th>Wert</th></tr></thead><tbody>';
+  withA.forEach(a=>{ const l=a.items[a.items.length-1];
+    h+='<tr><td><span class="sw" style="background:'+a.color+'"></span>'+a.label+'</td><td>'+a.count+
+       '</td><td>'+new Date(l.t).toLocaleTimeString("de-DE")+'</td><td>'+fmt(l.y)+'</td></tr>'; });
+  return h+'</tbody></table>';
+}
+function anomsAsText(anoms){
+  const w=anoms.filter(a=>a.count>0);
+  return w.length ? w.map(a=>"- "+a.label+": "+a.count+" Ausreißer (zuletzt "+fmt(a.items[a.items.length-1].y)+")").join("\n")
+                  : "keine Ausreißer";
+}
+// --- Prognose: lineare Regression je Serie (Steigung pro Minute + ETA) ---
+function linfit(data){
+  const p=data.filter(d=>d.y!=null&&!isNaN(d.y)); const n=p.length; if(n<3)return null;
+  const t0=p[0].x; let sx=0,sy=0,sxx=0,sxy=0;
+  p.forEach(d=>{const x=(d.x-t0)/60000,y=d.y; sx+=x;sy+=y;sxx+=x*x;sxy+=x*y;});
+  const den=n*sxx-sx*sx; if(Math.abs(den)<1e-9)return null;
+  return {slopePerMin:(n*sxy-sx*sy)/den, last:p[n-1].y};
+}
+function chartForecast(spec){
+  if(!lastData)return [];
+  const target=spec.threshold||spec.max||null;
+  return datasets(lastData.models,spec).map(d=>{
+    const f=linfit(d.data); if(!f)return {label:d.label,color:d.borderColor,none:true};
+    let eta="–";
+    if(target && f.slopePerMin>0.01 && f.last<target){
+      const mins=(target-f.last)/f.slopePerMin;
+      if(mins>0 && mins<60*24) eta="erreicht "+fmt(target)+" in ~"+durTxt(mins*60);
+    } else if(target && f.slopePerMin<-0.01){ eta="fällt (kein Sättigungsrisiko)"; }
+    else if(Math.abs(f.slopePerMin)<=0.01){ eta="stabil"; }
+    return {label:d.label,color:d.borderColor,perMin:f.slopePerMin,eta};
+  });
+}
+function renderForecast(fc){
+  const r=fc.filter(x=>!x.none);
+  if(!r.length) return '<div style="color:var(--muted);font-size:12px">Zu wenige Punkte für eine Prognose.</div>';
+  let h='<table class="antab"><thead><tr><th>Serie</th><th>Trend/min</th><th>Prognose</th></tr></thead><tbody>';
+  r.forEach(x=>{ h+='<tr><td><span class="sw" style="background:'+x.color+'"></span>'+x.label+'</td><td>'+
+    (x.perMin>=0?"+":"")+fmt(x.perMin)+'</td><td>'+(x.eta||"–")+'</td></tr>'; });
+  return h+'</tbody></table>';
+}
+function forecastAsText(fc){
+  const r=fc.filter(x=>!x.none && x.eta && x.eta!=="stabil" && x.eta!=="–");
+  return r.length ? r.map(x=>"- "+x.label+": "+(x.perMin>=0?"+":"")+fmt(x.perMin)+"/min, "+x.eta).join("\n") : "keine kritische Entwicklung";
+}
+function aiPrompt(c){
   const sel=document.getElementById("range"), rt=sel.options[sel.selectedIndex].text;
-  return ["Diagramm: "+spec.title,
-    spec.desc?("Bedeutung: "+spec.desc.replace(/\n/g," ")):"",
-    "Zeitfenster: "+rt+" · Einheit: "+(unit||"—"), "",
+  return ["Diagramm: "+c.spec.title,
+    c.spec.desc?("Bedeutung: "+c.spec.desc.replace(/\n/g," ")):"",
+    "Zeitfenster: "+rt+" · Einheit: "+(c.unit||"—"), "",
     "Kennzahlen je Serie (Ø / Min / Max / Aktuell / Trend seit Fensterbeginn):",
-    statsAsText(stats), "",
-    "Werte diese Kennzahlen aus: (1) Zustand einordnen, (2) Auffälligkeiten/Ausreißer/Trends, "+
-    "(3) bei mehreren Serien ein kurzer Vergleich, (4) konkrete Handlungsempfehlung falls nötig. "+
-    "Maximal 6 Sätze, die Zahlen nicht bloß wiederholen."].filter(Boolean).join("\n");
+    statsAsText(c.stats), "",
+    "Erkannte Ausreißer (robuste MAD-Analyse):", anomsAsText(c.anoms), "",
+    "Prognose (lineare Extrapolation):", forecastAsText(c.fc), "",
+    "Werte das aus: (1) Zustand einordnen, (2) Ausreißer/Trends bewerten, "+
+    "(3) bei mehreren Serien ein kurzer Vergleich, (4) Risiko/Sättigung aus der Prognose, "+
+    "(5) konkrete Handlungsempfehlung falls nötig. Maximal 6 Sätze, Zahlen nicht bloß wiederholen."
+    ].filter(Boolean).join("\n");
 }
 let anCur=null;
 function openAnalysis(id){
   const spec=CHARTS.find(c=>c.id===id); if(!spec)return;
-  const stats=chartStats(spec), unit=unitOf(spec);
-  anCur={spec,stats,unit};
+  const stats=chartStats(spec), unit=unitOf(spec), anoms=chartAnoms(spec), fc=chartForecast(spec);
+  anCur={spec,stats,unit,anoms,fc};
   document.getElementById("an_title").textContent=spec.title;
+  document.getElementById("an_extra").style.display="";
   document.getElementById("an_stats").innerHTML=renderStats(stats);
+  document.getElementById("an_anom").innerHTML=renderAnoms(anoms);
+  document.getElementById("an_fc").innerHTML=renderForecast(fc);
   document.getElementById("an_ai").textContent="Noch keine Auswertung generiert.";
   document.getElementById("an_aimeta").textContent="";
   const gen=document.getElementById("an_gen"); gen.disabled=false; gen.textContent="KI-Auswertung generieren";
   document.getElementById("analysis").classList.add("open");
 }
 function closeAnalysis(){ document.getElementById("analysis").classList.remove("open"); }
+function buildReportPrompt(){
+  const sel=document.getElementById("range"), rt=sel.options[sel.selectedIndex].text;
+  const lines=["Gesamt-Report über alle Monitoring-Diagramme.","Zeitfenster: "+rt,""];
+  CHARTS.forEach(spec=>{
+    const stats=chartStats(spec); if(!stats.some(s=>s.n))return;
+    lines.push("### "+spec.title, statsAsText(stats));
+    const an=anomsAsText(chartAnoms(spec)); if(an!=="keine Ausreißer") lines.push("Ausreißer: "+an.replace(/\n/g,"; "));
+    const fc=forecastAsText(chartForecast(spec)); if(fc!=="keine kritische Entwicklung") lines.push("Prognose: "+fc.replace(/\n/g,"; "));
+    lines.push("");
+  });
+  lines.push("Erstelle einen kompakten Betriebs-Report auf Deutsch: (1) Gesamtzustand in 1–2 Sätzen, "+
+    "(2) wichtigste Auffälligkeiten/Risiken über alle Metriken, (3) kurzer Vergleich der Modelle, "+
+    "(4) konkrete Handlungsempfehlungen. Kurze Absätze, maximal ~12 Sätze.");
+  return lines.join("\n");
+}
+function openReport(){
+  if(!lastData){ return; }
+  anCur={report:true};
+  document.getElementById("an_title").textContent="KI-Gesamt-Report";
+  document.getElementById("an_stats").innerHTML='<div style="color:var(--muted);font-size:12px">Aggregiert Kennzahlen, Ausreißer und Prognosen <b>aller</b> Diagramme und lässt sie von der KI bewerten.</div>';
+  document.getElementById("an_extra").style.display="none";
+  document.getElementById("an_ai").textContent="Noch keine Auswertung generiert.";
+  document.getElementById("an_aimeta").textContent="";
+  const gen=document.getElementById("an_gen"); gen.disabled=false; gen.textContent="KI-Report generieren";
+  document.getElementById("analysis").classList.add("open");
+}
 async function runAI(){
   if(!anCur)return;
   const out=document.getElementById("an_ai"), meta=document.getElementById("an_aimeta"), gen=document.getElementById("an_gen");
@@ -1202,8 +1449,10 @@ async function runAI(){
   if(!serverConfigured){ out.textContent='Kein KI-Endpunkt konfiguriert. Bitte server-seitig VLLM_AI_URL / VLLM_AI_MODEL setzen (z. B. über setup.sh).'; return; }
   gen.disabled=true; out.textContent="KI wertet aus …"; meta.textContent=""; const t0=Date.now();
   try{
+    const user=anCur.report?buildReportPrompt():aiPrompt(anCur);
+    const bd=anCur.report?{user,max_tokens:3000}:{user};
     const r=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({user:aiPrompt(anCur.spec,anCur.stats,anCur.unit)})});
+      body:JSON.stringify(bd)});
     const j=await r.json();
     if(j.error){ out.textContent="⚠️ "+j.error; }
     else { out.textContent=j.text||"(leere Antwort)"; meta.textContent="Modell "+(j.model||"")+" · "+((Date.now()-t0)/1000).toFixed(1)+" s"; }
@@ -1211,16 +1460,32 @@ async function runAI(){
   gen.disabled=false; gen.textContent="Neu generieren";
 }
 document.getElementById("an_gen").onclick=runAI;
+document.getElementById("reportbtn").onclick=openReport;
 document.getElementById("an_close").onclick=closeAnalysis;
 document.getElementById("analysis").addEventListener("click",e=>{ if(e.target.id==="analysis")closeAnalysis(); });
 document.getElementById("an_copy").onclick=()=>{
   if(!anCur)return;
-  const txt=anCur.spec.title+"\n\n"+statsAsText(anCur.stats)+"\n\nKI-Auswertung:\n"+document.getElementById("an_ai").textContent;
+  const ai=document.getElementById("an_ai").textContent;
+  const txt = anCur.report
+    ? "KI-Gesamt-Report\n\n"+ai
+    : anCur.spec.title+"\n\n"+statsAsText(anCur.stats)+
+      "\n\nAusreißer:\n"+anomsAsText(anCur.anoms)+
+      "\n\nPrognose:\n"+forecastAsText(anCur.fc)+
+      "\n\nKI-Auswertung:\n"+ai;
   if(navigator.clipboard)navigator.clipboard.writeText(txt).catch(()=>{});
 };
 
 buildGrid();
 applyTheme(store.get("vllm_theme")||"dark");
+// Anomalie-Marker in allen Diagrammen (Umschalter, Zustand im Cookie)
+window._anomOn = store.get("vllm_anom")==="1";
+(function(){
+  const b=document.getElementById("anombtn");
+  const sync=()=>b.classList.toggle("activebtn",window._anomOn);
+  sync();
+  b.onclick=()=>{ window._anomOn=!window._anomOn; store.set("vllm_anom",window._anomOn?"1":"0"); sync();
+    if(lastData) redrawCharts(lastData.models); };
+})();
 function applyDensity(d){
   document.body.dataset.density=d; store.set("vllm_density",d);
   document.querySelectorAll(".dbtn").forEach(b=>b.classList.toggle("active", b.dataset.d===d));
@@ -1235,7 +1500,8 @@ applyDensity(store.get("vllm_density")||"normal");
   gmenu.querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>gmenu.classList.remove("open")));
   document.addEventListener("click",e=>{ if(!gmenu.contains(e.target)&&e.target!==gear) gmenu.classList.remove("open"); });
 })();
-document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeVal());fetchConfig();startRefresh();};
+document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeVal());fetchConfig();startRefresh();fetchCompare();};
+document.getElementById("compare").onchange=()=>{store.set("vllm_compare",document.getElementById("compare").value);fetchCompare();};
 document.getElementById("pct").onchange=()=>{if(lastData)applySeries(lastData);};
 document.getElementById("mode").onchange=startRefresh;
 document.getElementById("reload").onclick=()=>{fetchConfig();fetchOnce();};
@@ -1252,6 +1518,64 @@ document.getElementById("restore").onclick=()=>{ saveHidden([]); applyHidden(); 
   sync();
   it.onclick=()=>{ store.set("vllm_inst_collapsed", ic.classList.toggle("collapsed")?"1":"0"); sync(); };
 })();
+// Alarm-Historie: einklappbar (Default eingeklappt) + Laden/Rendern
+(function(){
+  const ac=document.getElementById("alertcard"), at=document.getElementById("alerttoggle");
+  const sync=()=>{ at.textContent = ac.classList.contains("collapsed") ? "▸" : "▾"; };
+  if(store.get("vllm_alert_collapsed")!=="0") ac.classList.add("collapsed"); else ac.classList.remove("collapsed");
+  sync();
+  at.onclick=()=>{ store.set("vllm_alert_collapsed", ac.classList.toggle("collapsed")?"1":"0"); sync(); };
+})();
+const EV_LABEL={offline:"Offline",kv:"KV-Cache",temp:"GPU-Temp",error:"Fehler"};
+function renderAlerts(j){
+  const tb=document.querySelector("#alerttable tbody"); if(!tb)return;
+  const ev=(j&&j.events)||[]; tb.innerHTML="";
+  const cnt=document.getElementById("alertcount");
+  const active=ev.filter(e=>e.state==="raised").length;
+  if(cnt) cnt.textContent = ev.length ? "· "+ev.length+" Ereignisse" : "· keine";
+  if(!ev.length){ tb.innerHTML='<tr><td colspan="5" class="placeholder">Noch keine Alarm-Ereignisse.</td></tr>'; return; }
+  ev.forEach(e=>{
+    const t=new Date(e.ts).toLocaleString("de-DE");
+    const stCls="ev-"+e.state+(e.severity==="crit"?" ev-crit":"");
+    const stTxt=e.state==="raised"?"⬤ ausgelöst":"○ behoben";
+    const who=(e.model?shortModel(e.model):("Port "+e.port));
+    tb.innerHTML+=`<tr><td>${t}</td><td class="${stCls}">${stTxt}</td>`+
+      `<td><span class="evbadge">${EV_LABEL[e.kind]||e.kind}</span></td>`+
+      `<td>${who}</td><td>${e.message||""}</td></tr>`;
+  });
+}
+async function fetchAlerts(){try{renderAlerts(await(await fetch("/api/alerts?limit=100")).json());}catch(e){}}
+// Effizienz-Karte einklappbar
+(function(){
+  const ec=document.getElementById("effcard"), et=document.getElementById("efftoggle");
+  const sync=()=>{ et.textContent = ec.classList.contains("collapsed") ? "▸" : "▾"; };
+  if(store.get("vllm_eff_collapsed")!=="0") ec.classList.add("collapsed"); else ec.classList.remove("collapsed");
+  sync();
+  et.onclick=()=>{ store.set("vllm_eff_collapsed", ec.classList.toggle("collapsed")?"1":"0"); sync(); };
+})();
+function avgField(series,key){ let s=0,n=0; series.forEach(p=>{const v=p[key]; if(v!=null&&!isNaN(v)){s+=v;n++;}}); return n?s/n:null; }
+function fmtBig(v){ if(v==null)return "–"; const a=Math.abs(v);
+  if(a>=1e9)return (v/1e9).toFixed(1)+" Mrd"; if(a>=1e6)return (v/1e6).toFixed(1)+" Mio";
+  if(a>=1e3)return (v/1e3).toFixed(0)+" Tsd"; return Math.round(v).toString(); }
+function renderEfficiency(){
+  const body=document.getElementById("effbody"); if(!body||!lastData)return;
+  let totTps=0, gpuUtil=null, gpuPow=null;
+  Object.keys(lastData.models).forEach(m=>{
+    const inst=lastConfig?lastConfig.instances.find(x=>x.model===m):null;
+    const kind=inst?inst.kind:"vllm"; const s=lastData.models[m];
+    if(kind==="gpu"){ gpuUtil=avgField(s,"gpu_util"); gpuPow=avgField(s,"gpu_power"); return; }
+    totTps += avgField(s,"gen_tps")||0;
+  });
+  const M=(v,l)=>'<div class="metric"><b>'+v+'</b>'+l+'</div>';
+  let h="";
+  h+=M(fmtBig(totTps*86400),"Tokens/Tag (gesamt)");
+  h+=M(num(totTps,1),"gen tok/s Ø (gesamt)");
+  if(gpuUtil!=null) h+=M(num(gpuUtil,0)+" %","GPU-Auslastung Ø");
+  if(gpuUtil!=null) h+=M(num(gpuUtil/100*24,1)+" h","GPU-Vollast-Std./Tag");
+  if(gpuPow!=null) h+=M(num(gpuPow,0)+" W","GPU-Leistung Ø");
+  if(gpuPow) h+=M(num(totTps/gpuPow,2),"tok/s pro Watt");
+  body.innerHTML=h||'<span class="placeholder">Keine Daten.</span>';
+}
 document.getElementById("notif").onclick=()=>{
   const st=document.getElementById("status");
   const say=t=>{ if(st)st.textContent=t; };
@@ -1278,14 +1602,19 @@ document.getElementById("notif").onclick=()=>{
     else { say("Benachrichtigungen: "+p); alert("Benachrichtigungen wurden nicht erlaubt ("+p+")."); }
   });
 };
-// Zuletzt gewählten Zeitraum aus dem Cookie wiederherstellen
+// Zuletzt gewählten Zeitraum + Vergleich aus dem Cookie wiederherstellen
 (function(){
   const saved=store.get("vllm_range"), sel=document.getElementById("range");
   if(saved && [...sel.options].some(o=>o.value===saved)) sel.value=saved;
+  const sc=store.get("vllm_compare"), cs=document.getElementById("compare");
+  if(sc && [...cs.options].some(o=>o.value===sc)) cs.value=sc;
 })();
 fetchConfig();
 startRefresh();
+fetchAlerts();
+fetchCompare();
 setInterval(fetchConfig,30000);
+setInterval(fetchAlerts,30000);
 
 // --- Verbindungssicherheit & Zertifikat ---
 (function(){
@@ -1363,6 +1692,68 @@ class DashServer(ThreadingHTTPServer):
         pass  # TLS-Handshake-Fehler einzelner Clients nicht ins Log spammen
 
 
+_REPORT_FIELDS = [
+    ("kv", "KV-Cache %"), ("running", "aktiv"), ("waiting", "wartend"),
+    ("gen_tps", "gen tok/s"), ("prompt_tps", "prompt tok/s"),
+    ("ttft_p95", "TTFT p95 ms"), ("e2e_p95", "E2E p95 s"), ("itl_p95", "ITL p95 ms"),
+    ("hit_rate", "Prefix-Hit %"), ("error_ps", "Fehler/s"),
+    ("gpu_util", "GPU %"), ("gpu_temp", "GPU °C"), ("gpu_power", "GPU W"),
+]
+
+
+def _summarize_series(range_s):
+    models = build_series(range_s).get("models", {})
+    lines = []
+    for model in sorted(models):
+        pts = models[model]
+        if not pts:
+            continue
+        rows = []
+        for key, label in _REPORT_FIELDS:
+            vals = [p[key] for p in pts if isinstance(p.get(key), (int, float))]
+            if not vals:
+                continue
+            rows.append("- %s: Ø %.2f, min %.2f, max %.2f, aktuell %.2f"
+                        % (label, sum(vals) / len(vals), min(vals), max(vals), vals[-1]))
+        if rows:
+            lines.append("### %s" % model)
+            lines.extend(rows)
+            lines.append("")
+    return "\n".join(lines)
+
+
+def build_report(range_s=None):
+    range_s = range_s or REPORT_RANGE
+    stats = _summarize_series(range_s)
+    ev = build_alerts(300).get("events", [])
+    since = (int(time.time()) - range_s) * 1000
+    evw = [e for e in ev if e["ts"] >= since]
+    raised = sum(1 for e in evw if e["state"] == "raised")
+    alert_txt = ("%d Ereignisse (%d ausgelöst)" % (len(evw), raised)) if evw else "keine Alarme"
+    hours = round(range_s / 3600.0, 1)
+    prompt = ("Betriebs-Report für die letzten %s Stunden eines vLLM-Servers.\n\n"
+              "Kennzahlen je Modell:\n%s\n\nAlarme im Zeitraum: %s\n\n"
+              "Erstelle einen kompakten deutschen Schicht-Report: (1) Gesamtzustand, "
+              "(2) Auffälligkeiten/Alarme, (3) Modellvergleich, (4) Handlungsempfehlungen. "
+              "Kurze Absätze, maximal ~12 Sätze." % (hours, stats or "keine Daten", alert_txt))
+    ai = ai_analyze({"user": prompt, "max_tokens": 3000})
+    return {"range_s": range_s, "hours": hours, "stats": stats,
+            "alerts": alert_txt, "ai": ai.get("text") or ("[KI] " + ai.get("error", "")),
+            "generated": int(time.time())}
+
+
+def write_report(range_s=None):
+    rep = build_report(range_s)
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    path = os.path.join(REPORT_DIR, "report-%s.txt" % time.strftime("%Y%m%d-%H%M%S"))
+    body = ("vLLM-Schicht-Report  %s  (Zeitfenster %sh)\n%s\n\n%s\n\n%s\nKennzahlen:\n%s\nAlarme: %s\n"
+            % (time.strftime("%Y-%m-%d %H:%M"), rep["hours"], "=" * 60,
+               rep["ai"], "-" * 60, rep["stats"] or "keine Daten", rep["alerts"]))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    return path, body
+
+
 def main():
     port = DEFAULT_PORT
     if len(sys.argv) > 1:
@@ -1405,4 +1796,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "report":
+        rng = None
+        if len(sys.argv) > 2:
+            try:
+                rng = int(sys.argv[2])
+            except ValueError:
+                rng = None
+        p, body = write_report(rng)
+        print(body)
+        print("\n[i] Report gespeichert: %s" % p)
+    else:
+        main()
