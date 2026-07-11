@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.12.1"
+__version__ = "0.12.2"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -507,15 +507,6 @@ PAGE = r"""<!DOCTYPE html>
     box-shadow:0 0 0 100vmax rgba(0,0,0,.55);}
   .card.maximized canvas{max-height:calc(100vh - 90px);}
   .cbtn.analyze:hover{color:var(--accent);border-color:var(--accent);}
-  body:not(.ai-on) .cbtn.analyze{display:none;}
-  /* KI-Einstellungen im ⚙-Menü */
-  .menu .airow{display:flex;flex-direction:column;gap:2px;color:var(--muted);font-size:11px;}
-  .menu .airow input, .menu .airow select{width:100%;font-size:12px;padding:3px 5px;
-    background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;}
-  .menu .aihead{margin-top:2px;font-size:11px;font-weight:600;color:var(--fg);
-    border-top:1px solid var(--border);padding-top:6px;text-transform:uppercase;letter-spacing:.03em;}
-  .menu .aichk{flex-direction:row;align-items:center;gap:6px;}
-  .menu .aichk input{width:auto;}
   /* Analyse-Overlay */
   #analysis{position:fixed;inset:0;z-index:3000;display:none;background:rgba(0,0,0,.6);
     padding:24px;overflow:auto;}
@@ -634,16 +625,6 @@ PAGE = r"""<!DOCTYPE html>
       </label>
       <button id="export" title="Aktuell angezeigte Zeitreihen als CSV-Datei herunterladen">⬇ Export CSV</button>
       <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">⬇ Export JSON</button>
-      <div class="aihead">KI-Auswertung</div>
-      <label class="airow aichk" title="Blendet den 🔍-Button an den Diagrammen ein und aktiviert die KI-Auswertung.">
-        <input type="checkbox" id="ai_on"> aktiviert</label>
-      <label class="airow" title="OpenAI-kompatibler Chat-Endpunkt, z. B. eine der überwachten vLLM-Instanzen.">Endpunkt (/v1/chat/completions)
-        <input type="text" id="ai_url" placeholder="http://host:9081/v1/chat/completions"></label>
-      <label class="airow" title="Modellname, wie ihn der Endpunkt erwartet.">Modell
-        <input type="text" id="ai_model" list="ai_models" placeholder="Modellname">
-        <datalist id="ai_models"></datalist></label>
-      <div class="airow" title="Der API-Key wird ausschließlich server-seitig gehalten (Env VLLM_AI_KEY) und nie im Browser gespeichert oder gesendet.">API-Key
-        <span id="ai_keystat" style="color:var(--muted)">–</span></div>
     </div>
   </div>
   <span id="countdown"></span>
@@ -1042,7 +1023,7 @@ function applySeries(j){
   document.getElementById("status").textContent="Stand "+new Date(j.now).toLocaleTimeString("de-DE")+" · "+n+" Punkte";
 }
 
-async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderInstances();renderKPIs();aiPrefill();}catch(e){}}
+async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderInstances();renderKPIs();}catch(e){}}
 async function fetchOnce(){try{applySeries(await(await fetch("/api/series?range="+rangeVal())).json());}catch(e){document.getElementById("status").textContent="Fehler: "+e;}}
 
 // --- Refresh-Steuerung: Live (SSE) oder Intervall ---
@@ -1158,41 +1139,9 @@ document.addEventListener("keydown",e=>{
 });
 
 // --- KI-Auswertung & Analyse-Panel ---
-// Endpunkt/Modell = persönlicher Override im Cookie; der API-Key liegt AUSSCHLIESSLICH
-// server-seitig (Env VLLM_AI_KEY) und wird nie im Browser gehalten/gesendet.
-store.del("vllm_ai_key");   // Altbestand aus früheren Versionen entfernen
-const AI={ on:store.get("vllm_ai_on")!=="0", url:store.get("vllm_ai_url")||"",
-           model:store.get("vllm_ai_model")||"" };
-function aiSaveFromInputs(){
-  AI.on=document.getElementById("ai_on").checked;
-  AI.url=document.getElementById("ai_url").value.trim();
-  AI.model=document.getElementById("ai_model").value.trim();
-  store.set("vllm_ai_on",AI.on?"1":"0"); store.set("vllm_ai_url",AI.url);
-  store.set("vllm_ai_model",AI.model);
-  document.body.classList.toggle("ai-on",AI.on);
-}
-function aiInitInputs(){
-  document.getElementById("ai_on").checked=AI.on;
-  document.getElementById("ai_url").value=AI.url;
-  document.getElementById("ai_model").value=AI.model;
-  document.body.classList.toggle("ai-on",AI.on);
-  ["ai_on","ai_url","ai_model"].forEach(id=>
-    document.getElementById(id).addEventListener("change",aiSaveFromInputs));
-}
-function aiPrefill(){
-  if(!lastConfig)return;
-  const insts=(lastConfig.instances||[]).filter(i=>(i.kind||"vllm")!=="gpu");
-  const dl=document.getElementById("ai_models");
-  if(dl){ dl.innerHTML=""; insts.forEach(i=>{const o=document.createElement("option");o.value=i.model;dl.appendChild(o);}); }
-  const ai=lastConfig.ai||{};
-  const vllm=insts.find(i=>(i.kind||"vllm")==="vllm")||insts[0];
-  const u=document.getElementById("ai_url"), m=document.getElementById("ai_model");
-  // Placeholder = zentrale Server-Config (Standard für alle Frontends); sonst Instanz-Vorschlag
-  if(u && !AI.url) u.placeholder=ai.url || (vllm?("http://"+vllm.host+":"+vllm.port+"/v1/chat/completions"):"");
-  if(m && !AI.model) m.placeholder=ai.model || (vllm?vllm.model:"");
-  const ks=document.getElementById("ai_keystat");
-  if(ks) ks.textContent = ai.key_set ? "server-seitig gesetzt ✓" : "keiner (nicht nötig)";
-}
+// KI-Auswertung wird ausschließlich server-seitig konfiguriert (Env VLLM_AI_*).
+// Frühere browser-seitige Overrides aufräumen.
+["vllm_ai_key","vllm_ai_url","vllm_ai_model","vllm_ai_on"].forEach(k=>store.del(k));
 const fmt=v=>{ if(v==null||isNaN(v))return "–"; const a=Math.abs(v);
   return a>=100?v.toFixed(0):a>=1?v.toFixed(1):v.toFixed(2); };
 function chartStats(spec){
@@ -1250,18 +1199,17 @@ async function runAI(){
   if(!anCur)return;
   const out=document.getElementById("an_ai"), meta=document.getElementById("an_aimeta"), gen=document.getElementById("an_gen");
   const serverConfigured=lastConfig&&lastConfig.ai&&lastConfig.ai.configured;
-  if(!AI.url && !serverConfigured){ out.textContent='Kein KI-Endpunkt konfiguriert. Bitte im ⚙-Menü unter „KI-Auswertung" einen Endpunkt eintragen (oder server-seitig VLLM_AI_URL setzen).'; return; }
+  if(!serverConfigured){ out.textContent='Kein KI-Endpunkt konfiguriert. Bitte server-seitig VLLM_AI_URL / VLLM_AI_MODEL setzen (z. B. über setup.sh).'; return; }
   gen.disabled=true; out.textContent="KI wertet aus …"; meta.textContent=""; const t0=Date.now();
   try{
     const r=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({url:AI.url,model:AI.model,user:aiPrompt(anCur.spec,anCur.stats,anCur.unit)})});
+      body:JSON.stringify({user:aiPrompt(anCur.spec,anCur.stats,anCur.unit)})});
     const j=await r.json();
     if(j.error){ out.textContent="⚠️ "+j.error; }
-    else { out.textContent=j.text||"(leere Antwort)"; meta.textContent="Modell "+(j.model||AI.model)+" · "+((Date.now()-t0)/1000).toFixed(1)+" s"; }
+    else { out.textContent=j.text||"(leere Antwort)"; meta.textContent="Modell "+(j.model||"")+" · "+((Date.now()-t0)/1000).toFixed(1)+" s"; }
   }catch(e){ out.textContent="⚠️ Fehler: "+e; }
   gen.disabled=false; gen.textContent="Neu generieren";
 }
-aiInitInputs();
 document.getElementById("an_gen").onclick=runAI;
 document.getElementById("an_close").onclick=closeAnalysis;
 document.getElementById("analysis").addEventListener("click",e=>{ if(e.target.id==="analysis")closeAnalysis(); });

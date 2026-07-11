@@ -4,6 +4,16 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.12.2] – 2026-07-11
+
+### Geändert
+- **KI-Konfiguration ausschließlich server-seitig:** Die KI-Einstellungen
+  (Endpunkt/Modell/Key/An-Aus) sind aus dem ⚙-Menü **entfernt**. Konfiguriert
+  wird nur noch über `VLLM_AI_*` (Env bzw. `setup.sh`) – eine einzige Quelle für
+  alle Frontends, kein Pro-Browser-Override mehr. Der 🔍-Button ist immer
+  sichtbar; der Analyse-Request enthält nur den Prompt. Alte KI-Cookies
+  (`vllm_ai_url/model/on/key`) werden beim Laden entfernt.
+
 ## [0.12.1] – 2026-07-11
 
 ### Geändert
