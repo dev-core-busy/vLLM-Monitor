@@ -4,6 +4,24 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.13.2] – 2026-07-11
+
+### Neu
+- **Bereiche per Drag & Drop umsortierbar:** Alle Container (Modelle & GPU,
+  Instanzen, Alarm-Historie, Effizienz, Diagramme) liegen in `#sections` und
+  lassen sich an ihrer Überschrift vertikal umordnen (Reihenfolge im Cookie
+  `vllm_section_order`). Eigene Griff-Klasse `.shandle`, sauber getrennt von den
+  inneren Kachel-Sortables.
+- **Diagramme im eigenen einklappbaren Container**; die 4 Kacheldichte-Buttons
+  sind aus der Titelleiste in dessen Überschrift gewandert (mehr Platz oben).
+
+### Geändert / behoben
+- **Maximierte Karten überdecken die Titelleiste nicht mehr** (Header sticky mit
+  z-index über der Maximierung; Karte beginnt unterhalb des Headers).
+- **Klick vs. Drag:** Sortier-Drag startet erst ab kleiner Bewegungsschwelle –
+  ein Klick auf eine Bereichs-Überschrift klappt jetzt zuverlässig auf/zu statt
+  als Drag interpretiert zu werden.
+
 ## [0.13.1] – 2026-07-11
 
 ### Geändert

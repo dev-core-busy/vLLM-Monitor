@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.13.1"
+__version__ = "0.13.2"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -523,7 +523,7 @@ PAGE = r"""<!DOCTYPE html>
   *{box-sizing:border-box}
   body{font-family:system-ui,sans-serif;margin:0;background:var(--bg);color:var(--fg);}
   header{padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--border);
-         display:flex;align-items:center;gap:12px;flex-wrap:wrap;position:sticky;top:0;z-index:10;}
+         display:flex;align-items:center;gap:12px;flex-wrap:wrap;position:sticky;top:0;z-index:2100;}
   h1{font-size:17px;margin:0;font-weight:600;}
   select,button{background:var(--panel);color:var(--fg);border:1px solid var(--border);
                 border-radius:6px;padding:5px 9px;font-size:12px;cursor:pointer;}
@@ -590,6 +590,10 @@ PAGE = r"""<!DOCTYPE html>
   .abtn.sec{background:var(--panel);color:var(--fg);border:1px solid var(--border);font-weight:400;}
   .hidden-card{display:none !important;}
   #kpicard.collapsed #kpis{display:none;}
+  #chartcard.collapsed #charts,#chartcard.collapsed #legend{display:none;}
+  .chart-h2{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+  #chartcard .grid{padding:8px 0 2px;}
+  #chartcard #legend{padding:8px 0 0;}
   #instcard.collapsed #insttable{display:none;}
   #alertcard.collapsed #alerttable{display:none;}
   #effcard.collapsed #effbody{display:none!important;}
@@ -604,6 +608,11 @@ PAGE = r"""<!DOCTYPE html>
   .card h2.handle:hover,.kpi h3.handle:hover{background:rgba(88,166,255,.12);}
   .card h2.handle:active,.kpi h3.handle:active{cursor:grabbing;}
   .card h2.handle::before,.kpi h3.handle::before{content:"⠿ ";color:var(--muted);opacity:.7;}
+  /* Griff zum Umordnen der ganzen Bereiche (Container) */
+  .card h2.shandle{cursor:grab;user-select:none;touch-action:none;}
+  .card h2.shandle:active{cursor:grabbing;}
+  .card h2.shandle::before{content:"⠿ ";color:var(--muted);opacity:.6;}
+  .card h2.shandle .densgroup::before{content:none;}
   .cpick{margin-left:auto;width:20px;height:20px;padding:0;border:1px solid var(--border);
     border-radius:5px;background:none;cursor:pointer;flex:0 0 auto;}
   .cpick::-webkit-color-swatch-wrapper{padding:0;}
@@ -707,37 +716,43 @@ PAGE = r"""<!DOCTYPE html>
   <span id="status" style="flex-basis:100%;text-align:right"></span>
 </header>
 
-<div class="card" id="kpicard" style="margin:14px 16px 0">
+<div id="sections">
+<div class="card" id="kpicard" data-id="kpi" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="kpitoggle" title="Ein-/Ausklappen">▾</button></div>
-  <h2>Modelle &amp; GPU</h2>
+  <h2 class="shandle" title="Ziehen zum Umordnen der Bereiche">Modelle &amp; GPU</h2>
   <div class="kpis" id="kpis"></div>
 </div>
 
-<div class="card" id="instcard" style="margin:14px 16px 0">
+<div class="card" id="instcard" data-id="inst" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="insttoggle" title="Ein-/Ausklappen">▾</button></div>
-  <h2>Instanzen</h2>
+  <h2 class="shandle" title="Ziehen zum Umordnen der Bereiche">Instanzen</h2>
   <table id="insttable"><thead><tr>
     <th>Status</th><th>Typ</th><th>Instanz</th><th>Modell</th><th>Version</th>
     <th>KV-Kap. / VRAM</th><th>max_model_len</th><th>gpu_mem</th><th>Prefix-Cache</th>
   </tr></thead><tbody></tbody></table>
 </div>
 
-<div class="card collapsed" id="alertcard" style="margin:14px 16px 0">
+<div class="card collapsed" id="alertcard" data-id="alerts" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="alerttoggle" title="Ein-/Ausklappen">▸</button></div>
-  <h2>Alarm-Historie <span id="alertcount" style="color:var(--muted);font-weight:400"></span></h2>
+  <h2 class="shandle" title="Ziehen zum Umordnen der Bereiche">Alarm-Historie <span id="alertcount" style="color:var(--muted);font-weight:400"></span></h2>
   <table id="alerttable"><thead><tr>
     <th>Zeit</th><th>Status</th><th>Typ</th><th>Instanz / Modell</th><th>Meldung</th>
   </tr></thead><tbody></tbody></table>
 </div>
 
-<div class="card collapsed" id="effcard" style="margin:14px 16px 0">
+<div class="card collapsed" id="effcard" data-id="eff" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="efftoggle" title="Ein-/Ausklappen">▸</button></div>
-  <h2>Effizienz & Kapazität <span style="color:var(--muted);font-weight:400;font-size:11px">(Ø über Zeitfenster, hochgerechnet)</span></h2>
+  <h2 class="shandle" title="Ziehen zum Umordnen der Bereiche">Effizienz & Kapazität <span style="color:var(--muted);font-weight:400;font-size:11px">(Ø über Zeitfenster, hochgerechnet)</span></h2>
   <div id="effbody" style="display:flex;flex-wrap:wrap;gap:18px;padding-top:4px"></div>
 </div>
 
-<div id="legend" title="Farb-Zuordnung der Modelle – Klick blendet ein Modell in allen Diagrammen aus/ein"></div>
-<div class="grid" id="charts"></div>
+<div class="card" id="chartcard" data-id="chart" style="margin:14px 16px 0">
+  <div class="cardbtns"><button class="cbtn" id="charttoggle" title="Ein-/Ausklappen">▾</button></div>
+  <h2 class="chart-h2 shandle" title="Ziehen zum Umordnen der Bereiche">Diagramme <span id="densslot"></span></h2>
+  <div id="legend" title="Farb-Zuordnung der Modelle – Klick blendet ein Modell in allen Diagrammen aus/ein"></div>
+  <div class="grid" id="charts"></div>
+</div>
+</div>
 
 <div id="analysis">
   <div class="anbox">
@@ -915,7 +930,7 @@ function saveOrder(container,key){
   const ids=[...container.children].map(c=>c.dataset.id).filter(Boolean);
   store.set(key,JSON.stringify(ids));
 }
-function afterElement(container,x,y,ph){
+function afterElement(container,x,y,ph,vertical){
   // Treffer-Test: über welcher Karte steht der Zeiger? -> davor/danach einsortieren.
   // Kein Sprung, wenn der Zeiger über der Lücke oder zwischen den Karten liegt.
   const cards=[...container.querySelectorAll(":scope > [data-id]:not(.dragging)")];
@@ -923,7 +938,8 @@ function afterElement(container,x,y,ph){
   for(const c of cards){
     const b=c.getBoundingClientRect();
     if(x>=b.left && x<=b.right && y>=b.top && y<=b.bottom){
-      return (x < b.left + b.width/2) ? c : c.nextElementSibling;
+      const before = vertical ? (y < b.top + b.height/2) : (x < b.left + b.width/2);
+      return before ? c : c.nextElementSibling;
     }
   }
   const first=cards[0].getBoundingClientRect();
@@ -932,39 +948,50 @@ function afterElement(container,x,y,ph){
   if(y < first.top)   return cards[0];   // oberhalb aller Karten -> vor die erste
   return ph;                             // dazwischen -> Platzhalter nicht bewegen
 }
-function makeSortable(container,onSave){
-  container.querySelectorAll(".handle").forEach(h=>{
+function makeSortable(container,onSave,handleSel,vertical){
+  container.querySelectorAll(handleSel||".handle").forEach(h=>{
     if(h._sortBound)return; h._sortBound=true;
+    // Nach echtem Drag den folgenden Klick unterdrücken (sonst toggelt der Header)
+    h.addEventListener("click",e=>{ if(h._suppressClick){ e.stopImmediatePropagation(); e.preventDefault(); h._suppressClick=false; } },true);
     h.addEventListener("pointerdown",e=>{
       if(e.button!==0)return;
       const el=h.closest("[data-id]"); if(!el)return;
-      e.preventDefault();
-      const rect=el.getBoundingClientRect();
-      const offX=e.clientX-rect.left, offY=e.clientY-rect.top;
-      // Platzhalter-Lücke einsetzen, Karte "anheben" (schwebt, folgt der Maus)
-      const ph=document.createElement("div");
-      ph.className="placeholder-slot"; ph.style.height=rect.height+"px";
-      container.insertBefore(ph,el);
-      window._dragging=true; el.classList.add("dragging");
-      el.style.position="fixed"; el.style.width=rect.width+"px";
-      el.style.left=(e.clientX-offX)+"px"; el.style.top=(e.clientY-offY)+"px";
-      el.style.zIndex="1000"; el.style.pointerEvents="none";
-      document.body.appendChild(el);   // aus dem Raster nehmen -> keine Sibling-Rückkopplung
+      const startX=e.clientX, startY=e.clientY;
+      let dragging=false, ph=null, offX=0, offY=0;
+      const begin=ev=>{
+        dragging=true;
+        const rect=el.getBoundingClientRect();
+        offX=startX-rect.left; offY=startY-rect.top;
+        ph=document.createElement("div");
+        ph.className="placeholder-slot"; ph.style.height=rect.height+"px";
+        container.insertBefore(ph,el);
+        window._dragging=true; el.classList.add("dragging");
+        el.style.position="fixed"; el.style.width=rect.width+"px";
+        el.style.zIndex="1000"; el.style.pointerEvents="none";
+        document.body.appendChild(el);   // aus dem Raster nehmen -> keine Sibling-Rückkopplung
+      };
       const move=ev=>{
+        if(!dragging){
+          // erst ab kleiner Bewegungsschwelle wird gezogen – ein Klick bleibt ein Klick
+          if(Math.abs(ev.clientX-startX)<5 && Math.abs(ev.clientY-startY)<5) return;
+          begin(ev);
+        }
         ev.preventDefault();
         el.style.left=(ev.clientX-offX)+"px";
         el.style.top=(ev.clientY-offY)+"px";
-        const ref=afterElement(container,ev.clientX,ev.clientY,ph);
+        const ref=afterElement(container,ev.clientX,ev.clientY,ph,vertical);
         if(ref!==ph){ if(ref)container.insertBefore(ph,ref); else container.appendChild(ph); }
       };
       const up=()=>{
         document.removeEventListener("pointermove",move);
         document.removeEventListener("pointerup",up);
         document.removeEventListener("pointercancel",up);
+        if(!dragging)return;               // war nur ein Klick -> nichts tun
         container.insertBefore(el,ph); ph.remove();
         el.classList.remove("dragging");
         el.style.position=el.style.width=el.style.left=el.style.top=el.style.zIndex=el.style.pointerEvents="";
         window._dragging=false;
+        h._suppressClick=true;             // den unmittelbar folgenden Klick verwerfen
         onSave&&onSave();
       };
       document.addEventListener("pointermove",move,{passive:false});
@@ -1268,6 +1295,10 @@ function applyHidden(){
 function toggleMax(card,id){
   const on=card.classList.toggle("maximized");
   document.body.style.overflow=on?"hidden":"";
+  if(on){ window.scrollTo(0,0);
+    const hdr=document.querySelector("header");
+    card.style.top=((hdr?hdr.offsetHeight:56)+8)+"px";   // unter der Titelleiste beginnen
+  } else { card.style.top=""; }
   const c=charts[id]; if(c) setTimeout(()=>{try{c.resize();}catch(e){}},60);
 }
 function wireCardButtons(container){
@@ -1522,6 +1553,34 @@ document.getElementById("restore").onclick=()=>{ saveHidden([]); applyHidden(); 
   if(store.get("vllm_kpi_collapsed")==="1") kc.classList.add("collapsed");
   sync();
   kt.onclick=()=>{ store.set("vllm_kpi_collapsed", kc.classList.toggle("collapsed")?"1":"0"); sync(); };
+})();
+// Diagramm-Container: Kacheldichte-Buttons aus der Titelleiste in die Überschrift,
+// Container einklappbar (Default aufgeklappt)
+(function(){
+  const slot=document.getElementById("densslot"), dg=document.querySelector(".densgroup");
+  if(slot&&dg){ slot.appendChild(dg);
+    // Klick auf die Rasterbuttons darf weder Umordnen noch Auf-/Zuklappen auslösen
+    ["pointerdown","mousedown","click"].forEach(ev=>dg.addEventListener(ev,e=>e.stopPropagation())); }
+  const cc=document.getElementById("chartcard"), ct=document.getElementById("charttoggle");
+  const sync=()=>{ ct.textContent = cc.classList.contains("collapsed") ? "▸" : "▾"; };
+  if(store.get("vllm_chart_collapsed")==="1") cc.classList.add("collapsed");
+  sync();
+  ct.onclick=()=>{ const now=cc.classList.toggle("collapsed"); store.set("vllm_chart_collapsed", now?"1":"0"); sync();
+    if(!now) setTimeout(()=>Object.values(charts).forEach(c=>{try{c.resize();}catch(e){}}),60); };
+})();
+// Reihenfolge der Bereiche (Container) per Drag & Drop – Griff = Bereichs-Überschrift
+(function(){
+  const cont=document.getElementById("sections"); if(!cont)return;
+  const saved=JSON.parse(store.get("vllm_section_order")||"null");
+  if(saved&&saved.length) saved.forEach(id=>{
+    const el=cont.querySelector(':scope > [data-id="'+id+'"]'); if(el)cont.appendChild(el);
+  });
+  makeSortable(cont,()=>{ saveOrder(cont,"vllm_section_order");
+    setTimeout(()=>Object.values(charts).forEach(c=>{try{c.resize();}catch(e){}}),80); },".shandle",true);
+  // Klick auf die Bereichs-Überschrift klappt auf/zu (Drag erst ab Bewegung)
+  cont.querySelectorAll(":scope > .card > h2.shandle").forEach(h=>{
+    h.addEventListener("click",()=>{ const btn=h.parentElement.querySelector(".cardbtns .cbtn"); if(btn)btn.click(); });
+  });
 })();
 // Instanzen-Karte einklappbar (Zustand im Cookie)
 (function(){
