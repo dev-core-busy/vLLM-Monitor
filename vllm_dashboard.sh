@@ -32,8 +32,9 @@ import html
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.11.2"
+__version__ = "0.12.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -41,6 +42,14 @@ DEFAULT_PORT = 8899
 LABEL = os.environ.get("VLLM_LABEL", "")
 CERT_PATH = None            # wird in main() gesetzt, wenn TLS aktiv ist
 PUSH_INTERVAL = 5           # SSE-Push-Takt (Sekunden)
+
+# KI-Auswertung: OpenAI-kompatibler Chat-Endpunkt (Default: leer -> im Frontend
+# konfigurierbar). Werte aus dem Request-Body haben Vorrang vor diesen Defaults.
+AI_URL = os.environ.get("VLLM_AI_URL", "")        # z. B. http://host:9081/v1/chat/completions
+AI_MODEL = os.environ.get("VLLM_AI_MODEL", "")
+AI_KEY = os.environ.get("VLLM_AI_KEY", "")
+AI_TIMEOUT = float(os.environ.get("VLLM_AI_TIMEOUT", "90"))
+AI_MAX_TOKENS = int(os.environ.get("VLLM_AI_MAX_TOKENS", "1500"))
 STALE_AFTER = 90            # Instanz gilt als offline, wenn älter (Sekunden)
 
 # Counter-Spalten -> Raten-Feld (Δwert / Δt)
@@ -257,6 +266,81 @@ def _range_from(qs):
     return max(60, min(r, 30 * 86400))
 
 
+def _normalize_ai_url(u):
+    """Macht die Endpunkt-Angabe tolerant: akzeptiert host:port, .../v1 oder die
+    volle .../v1/chat/completions-URL und ergänzt den fehlenden Pfad."""
+    u = (u or "").strip().rstrip("/")
+    if not u:
+        return u
+    if "://" not in u:
+        u = "http://" + u
+    low = u.lower()
+    if low.endswith("/chat/completions"):
+        return u
+    if low.endswith("/v1"):
+        return u + "/chat/completions"
+    return u + "/v1/chat/completions"
+
+
+def ai_analyze(body):
+    """Leitet eine Analyse-Anfrage an einen OpenAI-kompatiblen Chat-Endpunkt
+    (z. B. das überwachte vLLM) weiter. Request-Body überschreibt die Defaults."""
+    url = _normalize_ai_url(body.get("url") or AI_URL or "")
+    model = (body.get("model") or AI_MODEL or "").strip()
+    key = (body.get("key") or AI_KEY or "").strip()
+    system = body.get("system") or (
+        "Du bist ein erfahrener Monitoring-Analyst für LLM-Server (vLLM). "
+        "Antworte knapp, sachlich und auf Deutsch.")
+    user = body.get("user") or ""
+    if not url:
+        return {"error": "Kein KI-Endpunkt konfiguriert. Bitte im ⚙-Menü unter "
+                         "'KI-Auswertung' einen /v1/chat/completions-Endpunkt eintragen."}
+    if not model:
+        return {"error": "Kein KI-Modell konfiguriert (⚙-Menü → KI-Auswertung)."}
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+        "temperature": 0.3,
+        "max_tokens": AI_MAX_TOKENS,
+        "stream": False,
+    }).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    req = urlrequest.Request(url, data=payload, headers=headers, method="POST")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urlrequest.urlopen(req, timeout=AI_TIMEOUT, context=ctx) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urlerror.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8")[:300]
+        except Exception:
+            pass
+        return {"error": "KI-Endpunkt HTTP %s%s" % (e.code, (": " + detail) if detail else "")}
+    except Exception as e:
+        return {"error": "KI-Endpunkt nicht erreichbar: %s" % e}
+    try:
+        msg = data["choices"][0]["message"]
+        text = (msg.get("content") or "").strip()
+        # Reasoning-Modelle (z. B. Qwen3) legen die Antwort ggf. nur ins Denk-Feld,
+        # wenn das Token-Budget vorher aufgebraucht wurde -> als Fallback nutzen.
+        if not text:
+            text = (msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+        finish = data["choices"][0].get("finish_reason")
+    except (KeyError, IndexError, TypeError):
+        text, finish = "", None
+    if not text and finish == "length":
+        return {"error": "KI-Antwort abgeschnitten (Token-Budget erschöpft). "
+                         "Im ⚙-Menü ggf. ein Modell ohne langes Reasoning wählen oder "
+                         "VLLM_AI_MAX_TOKENS erhöhen."}
+    return {"text": text, "model": model}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -278,6 +362,20 @@ class Handler(BaseHTTPRequestHandler):
                         .replace("__VERSION__", __version__)
                         .replace("__TLSAVAIL__", "1" if CERT_PATH else "0"))
             self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
+        else:
+            self._send(404, "text/plain", b"not found")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/analyze":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n) if n > 0 else b"{}"
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except (ValueError, OSError):
+                self._json({"error": "ungültige Anfrage"})
+                return
+            self._json(ai_analyze(body))
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -404,6 +502,38 @@ PAGE = r"""<!DOCTYPE html>
   .card.maximized{position:fixed;inset:14px;z-index:2000;margin:0;overflow:auto;
     box-shadow:0 0 0 100vmax rgba(0,0,0,.55);}
   .card.maximized canvas{max-height:calc(100vh - 90px);}
+  .cbtn.analyze:hover{color:var(--accent);border-color:var(--accent);}
+  body:not(.ai-on) .cbtn.analyze{display:none;}
+  /* KI-Einstellungen im ⚙-Menü */
+  .menu .airow{display:flex;flex-direction:column;gap:2px;color:var(--muted);font-size:11px;}
+  .menu .airow input, .menu .airow select{width:100%;font-size:12px;padding:3px 5px;
+    background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;}
+  .menu .aihead{margin-top:2px;font-size:11px;font-weight:600;color:var(--fg);
+    border-top:1px solid var(--border);padding-top:6px;text-transform:uppercase;letter-spacing:.03em;}
+  .menu .aichk{flex-direction:row;align-items:center;gap:6px;}
+  .menu .aichk input{width:auto;}
+  /* Analyse-Overlay */
+  #analysis{position:fixed;inset:0;z-index:3000;display:none;background:rgba(0,0,0,.6);
+    padding:24px;overflow:auto;}
+  #analysis.open{display:flex;align-items:flex-start;justify-content:center;}
+  .anbox{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+    width:min(760px,100%);box-shadow:0 20px 60px rgba(0,0,0,.6);}
+  .anhead{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--border);}
+  .anhead h3{margin:0;font-size:15px;flex:1;}
+  .anbody{padding:14px 16px;}
+  .anbody h4{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);}
+  .antab{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:14px;}
+  .antab th,.antab td{text-align:right;padding:4px 8px;border-bottom:1px solid var(--grid);white-space:nowrap;}
+  .antab th:first-child,.antab td:first-child{text-align:left;}
+  .antab td .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle;}
+  .aiout{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px 14px;
+    font-size:13px;line-height:1.5;white-space:pre-wrap;min-height:40px;color:var(--fg);}
+  .aimeta{font-size:11px;color:var(--muted);margin-top:6px;}
+  .anfoot{display:flex;gap:8px;align-items:center;padding:0 16px 16px;}
+  .abtn{background:var(--accent);color:#fff;border:none;border-radius:7px;padding:7px 14px;
+    font-size:13px;cursor:pointer;font-weight:600;}
+  .abtn:disabled{opacity:.5;cursor:default;}
+  .abtn.sec{background:var(--panel);color:var(--fg);border:1px solid var(--border);font-weight:400;}
   .hidden-card{display:none !important;}
   #instcard.collapsed #insttable{display:none;}
   canvas{max-height:var(--card-h);}
@@ -500,6 +630,16 @@ PAGE = r"""<!DOCTYPE html>
       </label>
       <button id="export" title="Aktuell angezeigte Zeitreihen als CSV-Datei herunterladen">⬇ Export CSV</button>
       <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">⬇ Export JSON</button>
+      <div class="aihead">KI-Auswertung</div>
+      <label class="airow aichk" title="Blendet den 🔍-Button an den Diagrammen ein und aktiviert die KI-Auswertung.">
+        <input type="checkbox" id="ai_on"> aktiviert</label>
+      <label class="airow" title="OpenAI-kompatibler Chat-Endpunkt, z. B. eine der überwachten vLLM-Instanzen.">Endpunkt (/v1/chat/completions)
+        <input type="text" id="ai_url" placeholder="http://host:9081/v1/chat/completions"></label>
+      <label class="airow" title="Modellname, wie ihn der Endpunkt erwartet.">Modell
+        <input type="text" id="ai_model" list="ai_models" placeholder="Modellname">
+        <datalist id="ai_models"></datalist></label>
+      <label class="airow" title="Nur falls der Endpunkt einen Token verlangt (lokales vLLM meist nicht).">API-Key (optional)
+        <input type="password" id="ai_key" placeholder="leer lassen, wenn keiner nötig"></label>
     </div>
   </div>
   <span id="countdown"></span>
@@ -519,6 +659,24 @@ PAGE = r"""<!DOCTYPE html>
 
 <div id="legend" title="Farb-Zuordnung der Modelle – Klick blendet ein Modell in allen Diagrammen aus/ein"></div>
 <div class="grid" id="charts"></div>
+
+<div id="analysis">
+  <div class="anbox">
+    <div class="anhead"><h3 id="an_title">Analyse</h3>
+      <button class="cbtn close" id="an_close" title="Schließen (Esc)">×</button></div>
+    <div class="anbody">
+      <h4>Kennzahlen (aktuelles Zeitfenster)</h4>
+      <div id="an_stats"></div>
+      <h4>KI-Auswertung</h4>
+      <div class="aiout" id="an_ai">Noch keine Auswertung generiert.</div>
+      <div class="aimeta" id="an_aimeta"></div>
+    </div>
+    <div class="anfoot">
+      <button class="abtn" id="an_gen">KI-Auswertung generieren</button>
+      <button class="abtn sec" id="an_copy" title="Kennzahlen + KI-Text kopieren">Kopieren</button>
+    </div>
+  </div>
+</div>
 
 <div id="secbanner" style="display:none">
   <span>⚠️ Unverschlüsselte Verbindung (HTTP) – Browser-Benachrichtigungen sind hier nicht möglich.</span>
@@ -880,7 +1038,7 @@ function applySeries(j){
   document.getElementById("status").textContent="Stand "+new Date(j.now).toLocaleTimeString("de-DE")+" · "+n+" Punkte";
 }
 
-async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderInstances();renderKPIs();}catch(e){}}
+async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderInstances();renderKPIs();aiPrefill();}catch(e){}}
 async function fetchOnce(){try{applySeries(await(await fetch("/api/series?range="+rangeVal())).json());}catch(e){document.getElementById("status").textContent="Fehler: "+e;}}
 
 // --- Refresh-Steuerung: Live (SSE) oder Intervall ---
@@ -949,7 +1107,8 @@ function applyTheme(t){document.body.dataset.theme=t;store.set("vllm_theme",t);
 function buildGrid(){
   const g=document.getElementById("charts");
   const saved=JSON.parse(store.get("vllm_chart_order")||"null");
-  const btns=`<div class="cardbtns"><button class="cbtn max" title="Maximieren (Esc schließt)">⛶</button>`+
+  const btns=`<div class="cardbtns"><button class="cbtn analyze" title="Analyse & KI-Auswertung">🔍</button>`+
+             `<button class="cbtn max" title="Maximieren (Esc schließt)">⛶</button>`+
              `<button class="cbtn close" title="Kachel ausblenden">×</button></div>`;
   orderBy(CHARTS,saved,s=>s.id).forEach(spec=>{
     const d=document.createElement("div");d.className="card";d.dataset.id=spec.id;
@@ -981,14 +1140,128 @@ function wireCardButtons(container){
   container.addEventListener("click",e=>{
     const b=e.target.closest(".cbtn"); if(!b)return;
     const card=b.closest("[data-id]"); if(!card)return;
-    if(b.classList.contains("max")) toggleMax(card,card.dataset.id);
+    if(b.classList.contains("analyze")) openAnalysis(card.dataset.id);
+    else if(b.classList.contains("max")) toggleMax(card,card.dataset.id);
     else if(b.classList.contains("close")){ const h=loadHidden(); if(!h.includes(card.dataset.id)){h.push(card.dataset.id);saveHidden(h);} if(card.classList.contains("maximized"))toggleMax(card,card.dataset.id); applyHidden(); }
   });
 }
 // Esc beendet die Maximierung
 document.addEventListener("keydown",e=>{
-  if(e.key==="Escape"){const m=document.querySelector(".card.maximized");if(m)toggleMax(m,m.dataset.id);}
+  if(e.key==="Escape"){
+    const an=document.getElementById("analysis");
+    if(an&&an.classList.contains("open")){closeAnalysis();return;}
+    const m=document.querySelector(".card.maximized");if(m)toggleMax(m,m.dataset.id);}
 });
+
+// --- KI-Auswertung & Analyse-Panel ---
+const AI={ on:store.get("vllm_ai_on")!=="0", url:store.get("vllm_ai_url")||"",
+           model:store.get("vllm_ai_model")||"", key:store.get("vllm_ai_key")||"" };
+function aiSaveFromInputs(){
+  AI.on=document.getElementById("ai_on").checked;
+  AI.url=document.getElementById("ai_url").value.trim();
+  AI.model=document.getElementById("ai_model").value.trim();
+  AI.key=document.getElementById("ai_key").value;
+  store.set("vllm_ai_on",AI.on?"1":"0"); store.set("vllm_ai_url",AI.url);
+  store.set("vllm_ai_model",AI.model); store.set("vllm_ai_key",AI.key);
+  document.body.classList.toggle("ai-on",AI.on);
+}
+function aiInitInputs(){
+  document.getElementById("ai_on").checked=AI.on;
+  document.getElementById("ai_url").value=AI.url;
+  document.getElementById("ai_model").value=AI.model;
+  document.getElementById("ai_key").value=AI.key;
+  document.body.classList.toggle("ai-on",AI.on);
+  ["ai_on","ai_url","ai_model","ai_key"].forEach(id=>
+    document.getElementById(id).addEventListener("change",aiSaveFromInputs));
+}
+function aiPrefill(){
+  if(!lastConfig)return;
+  const insts=(lastConfig.instances||[]).filter(i=>(i.kind||"vllm")!=="gpu");
+  const dl=document.getElementById("ai_models");
+  if(dl){ dl.innerHTML=""; insts.forEach(i=>{const o=document.createElement("option");o.value=i.model;dl.appendChild(o);}); }
+  const vllm=insts.find(i=>(i.kind||"vllm")==="vllm")||insts[0];
+  if(vllm){
+    const u=document.getElementById("ai_url"), m=document.getElementById("ai_model");
+    if(u && !AI.url) u.placeholder="http://"+vllm.host+":"+vllm.port+"/v1/chat/completions";
+    if(m && !AI.model) m.placeholder=vllm.model;
+  }
+}
+const fmt=v=>{ if(v==null||isNaN(v))return "–"; const a=Math.abs(v);
+  return a>=100?v.toFixed(0):a>=1?v.toFixed(1):v.toFixed(2); };
+function chartStats(spec){
+  if(!lastData)return [];
+  return datasets(lastData.models,spec).map(d=>{
+    let n=0,min=Infinity,max=-Infinity,sum=0,first=null,last=null;
+    d.data.forEach(p=>{const v=p.y; if(v==null||isNaN(v))return;
+      n++; if(v<min)min=v; if(v>max)max=v; sum+=v; if(first===null)first=v; last=v;});
+    return n?{label:d.label,color:d.borderColor,n,min,max,avg:sum/n,last,trend:last-first}
+            :{label:d.label,color:d.borderColor,n:0};
+  });
+}
+function unitOf(spec){ const m=spec.title.match(/\(([^)]+)\)\s*$/); return m?m[1]:""; }
+function renderStats(stats){
+  let h='<table class="antab"><thead><tr><th>Serie</th><th>Ø</th><th>Min</th><th>Max</th><th>Aktuell</th><th>Trend</th></tr></thead><tbody>';
+  stats.forEach(s=>{
+    const sw='<span class="sw" style="background:'+s.color+'"></span>';
+    if(!s.n){ h+='<tr><td>'+sw+s.label+'</td><td colspan="5" style="text-align:left;color:var(--muted)">keine Daten</td></tr>'; return; }
+    const arrow=s.trend>0?"▲":s.trend<0?"▼":"–";
+    h+='<tr><td>'+sw+s.label+'</td><td>'+fmt(s.avg)+'</td><td>'+fmt(s.min)+'</td><td>'+fmt(s.max)+
+       '</td><td>'+fmt(s.last)+'</td><td>'+arrow+' '+fmt(Math.abs(s.trend))+'</td></tr>';
+  });
+  return h+"</tbody></table>";
+}
+function statsAsText(stats){
+  return stats.map(s=> s.n
+    ? "- "+s.label+": Ø "+fmt(s.avg)+", Min "+fmt(s.min)+", Max "+fmt(s.max)+", aktuell "+fmt(s.last)+", Trend "+(s.trend>=0?"+":"")+fmt(s.trend)
+    : "- "+s.label+": keine Daten").join("\n");
+}
+function aiPrompt(spec,stats,unit){
+  const sel=document.getElementById("range"), rt=sel.options[sel.selectedIndex].text;
+  return ["Diagramm: "+spec.title,
+    spec.desc?("Bedeutung: "+spec.desc.replace(/\n/g," ")):"",
+    "Zeitfenster: "+rt+" · Einheit: "+(unit||"—"), "",
+    "Kennzahlen je Serie (Ø / Min / Max / Aktuell / Trend seit Fensterbeginn):",
+    statsAsText(stats), "",
+    "Werte diese Kennzahlen aus: (1) Zustand einordnen, (2) Auffälligkeiten/Ausreißer/Trends, "+
+    "(3) bei mehreren Serien ein kurzer Vergleich, (4) konkrete Handlungsempfehlung falls nötig. "+
+    "Maximal 6 Sätze, die Zahlen nicht bloß wiederholen."].filter(Boolean).join("\n");
+}
+let anCur=null;
+function openAnalysis(id){
+  const spec=CHARTS.find(c=>c.id===id); if(!spec)return;
+  const stats=chartStats(spec), unit=unitOf(spec);
+  anCur={spec,stats,unit};
+  document.getElementById("an_title").textContent=spec.title;
+  document.getElementById("an_stats").innerHTML=renderStats(stats);
+  document.getElementById("an_ai").textContent="Noch keine Auswertung generiert.";
+  document.getElementById("an_aimeta").textContent="";
+  const gen=document.getElementById("an_gen"); gen.disabled=false; gen.textContent="KI-Auswertung generieren";
+  document.getElementById("analysis").classList.add("open");
+}
+function closeAnalysis(){ document.getElementById("analysis").classList.remove("open"); }
+async function runAI(){
+  if(!anCur)return;
+  const out=document.getElementById("an_ai"), meta=document.getElementById("an_aimeta"), gen=document.getElementById("an_gen");
+  if(!AI.url){ out.textContent='Kein KI-Endpunkt konfiguriert. Bitte im ⚙-Menü unter „KI-Auswertung" Endpunkt und Modell eintragen.'; return; }
+  gen.disabled=true; out.textContent="KI wertet aus …"; meta.textContent=""; const t0=Date.now();
+  try{
+    const r=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({url:AI.url,model:AI.model,key:AI.key,user:aiPrompt(anCur.spec,anCur.stats,anCur.unit)})});
+    const j=await r.json();
+    if(j.error){ out.textContent="⚠️ "+j.error; }
+    else { out.textContent=j.text||"(leere Antwort)"; meta.textContent="Modell "+(j.model||AI.model)+" · "+((Date.now()-t0)/1000).toFixed(1)+" s"; }
+  }catch(e){ out.textContent="⚠️ Fehler: "+e; }
+  gen.disabled=false; gen.textContent="Neu generieren";
+}
+aiInitInputs();
+document.getElementById("an_gen").onclick=runAI;
+document.getElementById("an_close").onclick=closeAnalysis;
+document.getElementById("analysis").addEventListener("click",e=>{ if(e.target.id==="analysis")closeAnalysis(); });
+document.getElementById("an_copy").onclick=()=>{
+  if(!anCur)return;
+  const txt=anCur.spec.title+"\n\n"+statsAsText(anCur.stats)+"\n\nKI-Auswertung:\n"+document.getElementById("an_ai").textContent;
+  if(navigator.clipboard)navigator.clipboard.writeText(txt).catch(()=>{});
+};
 
 buildGrid();
 applyTheme(store.get("vllm_theme")||"dark");

@@ -26,7 +26,13 @@ one or more vLLM instances (host via `VLLM_HOST`, ports/labels via
   Chart.js dashboard and a `/api/series` JSON endpoint. Computes rates
   (tokens/s, requests/s), average latencies (TTFT/E2E/ITL from histogram
   `Δsum/Δcount`), and prefix-cache hit rate from the stored cumulative counters,
-  graphed **per model over time**.
+  graphed **per model over time**. Each chart has a 🔍 analysis panel: locally
+  computed stats (min/max/avg/trend per series) plus an optional AI evaluation.
+  The AI call is proxied server-side via `POST /api/analyze` → an
+  OpenAI-compatible chat endpoint (`VLLM_AI_URL`/`VLLM_AI_MODEL`/`VLLM_AI_KEY`,
+  e.g. one of the monitored vLLM instances). `ai_analyze()` normalizes the URL
+  (accepts `host:port`, `…/v1`, or the full path) and falls back to the
+  `reasoning` field for reasoning models (Qwen3) when `content` is empty.
 
 Both files are named `*.sh` but are **Python 3** (shebang `#!/usr/bin/env
 python3`) and use **only the standard library** — no `pip install` needed.

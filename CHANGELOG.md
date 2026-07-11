@@ -4,6 +4,27 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.12.0] – 2026-07-11
+
+### Neu
+- **KI-Auswertung je Diagramm**: Der neue 🔍-Button (links vom Maximieren-Button)
+  öffnet ein Analyse-Panel mit lokal berechneten Kennzahlen (Ø/Min/Max/Aktuell/
+  Trend je Serie, Modellvergleich) und einer optionalen KI-Bewertung
+  (Zustand, Auffälligkeiten, Vergleich, Handlungsempfehlung).
+- Die KI läuft über einen frei konfigurierbaren **OpenAI-kompatiblen
+  Chat-Endpunkt** – z. B. direkt eine der überwachten vLLM-Instanzen, sodass
+  keine Daten das Netz verlassen. Konfiguration im ⚙-Menü (Endpunkt, Modell,
+  API-Key, An/Aus) oder per Env (`VLLM_AI_URL`, `VLLM_AI_MODEL`, `VLLM_AI_KEY`,
+  `VLLM_AI_MAX_TOKENS`); `setup.sh` fragt den Endpunkt beim Einrichten ab.
+- Neuer Backend-Endpunkt `POST /api/analyze` als serverseitiger Proxy zum
+  Chat-Endpunkt (kein CORS/Key im Browser, stdlib-only).
+
+### Behoben / robust
+- Endpunkt-Angabe ist tolerant: `host:port`, `…/v1` oder die volle
+  `…/v1/chat/completions`-URL werden akzeptiert (Pfad wird ergänzt).
+- Reasoning-Modelle (z. B. Qwen3): Token-Budget erhöht und Fallback auf das
+  Reasoning-Feld, falls `content` leer bleibt.
+
 ## [0.11.2] – 2026-07-10
 
 ### Geändert

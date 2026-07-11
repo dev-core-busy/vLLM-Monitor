@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.11.2-blue)
+![Version](https://img.shields.io/badge/version-0.12.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -54,8 +54,14 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
 - 🚦 **KPI-Karten & Alarme** – Farbampeln je Instanz, Schwellwert-Warnungen
   (KV %, Fehler, offline) mit optionaler Browser-Benachrichtigung.
 - 📐 **Latenz-Perzentile P50/P95/P99** (TTFT/E2E/ITL) aus den Histogramm-Buckets.
+- 🤖 **KI-Auswertung je Diagramm** – der 🔍-Button öffnet ein Analyse-Panel mit
+  lokal berechneten Kennzahlen (Ø/Min/Max/Aktuell/Trend, Modellvergleich) und
+  einer optionalen KI-Bewertung. Die KI läuft über einen frei konfigurierbaren
+  **OpenAI-kompatiblen Chat-Endpunkt** – z. B. direkt eine der überwachten
+  vLLM-Instanzen, sodass keine Daten das Netz verlassen.
 - ⚡ **Live-Push (SSE)**, Zoom/Pan, synchrones Fadenkreuz, Counter-Reset-Marker,
-  CSV-/JSON-Export, Hell/Dunkel, Health-Übersicht & KV-Kapazität je Instanz.
+  CSV-/JSON-Export, Hell/Dunkel, frei wählbare Kachelfarben & -dichte,
+  Health-Übersicht & KV-Kapazität je Instanz.
 
 ## Architektur
 
@@ -140,6 +146,10 @@ Dashboard:
 |----------|---------|-----------|
 | `VLLM_LABEL` | *(leer)* | Untertitel in der Kopfzeile (z. B. Host/Standort) |
 | `VLLM_DASH_BIND` | `127.0.0.1` | Bind-Adresse; `0.0.0.0` = netzwerkweit erreichbar |
+| `VLLM_AI_URL` | *(leer)* | KI-Auswertung: OpenAI-kompatibler Chat-Endpunkt (`host:port` oder volle `…/v1/chat/completions`-URL; leer = aus). Im ⚙-Menü überschreibbar. |
+| `VLLM_AI_MODEL` | *(leer)* | Modellname für die KI-Auswertung (lt. `/v1/models`) |
+| `VLLM_AI_KEY` | *(leer)* | Optionaler Bearer-Token (lokales vLLM meist ohne) |
+| `VLLM_AI_MAX_TOKENS` | `1500` | Token-Budget der KI-Antwort (Reasoning-Modelle brauchen mehr) |
 
 CLI-Aufruf des Dashboards: `python3 vllm_dashboard.sh [PORT] [BIND]`
 (z. B. `python3 vllm_dashboard.sh 8899 0.0.0.0`).
