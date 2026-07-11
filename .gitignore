@@ -10,6 +10,10 @@ session.sh
 .*_last_ip
 id_ed25519*
 *.pem
+# Lokale Setup-/Deployment-Config (Instanz-IPs, KI-Endpunkt) – nicht veröffentlichen
+.vllm_monitor_setup
+*.local.env
+vllm_monitor.conf
 
 # Python
 __pycache__/

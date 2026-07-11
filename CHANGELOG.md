@@ -4,6 +4,18 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.12.1] – 2026-07-11
+
+### Geändert
+- **Zentrale KI-Config statt pro-Browser:** Endpunkt/Modell/Key aus der
+  Server-Env (`VLLM_AI_*`) gelten als Standard für **alle** Frontends und werden
+  über `GET /api/config` bekanntgegeben. Endpunkt/Modell bleiben pro Browser
+  (Cookie) überschreibbar.
+- **API-Key nur noch server-seitig:** Der Key wird nicht mehr im Browser
+  gespeichert oder mitgesendet und nie ausgeliefert – `/api/config` meldet nur,
+  *ob* ein Key gesetzt ist. Das ⚙-Menü zeigt statt eines Eingabefelds den Status
+  „server-seitig gesetzt". Ein evtl. alter `vllm_ai_key`-Cookie wird entfernt.
+
 ## [0.12.0] – 2026-07-11
 
 ### Neu

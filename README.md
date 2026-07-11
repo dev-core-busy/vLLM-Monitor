@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.12.0-blue)
+![Version](https://img.shields.io/badge/version-0.12.1-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -146,10 +146,15 @@ Dashboard:
 |----------|---------|-----------|
 | `VLLM_LABEL` | *(leer)* | Untertitel in der Kopfzeile (z. B. Host/Standort) |
 | `VLLM_DASH_BIND` | `127.0.0.1` | Bind-Adresse; `0.0.0.0` = netzwerkweit erreichbar |
-| `VLLM_AI_URL` | *(leer)* | KI-Auswertung: OpenAI-kompatibler Chat-Endpunkt (`host:port` oder volle `…/v1/chat/completions`-URL; leer = aus). Im ⚙-Menü überschreibbar. |
+| `VLLM_AI_URL` | *(leer)* | KI-Auswertung: OpenAI-kompatibler Chat-Endpunkt (`host:port` oder volle `…/v1/chat/completions`-URL; leer = aus). **Zentraler Standard für alle Frontends**; im ⚙-Menü pro Browser überschreibbar. |
 | `VLLM_AI_MODEL` | *(leer)* | Modellname für die KI-Auswertung (lt. `/v1/models`) |
-| `VLLM_AI_KEY` | *(leer)* | Optionaler Bearer-Token (lokales vLLM meist ohne) |
+| `VLLM_AI_KEY` | *(leer)* | Optionaler Bearer-Token (lokales vLLM meist ohne). **Nur server-seitig** – wird nie im Browser gespeichert oder ausgeliefert (das UI zeigt nur, *ob* einer gesetzt ist). |
 | `VLLM_AI_MAX_TOKENS` | `1500` | Token-Budget der KI-Antwort (Reasoning-Modelle brauchen mehr) |
+
+Die zentrale KI-Config (Endpunkt, Modell, ob ein Key gesetzt ist – **nie der Key
+selbst**) wird über `GET /api/config` an alle Frontends verteilt und dient dort
+als Standard. Endpunkt/Modell lassen sich im ⚙-Menü pro Browser (Cookie)
+überschreiben; der Key bleibt ausschließlich auf dem Server.
 
 CLI-Aufruf des Dashboards: `python3 vllm_dashboard.sh [PORT] [BIND]`
 (z. B. `python3 vllm_dashboard.sh 8899 0.0.0.0`).

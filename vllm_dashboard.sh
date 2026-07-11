@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -251,7 +251,11 @@ def build_config():
             "vram_bytes": (vram[0] if vram else None),
         })
     conn.close()
-    return {"now": now * 1000, "instances": inst}
+    # Zentrale KI-Config (Server-Default für alle Frontends). Der Key selbst wird
+    # NIE ausgeliefert – nur, ob server-seitig einer gesetzt ist.
+    ai = {"url": AI_URL, "model": AI_MODEL, "key_set": bool(AI_KEY),
+          "configured": bool(AI_URL)}
+    return {"now": now * 1000, "instances": inst, "ai": ai}
 
 
 # ---------------------------------------------------------------------------
@@ -638,8 +642,8 @@ PAGE = r"""<!DOCTYPE html>
       <label class="airow" title="Modellname, wie ihn der Endpunkt erwartet.">Modell
         <input type="text" id="ai_model" list="ai_models" placeholder="Modellname">
         <datalist id="ai_models"></datalist></label>
-      <label class="airow" title="Nur falls der Endpunkt einen Token verlangt (lokales vLLM meist nicht).">API-Key (optional)
-        <input type="password" id="ai_key" placeholder="leer lassen, wenn keiner nötig"></label>
+      <div class="airow" title="Der API-Key wird ausschließlich server-seitig gehalten (Env VLLM_AI_KEY) und nie im Browser gespeichert oder gesendet.">API-Key
+        <span id="ai_keystat" style="color:var(--muted)">–</span></div>
     </div>
   </div>
   <span id="countdown"></span>
@@ -1154,24 +1158,25 @@ document.addEventListener("keydown",e=>{
 });
 
 // --- KI-Auswertung & Analyse-Panel ---
+// Endpunkt/Modell = persönlicher Override im Cookie; der API-Key liegt AUSSCHLIESSLICH
+// server-seitig (Env VLLM_AI_KEY) und wird nie im Browser gehalten/gesendet.
+store.del("vllm_ai_key");   // Altbestand aus früheren Versionen entfernen
 const AI={ on:store.get("vllm_ai_on")!=="0", url:store.get("vllm_ai_url")||"",
-           model:store.get("vllm_ai_model")||"", key:store.get("vllm_ai_key")||"" };
+           model:store.get("vllm_ai_model")||"" };
 function aiSaveFromInputs(){
   AI.on=document.getElementById("ai_on").checked;
   AI.url=document.getElementById("ai_url").value.trim();
   AI.model=document.getElementById("ai_model").value.trim();
-  AI.key=document.getElementById("ai_key").value;
   store.set("vllm_ai_on",AI.on?"1":"0"); store.set("vllm_ai_url",AI.url);
-  store.set("vllm_ai_model",AI.model); store.set("vllm_ai_key",AI.key);
+  store.set("vllm_ai_model",AI.model);
   document.body.classList.toggle("ai-on",AI.on);
 }
 function aiInitInputs(){
   document.getElementById("ai_on").checked=AI.on;
   document.getElementById("ai_url").value=AI.url;
   document.getElementById("ai_model").value=AI.model;
-  document.getElementById("ai_key").value=AI.key;
   document.body.classList.toggle("ai-on",AI.on);
-  ["ai_on","ai_url","ai_model","ai_key"].forEach(id=>
+  ["ai_on","ai_url","ai_model"].forEach(id=>
     document.getElementById(id).addEventListener("change",aiSaveFromInputs));
 }
 function aiPrefill(){
@@ -1179,12 +1184,14 @@ function aiPrefill(){
   const insts=(lastConfig.instances||[]).filter(i=>(i.kind||"vllm")!=="gpu");
   const dl=document.getElementById("ai_models");
   if(dl){ dl.innerHTML=""; insts.forEach(i=>{const o=document.createElement("option");o.value=i.model;dl.appendChild(o);}); }
+  const ai=lastConfig.ai||{};
   const vllm=insts.find(i=>(i.kind||"vllm")==="vllm")||insts[0];
-  if(vllm){
-    const u=document.getElementById("ai_url"), m=document.getElementById("ai_model");
-    if(u && !AI.url) u.placeholder="http://"+vllm.host+":"+vllm.port+"/v1/chat/completions";
-    if(m && !AI.model) m.placeholder=vllm.model;
-  }
+  const u=document.getElementById("ai_url"), m=document.getElementById("ai_model");
+  // Placeholder = zentrale Server-Config (Standard für alle Frontends); sonst Instanz-Vorschlag
+  if(u && !AI.url) u.placeholder=ai.url || (vllm?("http://"+vllm.host+":"+vllm.port+"/v1/chat/completions"):"");
+  if(m && !AI.model) m.placeholder=ai.model || (vllm?vllm.model:"");
+  const ks=document.getElementById("ai_keystat");
+  if(ks) ks.textContent = ai.key_set ? "server-seitig gesetzt ✓" : "keiner (nicht nötig)";
 }
 const fmt=v=>{ if(v==null||isNaN(v))return "–"; const a=Math.abs(v);
   return a>=100?v.toFixed(0):a>=1?v.toFixed(1):v.toFixed(2); };
@@ -1242,11 +1249,12 @@ function closeAnalysis(){ document.getElementById("analysis").classList.remove("
 async function runAI(){
   if(!anCur)return;
   const out=document.getElementById("an_ai"), meta=document.getElementById("an_aimeta"), gen=document.getElementById("an_gen");
-  if(!AI.url){ out.textContent='Kein KI-Endpunkt konfiguriert. Bitte im ⚙-Menü unter „KI-Auswertung" Endpunkt und Modell eintragen.'; return; }
+  const serverConfigured=lastConfig&&lastConfig.ai&&lastConfig.ai.configured;
+  if(!AI.url && !serverConfigured){ out.textContent='Kein KI-Endpunkt konfiguriert. Bitte im ⚙-Menü unter „KI-Auswertung" einen Endpunkt eintragen (oder server-seitig VLLM_AI_URL setzen).'; return; }
   gen.disabled=true; out.textContent="KI wertet aus …"; meta.textContent=""; const t0=Date.now();
   try{
     const r=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({url:AI.url,model:AI.model,key:AI.key,user:aiPrompt(anCur.spec,anCur.stats,anCur.unit)})});
+      body:JSON.stringify({url:AI.url,model:AI.model,user:aiPrompt(anCur.spec,anCur.stats,anCur.unit)})});
     const j=await r.json();
     if(j.error){ out.textContent="⚠️ "+j.error; }
     else { out.textContent=j.text||"(leere Antwort)"; meta.textContent="Modell "+(j.model||AI.model)+" · "+((Date.now()-t0)/1000).toFixed(1)+" s"; }
