@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -545,7 +545,7 @@ PAGE = r"""<!DOCTYPE html>
   #countdown{margin-left:auto;font-size:12px;font-variant-numeric:tabular-nums;color:var(--accent);
              min-width:150px;text-align:right;}
   #countdown.now{color:var(--ok);} #countdown.paused{color:var(--muted);}
-  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding:14px 16px 0;}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding:6px 0 2px;}
   .kpi{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;}
   .kpi.alert{border-color:var(--bad);box-shadow:0 0 0 1px var(--bad) inset;}
   .kpi h3{margin:0 0 8px;font-size:13px;display:flex;align-items:center;gap:8px;}
@@ -589,6 +589,7 @@ PAGE = r"""<!DOCTYPE html>
   .abtn:disabled{opacity:.5;cursor:default;}
   .abtn.sec{background:var(--panel);color:var(--fg);border:1px solid var(--border);font-weight:400;}
   .hidden-card{display:none !important;}
+  #kpicard.collapsed #kpis{display:none;}
   #instcard.collapsed #insttable{display:none;}
   #alertcard.collapsed #alerttable{display:none;}
   #effcard.collapsed #effbody{display:none!important;}
@@ -671,15 +672,6 @@ PAGE = r"""<!DOCTYPE html>
     <button class="dbtn" data-d="kompakt" title="Mittel (4×3)"><svg class="dg" viewBox="0 0 26 20"><circle cx="5.2" cy="5.0" r="1.7"/><circle cx="10.4" cy="5.0" r="1.7"/><circle cx="15.6" cy="5.0" r="1.7"/><circle cx="20.8" cy="5.0" r="1.7"/><circle cx="5.2" cy="10.0" r="1.7"/><circle cx="10.4" cy="10.0" r="1.7"/><circle cx="15.6" cy="10.0" r="1.7"/><circle cx="20.8" cy="10.0" r="1.7"/><circle cx="5.2" cy="15.0" r="1.7"/><circle cx="10.4" cy="15.0" r="1.7"/><circle cx="15.6" cy="15.0" r="1.7"/><circle cx="20.8" cy="15.0" r="1.7"/></svg></button>
     <button class="dbtn" data-d="normal" title="Große Kacheln (3×2)"><svg class="dg" viewBox="0 0 26 20"><circle cx="6.5" cy="6.7" r="2.2"/><circle cx="13.0" cy="6.7" r="2.2"/><circle cx="19.5" cy="6.7" r="2.2"/><circle cx="6.5" cy="13.3" r="2.2"/><circle cx="13.0" cy="13.3" r="2.2"/><circle cx="19.5" cy="13.3" r="2.2"/></svg></button>
   </span>
-  <label class="ctl" title="Wie sich das Dashboard aktualisiert: Live schiebt Daten per Server-Sent-Events (Push), oder festes Poll-Intervall, oder ganz aus.">Aktualisierung
-    <select id="mode" title="Aktualisierungsmodus des Dashboards">
-      <option value="live" selected title="Live-Push vom Server (SSE) – niedrigste Verzögerung">Live (SSE)</option>
-      <option value="5" title="Alle 5 Sekunden neu abfragen">alle 5 s</option>
-      <option value="15" title="Alle 15 Sekunden neu abfragen">alle 15 s</option>
-      <option value="60" title="Alle 60 Sekunden neu abfragen">alle 60 s</option>
-      <option value="off" title="Keine automatische Aktualisierung – nur per „Neu laden“">Aus</option>
-    </select>
-  </label>
   <button id="reload" title="Daten und Instanz-Konfiguration sofort neu laden">Neu laden</button>
   <button id="resetzoom" title="Zoom/Verschieben in allen Diagrammen zurücksetzen (Mausrad = Zoom, Ziehen = Verschieben)">Zoom ⟲</button>
   <button id="anombtn" title="Ausreißer (robuste MAD-Anomalie-Erkennung) in allen Diagrammen als rote Punkte markieren">⚠ Anomalien</button>
@@ -689,8 +681,17 @@ PAGE = r"""<!DOCTYPE html>
   <button id="secbtn" title="Verbindungssicherheit & Zertifikat">🔒</button>
   <button id="restore" title="Ausgeblendete Kacheln wieder einblenden" style="display:none">Ausgeblendet: 0 ⟲</button>
   <div class="menuwrap">
-    <button id="gear" title="Weitere Optionen (Latenz-Perzentil, Export)">⚙</button>
+    <button id="gear" title="Weitere Optionen (Aktualisierung, Latenz-Perzentil, Export)">⚙</button>
     <div id="gearmenu" class="menu">
+      <label class="mrow" title="Wie sich das Dashboard aktualisiert: Live schiebt Daten per Server-Sent-Events (Push), oder festes Poll-Intervall, oder ganz aus.">Aktualisierung
+        <select id="mode" title="Aktualisierungsmodus des Dashboards">
+          <option value="live" selected title="Live-Push vom Server (SSE) – niedrigste Verzögerung">Live (SSE)</option>
+          <option value="5" title="Alle 5 Sekunden neu abfragen">alle 5 s</option>
+          <option value="15" title="Alle 15 Sekunden neu abfragen">alle 15 s</option>
+          <option value="60" title="Alle 60 Sekunden neu abfragen">alle 60 s</option>
+          <option value="off" title="Keine automatische Aktualisierung – nur per „Neu laden“">Aus</option>
+        </select>
+      </label>
       <label class="mrow" title="Latenz-Perzentil für die Panels TTFT/E2E/ITL und die KPI-Karten. P95 = 95 % der Requests sind schneller; P99 zeigt Ausreißer, P50 den Median.">Latenz-Perzentil
         <select id="pct">
           <option value="p50">P50</option>
@@ -706,7 +707,11 @@ PAGE = r"""<!DOCTYPE html>
   <span id="status" style="flex-basis:100%;text-align:right"></span>
 </header>
 
-<div class="kpis" id="kpis"></div>
+<div class="card" id="kpicard" style="margin:14px 16px 0">
+  <div class="cardbtns"><button class="cbtn" id="kpitoggle" title="Ein-/Ausklappen">▾</button></div>
+  <h2>Modelle &amp; GPU</h2>
+  <div class="kpis" id="kpis"></div>
+</div>
 
 <div class="card" id="instcard" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="insttoggle" title="Ein-/Ausklappen">▾</button></div>
@@ -1510,6 +1515,14 @@ document.getElementById("export").onclick=exportCSV;
 document.getElementById("exportjson").onclick=()=>lastData&&download("vllm_metrics.json",JSON.stringify(lastData,null,2),"application/json");
 document.getElementById("theme").onclick=()=>applyTheme(document.body.dataset.theme==="dark"?"light":"dark");
 document.getElementById("restore").onclick=()=>{ saveHidden([]); applyHidden(); };
+// KPI-Karten (Modelle & GPU) einklappbar (Default aufgeklappt)
+(function(){
+  const kc=document.getElementById("kpicard"), kt=document.getElementById("kpitoggle");
+  const sync=()=>{ kt.textContent = kc.classList.contains("collapsed") ? "▸" : "▾"; };
+  if(store.get("vllm_kpi_collapsed")==="1") kc.classList.add("collapsed");
+  sync();
+  kt.onclick=()=>{ store.set("vllm_kpi_collapsed", kc.classList.toggle("collapsed")?"1":"0"); sync(); };
+})();
 // Instanzen-Karte einklappbar (Zustand im Cookie)
 (function(){
   const ic=document.getElementById("instcard"), it=document.getElementById("insttoggle");

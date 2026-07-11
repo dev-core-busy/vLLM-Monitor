@@ -4,6 +4,18 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.13.1] – 2026-07-11
+
+### Geändert
+- **KPI-Karten (Modelle & GPU)** liegen jetzt in einem einklappbaren Container
+  („Modelle & GPU") – konsistent mit Instanzen, Alarm-Historie und Effizienz.
+- **Aktualisierungs-Auswahl** (Live/SSE bzw. Poll-Intervall) aus der Titelleiste
+  ins ⚙-Menü verschoben (aufgeräumtere Kopfzeile).
+
+### Doku
+- README: **Einzeiler-Installation** ergänzt
+  (`git clone … && cd vLLM-Monitor && ./setup.sh`).
+
 ## [0.13.0] – 2026-07-11
 
 ### Neu

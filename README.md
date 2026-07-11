@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.13.0-blue)
+![Version](https://img.shields.io/badge/version-0.13.1-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -110,13 +110,23 @@ durch Verwerfen negativer Deltas abgefangen.
 
 ## Installation
 
+**Einzeiler** (klonen + interaktives Setup starten):
+
 ```bash
-git clone git@github.com:dev-core-busy/vLLM-Monitor.git
+git clone https://github.com/dev-core-busy/vLLM-Monitor.git && cd vLLM-Monitor && ./setup.sh
+```
+
+`setup.sh` öffnet ein Menü – Punkt **1) Installieren** fragt Ziel-IP, Instanzen
+usw. ab und richtet die systemd-Dienste ein. Nur `git` und Python 3.8+ nötig,
+keine weiteren Abhängigkeiten.
+
+Oder manuell:
+
+```bash
+git clone https://github.com/dev-core-busy/vLLM-Monitor.git
 cd vLLM-Monitor
 python3 --version   # 3.8 oder neuer
 ```
-
-Mehr ist nicht nötig – es gibt keine Abhängigkeiten zu installieren.
 
 ## Schnellstart
 
