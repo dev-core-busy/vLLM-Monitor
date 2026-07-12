@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.13.2-blue)
+![Version](https://img.shields.io/badge/version-0.14.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -70,6 +70,14 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
   tok/s pro Watt) und Sättigungs-Prognose.
 - 🗓️ **Geplanter KI-Schicht-Report** (`report`-CLI + systemd-Timer) schreibt
   einen deutschen Betriebs-Report in eine Datei.
+- 🏷️ **Zeitachsen-Annotationen** (Deploy/Restart) als senkrechte Linien in allen
+  Diagrammen – per Toolbar-Button oder CLI (`vllm_dashboard.sh annotate "…"`),
+  ideal aus Deploy-Skripten.
+- 🌐 **Mehrere Hosts/Cluster** über `host:port:label`-Targets; Host-Filter im
+  Dashboard blendet Instanzen/KPIs/Diagramme je Host ein.
+- 🫀 **Self-Monitoring** – der Collector schreibt einen Heartbeat (Status im
+  Header sichtbar) und unterstützt den **systemd-Watchdog** (Auto-Neustart bei
+  Hänger).
 - 📐 **Latenz-Perzentile P50/P95/P99** (TTFT/E2E/ITL) aus den Histogramm-Buckets.
 - ⚡ **Live-Push (SSE)**, Zoom/Pan, synchrones Fadenkreuz, Counter-Reset-Marker,
   CSV-/JSON-Export, Hell/Dunkel, frei wählbare Kachelfarben & -dichte,
@@ -151,7 +159,7 @@ Der Collector wird vollständig über **Umgebungsvariablen** gesteuert:
 | Variable | Default | Bedeutung |
 |----------|---------|-----------|
 | `VLLM_HOST` | `127.0.0.1` | Host/IP der vLLM-Instanz(en) |
-| `VLLM_TARGETS` | `8000:default` | Kommagetrennte Liste `port:label[,port:label…]`. Das Label ist nur Fallback – der echte Modellname kommt aus den Metriken. |
+| `VLLM_TARGETS` | `8000:default` | Kommagetrennte Liste `[host:]port[:label][,…]`. Ohne Host gilt `VLLM_HOST` – mit Host-Präfix (`host:port:label`) lassen sich **mehrere Hosts/Cluster** mischen. Das Label ist nur Fallback – der echte Modellname kommt aus den Metriken. |
 | `VLLM_INTERVAL` | `15` | Sekunden zwischen zwei Scrapes |
 | `VLLM_RETENTION_DAYS` | `30` | Aufbewahrungsdauer; ältere Daten werden gelöscht |
 | `VLLM_HTTP_TIMEOUT` | `15` | Timeout pro `/metrics`-Abruf (Sekunden) |

@@ -39,12 +39,22 @@ one or more vLLM instances (host via `VLLM_HOST`, ports/labels via
   aggregate prompt over all charts. `GET /api/alerts` serves the alert history,
   `GET /api/series?offset=…` returns a shifted window for period comparison, and
   `vllm_dashboard.sh report [seconds]` writes a scheduled shift report to
-  `VLLM_REPORT_DIR` (systemd timer via `setup.sh`).
+  `VLLM_REPORT_DIR` (systemd timer via `setup.sh`). **Timeline annotations**
+  (deploy/restart markers) live in an `annotations` table: `GET/POST/DELETE
+  /api/annotations` + `vllm_dashboard.sh annotate "label" [ts]`; they render as
+  vertical lines in every chart.
 
 The collector evaluates **configurable alert thresholds** (`VLLM_ALERT_KV/TEMP/
 ERR/OFFLINE_MIN`, also read by the dashboard and exposed in `/api/config`) and
 records state transitions (raised/cleared) into an `events` table — one row per
 change, not per scrape.
+
+`VLLM_TARGETS` entries may carry an optional host (`[host:]port[:label]`) so a
+single collector can watch **multiple hosts/clusters**; the dashboard shows a
+host filter when more than one host is present. **Self-monitoring:** the
+collector writes a heartbeat into `collector_status` (surfaced in `/api/config`
+and the header) and supports the **systemd watchdog** via `sd_notify`
+(`READY=1`/`WATCHDOG=1`; `WatchdogSec=120` in the unit).
 
 Both files are named `*.sh` but are **Python 3** (shebang `#!/usr/bin/env
 python3`) and use **only the standard library** — no `pip install` needed.

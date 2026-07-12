@@ -29,11 +29,12 @@ import re
 import sys
 import time
 import json
+import socket
 import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.13.2"
+__version__ = "0.14.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -43,17 +44,28 @@ HOST = os.environ.get("VLLM_HOST", "127.0.0.1")
 
 
 def _parse_targets(spec):
-    """"9081:Qwen,9082:Gemma" -> [{"port":9081,"label":"Qwen"}, ...]"""
+    """"[host:]port[:label]" -> [{"host":.., "port":9081, "label":"Qwen"}, ...]
+
+    Rückwärtskompatibel: "9081:Qwen" bleibt port:label (erstes Feld numerisch);
+    "host:9081[:label]" (erstes Feld nicht-numerisch) ist host:port[:label].
+    Ohne Host wird VLLM_HOST verwendet – so lassen sich mehrere Hosts mischen."""
     targets = []
     for part in spec.split(","):
         part = part.strip()
         if not part:
             continue
-        if ":" in part:
-            port, label = part.split(":", 1)
+        bits = part.split(":")
+        host = HOST
+        if len(bits) == 1:
+            port, label = bits[0], bits[0]
+        elif len(bits) == 2:
+            if bits[0].strip().isdigit():
+                port, label = bits[0], bits[1]
+            else:
+                host, port, label = bits[0], bits[1], bits[1]
         else:
-            port, label = part, part
-        targets.append({"port": int(port), "label": label.strip()})
+            host, port, label = bits[0], bits[1], ":".join(bits[2:])
+        targets.append({"host": host.strip(), "port": int(port), "label": label.strip()})
     return targets
 
 
@@ -262,6 +274,14 @@ def init_db(conn):
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
+    # Self-Monitoring: Herzschlag des Collectors (eine Zeile, id=1)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS collector_status (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            ts INTEGER, scrapes INTEGER, errors INTEGER, stored INTEGER,
+            interval INTEGER, version TEXT, host TEXT
+        )
+    """)
     conn.commit()
 
 
@@ -360,8 +380,8 @@ def parse_prometheus(text):
     return out
 
 
-def fetch_text(port, path):
-    url = "http://%s:%d%s" % (HOST, port, path)
+def fetch_text(host, port, path):
+    url = "http://%s:%d%s" % (host, port, path)
     req = request.Request(url, headers={"User-Agent": "vllm_collector/%s" % __version__})
     try:
         resp = request.urlopen(req, timeout=HTTP_TIMEOUT)
@@ -666,24 +686,25 @@ def scrape_once(conn, verbose=True):
     ts = int(time.time())
     total = 0
     for tgt in TARGETS:
+        host = tgt.get("host", HOST)
         port = tgt["port"]
-        text = fetch_text(port, "/metrics")
+        text = fetch_text(host, port, "/metrics")
         if text is None:
-            mark_down(conn, HOST, port)
-            _down_since.setdefault((HOST, port), ts)
-            if ts - _down_since[(HOST, port)] >= ALERT_OFFLINE_MIN * 60:
-                record_alert(conn, ts, HOST, port, None, "offline", True,
+            mark_down(conn, host, port)
+            _down_since.setdefault((host, port), ts)
+            if ts - _down_since[(host, port)] >= ALERT_OFFLINE_MIN * 60:
+                record_alert(conn, ts, host, port, None, "offline", True,
                              msg="Instanz offline", severity="crit")
             continue
         # erreichbar -> evtl. bestehenden Offline-Alarm auflösen
-        _down_since.pop((HOST, port), None)
-        record_alert(conn, ts, HOST, port, None, "offline", False, severity="crit")
+        _down_since.pop((host, port), None)
+        record_alert(conn, ts, host, port, None, "offline", False, severity="crit")
         samples = parse_prometheus(text)
         per_model = extract(samples)
         cfg = extract_config(samples)
 
         # max_model_len + version je Modell aus der API
-        models_doc = fetch_text(port, "/v1/models")
+        models_doc = fetch_text(host, port, "/v1/models")
         maxlen = {}
         if models_doc:
             try:
@@ -691,7 +712,7 @@ def scrape_once(conn, verbose=True):
                     maxlen[m.get("id")] = _num(m.get("max_model_len"))
             except ValueError:
                 pass
-        ver_doc = fetch_text(port, "/version")
+        ver_doc = fetch_text(host, port, "/version")
         version = None
         if ver_doc:
             try:
@@ -701,28 +722,28 @@ def scrape_once(conn, verbose=True):
 
         if not per_model:
             if verbose:
-                print("  [!] Port %d: keine model_name-Metriken." % port)
+                print("  [!] %s:%d: keine model_name-Metriken." % (host, port))
             continue
         for model, values in per_model.items():
-            store_sample(conn, ts, HOST, port, model, values)
+            store_sample(conn, ts, host, port, model, values)
             mc = dict(cfg)
             mc["up"] = 1
             mc["max_model_len"] = maxlen.get(model)
             mc["version"] = version
             mc["kind"] = "vllm"
-            store_config(conn, HOST, port, model, mc)
+            store_config(conn, host, port, model, mc)
             # Schwellwert-Alarme (KV-Cache, neue Fehler)
             kv = values.get("kv_cache_usage")
             if kv is not None:
-                record_alert(conn, ts, HOST, port, model, "kv", (kv * 100.0) > ALERT_KV,
+                record_alert(conn, ts, host, port, model, "kv", (kv * 100.0) > ALERT_KV,
                              value=kv * 100.0, msg="KV-Cache %.0f%%" % (kv * 100.0))
             et = values.get("requests_error_total")
             if et is not None:
-                prev = _prev_err.get((HOST, port, model))
-                _prev_err[(HOST, port, model)] = et
+                prev = _prev_err.get((host, port, model))
+                _prev_err[(host, port, model)] = et
                 if prev is not None:
                     new = et - prev
-                    record_alert(conn, ts, HOST, port, model, "error", new > ALERT_ERR,
+                    record_alert(conn, ts, host, port, model, "error", new > ALERT_ERR,
                                  value=new, msg="%d neue Fehler" % int(new))
             total += 1
             if verbose:
@@ -762,20 +783,54 @@ def _fmt(v):
     return str(int(v)) if v == int(v) else "%.3f" % v
 
 
+def write_heartbeat(conn, ts, scrapes, errors, stored):
+    """Herzschlag in die DB schreiben, damit das Dashboard den Collector-Status sieht."""
+    conn.execute(
+        "INSERT OR REPLACE INTO collector_status "
+        "(id,ts,scrapes,errors,stored,interval,version,host) VALUES (1,?,?,?,?,?,?,?)",
+        (ts, scrapes, errors, stored, INTERVAL, __version__, HOST))
+
+
+def _sd_notify(state):
+    """systemd sd_notify (READY/WATCHDOG) – no-op außerhalb von systemd. Nur stdlib."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    try:
+        if addr[0] == "@":            # abstrakter Namensraum
+            addr = "\0" + addr[1:]
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        s.connect(addr)
+        s.sendall(state.encode())
+        s.close()
+    except OSError:
+        pass
+
+
 def run_loop():
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
+    _sd_notify("READY=1")
     print("vllm_collector %s – Ziel %s, Ports %s, Intervall %ds"
           % (__version__, HOST, [t["port"] for t in TARGETS], INTERVAL))
     n = 0
+    errors = 0
     while _running:
         start = time.time()
         print("[%s] Scrape #%d" % (time.strftime("%Y-%m-%d %H:%M:%S"), n))
+        stored = 0
         try:
-            scrape_once(conn)
+            stored = scrape_once(conn)
         except Exception as e:
+            errors += 1
             print("  [!] Scrape-Fehler: %s" % e)
         n += 1
+        try:
+            write_heartbeat(conn, int(time.time()), n, errors, stored)
+            conn.commit()
+        except Exception as e:
+            print("  [!] Heartbeat-Fehler: %s" % e)
+        _sd_notify("WATCHDOG=1")       # systemd-Watchdog bei Leben halten
         if n % PURGE_EVERY == 0:
             purge_old(conn)
             print("  [i] Retention-Aufräumung (> %d Tage)." % RETENTION_DAYS)

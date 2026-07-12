@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.13.2"
+__version__ = "0.14.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -265,6 +265,19 @@ def build_config():
             "version": c["version"],
             "vram_bytes": (vram[0] if vram else None),
         })
+    # Self-Monitoring: Herzschlag des Collectors
+    collector = None
+    try:
+        r = conn.execute("SELECT ts,scrapes,errors,interval,version,host "
+                         "FROM collector_status WHERE id=1").fetchone()
+        if r and r["ts"]:
+            iv = r["interval"] or 15
+            age = now - r["ts"]
+            collector = {"ts": r["ts"] * 1000, "age": age, "scrapes": r["scrapes"],
+                         "errors": r["errors"], "interval": iv, "version": r["version"],
+                         "host": r["host"], "ok": age <= max(3 * iv, 60)}
+    except sqlite3.OperationalError:
+        collector = None            # alter Collector ohne Heartbeat-Tabelle
     conn.close()
     # Zentrale KI-Config (Server-Default für alle Frontends). Der Key selbst wird
     # NIE ausgeliefert – nur, ob server-seitig einer gesetzt ist.
@@ -272,7 +285,8 @@ def build_config():
           "configured": bool(AI_URL)}
     thresholds = {"kv": ALERT_KV, "temp": ALERT_TEMP, "err": ALERT_ERR,
                   "offline_min": ALERT_OFFLINE_MIN}
-    return {"now": now * 1000, "instances": inst, "ai": ai, "thresholds": thresholds}
+    return {"now": now * 1000, "instances": inst, "ai": ai,
+            "thresholds": thresholds, "collector": collector}
 
 
 def build_alerts(limit=100):
@@ -293,6 +307,52 @@ def build_alerts(limit=100):
            "severity": r["severity"], "value": r["value"], "message": r["message"]}
           for r in rows]
     return {"events": ev, "now": int(time.time()) * 1000}
+
+
+def _ensure_annotations(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS annotations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL, label TEXT, created INTEGER)""")
+
+
+def build_annotations(range_s=None):
+    """Manuelle Zeitachsen-Annotationen (Deploy/Restart o. ä.)."""
+    if not os.path.exists(DB_PATH):
+        return {"annotations": []}
+    conn = _connect()
+    _ensure_annotations(conn)
+    if range_s:
+        since = int(time.time()) - range_s
+        rows = conn.execute("SELECT id,ts,label FROM annotations WHERE ts>=? ORDER BY ts",
+                            (since,)).fetchall()
+    else:
+        rows = conn.execute("SELECT id,ts,label FROM annotations ORDER BY ts DESC LIMIT 500").fetchall()
+    conn.close()
+    return {"annotations": [{"id": r["id"], "ts": r["ts"] * 1000, "label": r["label"]} for r in rows]}
+
+
+def add_annotation(ts, label):
+    label = (label or "").strip()[:120]
+    if not label:
+        return {"error": "leeres Label"}
+    ts = int(ts) if ts else int(time.time())
+    conn = _connect()
+    _ensure_annotations(conn)
+    cur = conn.execute("INSERT INTO annotations (ts,label,created) VALUES (?,?,?)",
+                       (ts, label, int(time.time())))
+    conn.commit()
+    nid = cur.lastrowid
+    conn.close()
+    return {"ok": True, "id": nid, "ts": ts * 1000, "label": label}
+
+
+def del_annotation(aid):
+    conn = _connect()
+    _ensure_annotations(conn)
+    conn.execute("DELETE FROM annotations WHERE id=?", (int(aid),))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +475,11 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 lim = 100
             self._json(build_alerts(min(max(lim, 1), 500)))
+        elif parsed.path == "/api/annotations":
+            rng = None
+            if "range" in qs:
+                rng = _range_from(qs)
+            self._json(build_annotations(rng))
         elif parsed.path == "/api/stream":
             self._stream(_range_from(qs))
         elif parsed.path == "/api/cert":
@@ -428,17 +493,45 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"not found")
 
+    def _read_body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n) if n > 0 else b"{}"
+            return json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, OSError):
+            return None
+
     def do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/analyze":
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(n) if n > 0 else b"{}"
-                body = json.loads(raw.decode("utf-8") or "{}")
-            except (ValueError, OSError):
+            body = self._read_body()
+            if body is None:
                 self._json({"error": "ungültige Anfrage"})
                 return
             self._json(ai_analyze(body))
+        elif parsed.path == "/api/annotations":
+            body = self._read_body()
+            if body is None:
+                self._json({"error": "ungültige Anfrage"})
+                return
+            ts = body.get("ts")
+            if ts:                       # Frontend liefert ms -> Sekunden
+                try:
+                    ts = int(ts) // 1000
+                except (ValueError, TypeError):
+                    ts = None
+            self._json(add_annotation(ts, body.get("label", "")))
+        else:
+            self._send(404, "text/plain", b"not found")
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        if parsed.path == "/api/annotations" and "id" in qs:
+            try:
+                self._json(del_annotation(int(qs["id"][0])))
+            except ValueError:
+                self._json({"error": "ungültige id"})
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -602,17 +695,13 @@ PAGE = r"""<!DOCTYPE html>
   .evbadge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;border:1px solid var(--border);}
   .activebtn{border-color:var(--accent)!important;color:var(--accent)!important;}
   canvas{max-height:var(--card-h);}
-  .card h2.handle,.kpi h3.handle{cursor:grab;user-select:none;touch-action:none;
-    margin:-10px -12px 6px;padding:6px 12px;border-radius:10px 10px 0 0;background:rgba(127,127,127,.06);}
-  .kpi h3.handle{margin:-12px -14px 8px;padding:8px 14px;}
-  .card h2.handle:hover,.kpi h3.handle:hover{background:rgba(88,166,255,.12);}
-  .card h2.handle:active,.kpi h3.handle:active{cursor:grabbing;}
-  .card h2.handle::before,.kpi h3.handle::before{content:"⠿ ";color:var(--muted);opacity:.7;}
-  /* Griff zum Umordnen der ganzen Bereiche (Container) */
-  .card h2.shandle{cursor:grab;user-select:none;touch-action:none;}
-  .card h2.shandle:active{cursor:grabbing;}
-  .card h2.shandle::before{content:"⠿ ";color:var(--muted);opacity:.6;}
-  .card h2.shandle .densgroup::before{content:none;}
+  /* Dedizierter Zieh-Griff (links) – nur hierüber wird verschoben/umgeordnet */
+  .grip,.sgrip{cursor:grab;user-select:none;touch-action:none;flex:0 0 auto;
+    color:var(--muted);font-size:13px;line-height:1;padding:2px 5px;border-radius:4px;
+    margin-right:6px;display:inline-flex;align-items:center;}
+  .grip:hover,.sgrip:hover{color:var(--fg);background:rgba(88,166,255,.15);}
+  .grip:active,.sgrip:active{cursor:grabbing;}
+  .kpi h3,.card h2.chart-h2{align-items:center;}
   .cpick{margin-left:auto;width:20px;height:20px;padding:0;border:1px solid var(--border);
     border-radius:5px;background:none;cursor:pointer;flex:0 0 auto;}
   .cpick::-webkit-color-swatch-wrapper{padding:0;}
@@ -658,6 +747,7 @@ PAGE = r"""<!DOCTYPE html>
 <header>
   <h1>vLLM Monitor <span style="color:var(--muted)">__SUBTITLE__</span></h1>
   <span style="font-size:11px;color:var(--muted)">v__VERSION__</span>
+  <span id="collstat" title="Status des Metrik-Collectors (Self-Monitoring)" style="font-size:11px"></span>
   <label class="ctl" title="Zeitfenster, das in allen Diagrammen dargestellt wird. Bei großen Fenstern werden die Daten automatisch verdichtet (Downsampling).">Zeitraum
     <select id="range" title="Zeitfenster der Diagramme (15 min bis 7 Tage)">
       <option value="900">15 min</option>
@@ -675,6 +765,9 @@ PAGE = r"""<!DOCTYPE html>
       <option value="604800">letzte Woche</option>
     </select>
   </label>
+  <label class="ctl" id="hostfilterwrap" title="Auf einen Host filtern (Instanzen, KPI-Karten, Diagramme). Erscheint nur bei mehreren Hosts." style="display:none">Host
+    <select id="hostfilter"><option value="">Alle Hosts</option></select>
+  </label>
   <span class="densgroup" title="Kacheldichte – mehr Punkte = mehr, kleinere Kacheln">
     <button class="dbtn" data-d="sehrdicht" title="Sehr klein, sehr viele Kacheln (6×5)"><svg class="dg" viewBox="0 0 26 20"><circle cx="3.5" cy="2.8" r="1.05"/><circle cx="7.3" cy="2.8" r="1.05"/><circle cx="11.1" cy="2.8" r="1.05"/><circle cx="14.9" cy="2.8" r="1.05"/><circle cx="18.7" cy="2.8" r="1.05"/><circle cx="22.5" cy="2.8" r="1.05"/><circle cx="3.5" cy="6.4" r="1.05"/><circle cx="7.3" cy="6.4" r="1.05"/><circle cx="11.1" cy="6.4" r="1.05"/><circle cx="14.9" cy="6.4" r="1.05"/><circle cx="18.7" cy="6.4" r="1.05"/><circle cx="22.5" cy="6.4" r="1.05"/><circle cx="3.5" cy="10.0" r="1.05"/><circle cx="7.3" cy="10.0" r="1.05"/><circle cx="11.1" cy="10.0" r="1.05"/><circle cx="14.9" cy="10.0" r="1.05"/><circle cx="18.7" cy="10.0" r="1.05"/><circle cx="22.5" cy="10.0" r="1.05"/><circle cx="3.5" cy="13.6" r="1.05"/><circle cx="7.3" cy="13.6" r="1.05"/><circle cx="11.1" cy="13.6" r="1.05"/><circle cx="14.9" cy="13.6" r="1.05"/><circle cx="18.7" cy="13.6" r="1.05"/><circle cx="22.5" cy="13.6" r="1.05"/><circle cx="3.5" cy="17.2" r="1.05"/><circle cx="7.3" cy="17.2" r="1.05"/><circle cx="11.1" cy="17.2" r="1.05"/><circle cx="14.9" cy="17.2" r="1.05"/><circle cx="18.7" cy="17.2" r="1.05"/><circle cx="22.5" cy="17.2" r="1.05"/></svg></button>
     <button class="dbtn" data-d="dicht" title="Klein, viele Kacheln (5×4)"><svg class="dg" viewBox="0 0 26 20"><circle cx="4.3" cy="4.0" r="1.3"/><circle cx="8.7" cy="4.0" r="1.3"/><circle cx="13.0" cy="4.0" r="1.3"/><circle cx="17.3" cy="4.0" r="1.3"/><circle cx="21.7" cy="4.0" r="1.3"/><circle cx="4.3" cy="8.0" r="1.3"/><circle cx="8.7" cy="8.0" r="1.3"/><circle cx="13.0" cy="8.0" r="1.3"/><circle cx="17.3" cy="8.0" r="1.3"/><circle cx="21.7" cy="8.0" r="1.3"/><circle cx="4.3" cy="12.0" r="1.3"/><circle cx="8.7" cy="12.0" r="1.3"/><circle cx="13.0" cy="12.0" r="1.3"/><circle cx="17.3" cy="12.0" r="1.3"/><circle cx="21.7" cy="12.0" r="1.3"/><circle cx="4.3" cy="16.0" r="1.3"/><circle cx="8.7" cy="16.0" r="1.3"/><circle cx="13.0" cy="16.0" r="1.3"/><circle cx="17.3" cy="16.0" r="1.3"/><circle cx="21.7" cy="16.0" r="1.3"/></svg></button>
@@ -685,6 +778,7 @@ PAGE = r"""<!DOCTYPE html>
   <button id="resetzoom" title="Zoom/Verschieben in allen Diagrammen zurücksetzen (Mausrad = Zoom, Ziehen = Verschieben)">Zoom ⟲</button>
   <button id="anombtn" title="Ausreißer (robuste MAD-Anomalie-Erkennung) in allen Diagrammen als rote Punkte markieren">⚠ Anomalien</button>
   <button id="reportbtn" title="KI-Gesamt-Report über alle Diagramme (Kennzahlen, Ausreißer, Prognosen)">📋 KI-Report</button>
+  <button id="annbtn" title="Annotation (Deploy/Restart …) für den aktuellen Zeitpunkt setzen – erscheint als senkrechte Linie in allen Diagrammen; Klick auf eine Linie löscht sie">🏷 Notiz</button>
   <button id="theme" title="Zwischen hellem und dunklem Design umschalten (wird gespeichert)">◐</button>
   <button id="notif" title="Browser-Benachrichtigungen bei Warnungen (KV-Cache voll, Fehler, Instanz offline) erlauben">🔔</button>
   <button id="secbtn" title="Verbindungssicherheit & Zertifikat">🔒</button>
@@ -719,13 +813,13 @@ PAGE = r"""<!DOCTYPE html>
 <div id="sections">
 <div class="card" id="kpicard" data-id="kpi" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="kpitoggle" title="Ein-/Ausklappen">▾</button></div>
-  <h2 class="shandle" title="Ziehen zum Umordnen der Bereiche">Modelle &amp; GPU</h2>
+  <h2><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Modelle &amp; GPU</h2>
   <div class="kpis" id="kpis"></div>
 </div>
 
 <div class="card" id="instcard" data-id="inst" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="insttoggle" title="Ein-/Ausklappen">▾</button></div>
-  <h2 class="shandle" title="Ziehen zum Umordnen der Bereiche">Instanzen</h2>
+  <h2><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Instanzen</h2>
   <table id="insttable"><thead><tr>
     <th>Status</th><th>Typ</th><th>Instanz</th><th>Modell</th><th>Version</th>
     <th>KV-Kap. / VRAM</th><th>max_model_len</th><th>gpu_mem</th><th>Prefix-Cache</th>
@@ -734,7 +828,7 @@ PAGE = r"""<!DOCTYPE html>
 
 <div class="card collapsed" id="alertcard" data-id="alerts" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="alerttoggle" title="Ein-/Ausklappen">▸</button></div>
-  <h2 class="shandle" title="Ziehen zum Umordnen der Bereiche">Alarm-Historie <span id="alertcount" style="color:var(--muted);font-weight:400"></span></h2>
+  <h2><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Alarm-Historie <span id="alertcount" style="color:var(--muted);font-weight:400"></span></h2>
   <table id="alerttable"><thead><tr>
     <th>Zeit</th><th>Status</th><th>Typ</th><th>Instanz / Modell</th><th>Meldung</th>
   </tr></thead><tbody></tbody></table>
@@ -742,13 +836,13 @@ PAGE = r"""<!DOCTYPE html>
 
 <div class="card collapsed" id="effcard" data-id="eff" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="efftoggle" title="Ein-/Ausklappen">▸</button></div>
-  <h2 class="shandle" title="Ziehen zum Umordnen der Bereiche">Effizienz & Kapazität <span style="color:var(--muted);font-weight:400;font-size:11px">(Ø über Zeitfenster, hochgerechnet)</span></h2>
+  <h2><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Effizienz & Kapazität <span style="color:var(--muted);font-weight:400;font-size:11px">(Ø über Zeitfenster, hochgerechnet)</span></h2>
   <div id="effbody" style="display:flex;flex-wrap:wrap;gap:18px;padding-top:4px"></div>
 </div>
 
 <div class="card" id="chartcard" data-id="chart" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="charttoggle" title="Ein-/Ausklappen">▾</button></div>
-  <h2 class="chart-h2 shandle" title="Ziehen zum Umordnen der Bereiche">Diagramme <span id="densslot"></span></h2>
+  <h2 class="chart-h2"><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Diagramme <span id="densslot"></span></h2>
   <div id="legend" title="Farb-Zuordnung der Modelle – Klick blendet ein Modell in allen Diagrammen aus/ein"></div>
   <div class="grid" id="charts"></div>
 </div>
@@ -864,7 +958,7 @@ const CHARTS=[
   desc:"Anteil der Prompt-Tokens, die aus dem Prefix-Cache wiederverwendet\nwurden statt neu berechnet zu werden.\nHoch = effizient bei wiederkehrenden Prompt-Anfängen (System-Prompts, RAG)."},
 ];
 
-let charts={}, lastData=null, lastConfig=null, hoverX=null, resets=[];
+let charts={}, lastData=null, lastConfig=null, hoverX=null, resets=[], annotations=[];
 const shortModel=m=>m.split("/").pop();
 const css=v=>getComputedStyle(document.body).getPropertyValue(v).trim();
 
@@ -1008,6 +1102,13 @@ const overlay={id:"overlay",afterDraw(c){
   resets.forEach(t=>{const px=x.getPixelForValue(t);if(px>=a.left&&px<=a.right){
     ctx.strokeStyle="rgba(248,81,73,.5)";ctx.setLineDash([3,3]);ctx.lineWidth=1;
     ctx.beginPath();ctx.moveTo(px,a.top);ctx.lineTo(px,a.bottom);ctx.stroke();}});
+  // Manuelle Annotationen (Deploy/Restart …): senkrechte Linie + vertikales Label
+  const acc=css("--accent");
+  annotations.forEach(an=>{const px=x.getPixelForValue(an.ts);if(px>=a.left&&px<=a.right){
+    ctx.strokeStyle=acc;ctx.setLineDash([5,3]);ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(px,a.top);ctx.lineTo(px,a.bottom);ctx.stroke();
+    ctx.setLineDash([]);ctx.fillStyle=acc;ctx.font="10px sans-serif";ctx.textAlign="left";
+    ctx.save();ctx.translate(px+3,a.top+3);ctx.rotate(Math.PI/2);ctx.fillText(an.label,0,0);ctx.restore();}});
   if(hoverX!=null){const px=x.getPixelForValue(hoverX);if(px>=a.left&&px<=a.right){
     ctx.setLineDash([]);ctx.strokeStyle=css("--muted");ctx.lineWidth=1;
     ctx.beginPath();ctx.moveTo(px,a.top);ctx.lineTo(px,a.bottom);ctx.stroke();}}
@@ -1022,6 +1123,9 @@ function mkChart(spec){
       interaction:{mode:"index",intersect:false},
       onHover:(e,els,c)=>{const p=c.scales.x.getValueForPixel(e.x);if(p===hoverX)return;hoverX=p;
         requestAnimationFrame(()=>Object.values(charts).forEach(o=>o.draw()));},
+      onClick:(e,els,c)=>{const xs=c.scales.x;let hit=null,best=6;
+        annotations.forEach(an=>{const ap=xs.getPixelForValue(an.ts);const d=Math.abs(ap-e.x);if(d<=best){best=d;hit=an;}});
+        if(hit&&confirm('Annotation „'+hit.label+'" löschen?')) delAnnotation(hit.id);},
       scales:{
         x:{type:"linear",ticks:{callback:v=>new Date(v).toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit"}),maxRotation:0,color:css("--muted")},grid:{color:css("--grid")}},
         y:{beginAtZero:true,...yMax,ticks:{color:css("--muted")},grid:{color:css("--grid")}}
@@ -1048,7 +1152,7 @@ function datasets(models,spec){
   const names=Object.keys(models).sort();
   const ds=[];
   names.forEach((name,mi)=>{
-    if(hiddenModels.has(name))return;
+    if(hiddenModels.has(name)||!passHost(name))return;
     const color=colorFor(name);
     const cap=spec.id==="kvtok"?capacityOf(name):null;
     fieldsFor(spec).forEach(f=>{
@@ -1075,7 +1179,7 @@ function hexA(h,a){ const m=/^#?([0-9a-fA-F]{6})$/.exec(h); if(!m)return h;
 function compareDatasets(models,spec){
   const ds=[];
   Object.keys(models).sort().forEach(name=>{
-    if(hiddenModels.has(name))return;
+    if(hiddenModels.has(name)||!passHost(name))return;
     const color=hexA(colorFor(name),0.4);
     const cap=spec.id==="kvtok"?capacityOf(name):null;
     fieldsFor(spec).forEach(f=>{
@@ -1089,6 +1193,20 @@ function compareDatasets(models,spec){
     });
   });
   return ds;
+}
+// --- Host-Filter (mehrere Hosts/Cluster) ---
+let hostFilter=store.get("vllm_host")||"";
+function hostList(){ return lastConfig?[...new Set((lastConfig.instances||[]).map(i=>i.host))].sort():[]; }
+function passHost(model){
+  if(!hostFilter||!lastConfig) return true;
+  return (lastConfig.instances||[]).some(x=>x.model===model && x.host===hostFilter);
+}
+function renderHostFilter(){
+  const wrap=document.getElementById("hostfilterwrap"), sel=document.getElementById("hostfilter");
+  if(!sel)return; const hosts=hostList();
+  wrap.style.display = hosts.length>1 ? "" : "none";
+  sel.innerHTML='<option value="">Alle Hosts</option>'+hosts.map(h=>'<option value="'+h+'">'+h+'</option>').join("");
+  if(hostFilter && hosts.includes(hostFilter)) sel.value=hostFilter; else { hostFilter=""; sel.value=""; }
 }
 let compareData=null;
 function compareOffset(){ const v=document.getElementById("compare").value;
@@ -1121,6 +1239,7 @@ function renderKPIs(){
   const saved=JSON.parse(store.get("vllm_kpi_order")||"null");
   const pct=document.getElementById("pct").value;
   orderBy(Object.keys(lastData.models).sort(),saved,m=>m).forEach(model=>{
+    if(!passHost(model))return;
     const s=lastData.models[model];const last=s.length?s[s.length-1]:{};
     const inst=lastConfig?lastConfig.instances.find(x=>x.model===model):null;
     const online=inst?inst.online:true;
@@ -1149,7 +1268,7 @@ function renderKPIs(){
     const el=document.createElement("div");
     el.className="kpi"+((kvBad||errBad||tempBad||!online)?" alert":"");
     el.dataset.id=model;
-    el.innerHTML=`<h3 class="handle"><span class="dot ${online?"on":"off"}"></span>${shortModel(model)}
+    el.innerHTML=`<h3><span class="grip" title="Ziehen zum Verschieben">⠿</span><span class="dot ${online?"on":"off"}"></span>${shortModel(model)}
         <input type="color" class="cpick" value="${colorFor(model)}" title="Diagramm-Farbe wählen">
         <span style="font-size:11px;color:var(--muted)">${online?"online":("offline"+(offMin!=null?" · seit "+durTxt(inst.age):""))}</span></h3>
       <div class="row">${row}</div>`;
@@ -1162,7 +1281,7 @@ function renderKPIs(){
     pick.addEventListener("input",e=>setColor(model,e.target.value,false));
     wrap.appendChild(el);
   });
-  makeSortable(wrap,()=>saveOrder(wrap,"vllm_kpi_order"));
+  makeSortable(wrap,()=>saveOrder(wrap,"vllm_kpi_order"),".grip");
   window._alerts=alerts;maybeNotify(alerts);
 }
 
@@ -1170,6 +1289,7 @@ function renderInstances(){
   const tb=document.querySelector("#insttable tbody");tb.innerHTML="";
   if(!lastConfig)return;
   lastConfig.instances.forEach(i=>{
+    if(hostFilter && i.host!==hostFilter)return;
     const tr=document.createElement("tr");
     let capcell="–";
     if(i.capacity_tokens){capcell=Math.round(i.capacity_tokens).toLocaleString("de-DE")+" Tok"
@@ -1200,7 +1320,16 @@ function applySeries(j){
   document.getElementById("status").textContent="Stand "+new Date(j.now).toLocaleTimeString("de-DE")+" · "+n+" Punkte";
 }
 
-async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderInstances();renderKPIs();}catch(e){}}
+function renderCollector(){
+  const el=document.getElementById("collstat"); if(!el)return;
+  const c=lastConfig&&lastConfig.collector;
+  if(!c){ el.textContent=""; return; }
+  const dot='<span class="dot '+(c.ok?"on":"off")+'" style="margin-right:4px"></span>';
+  el.innerHTML=dot+(c.ok?("Collector aktiv · "+durTxt(c.age)):("Collector inaktiv – letzter Scrape vor "+durTxt(c.age)))
+    +(c.errors?(" · "+c.errors+" Fehler"):"");
+  el.style.color = c.ok?"var(--muted)":"var(--bad)";
+}
+async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderHostFilter();renderInstances();renderKPIs();renderCollector();}catch(e){}}
 async function fetchOnce(){try{applySeries(await(await fetch("/api/series?range="+rangeVal())).json());}catch(e){document.getElementById("status").textContent="Fehler: "+e;}}
 
 // --- Refresh-Steuerung: Live (SSE) oder Intervall ---
@@ -1274,10 +1403,10 @@ function buildGrid(){
              `<button class="cbtn close" title="Kachel ausblenden">×</button></div>`;
   orderBy(CHARTS,saved,s=>s.id).forEach(spec=>{
     const d=document.createElement("div");d.className="card";d.dataset.id=spec.id;
-    d.innerHTML=btns+`<h2 class="handle" title="${spec.desc||""}">${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;
+    d.innerHTML=btns+`<h2 title="${spec.desc||""}"><span class="grip" title="Ziehen zum Verschieben">⠿</span>${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;
     g.appendChild(d);
   });
-  makeSortable(g,()=>saveOrder(g,"vllm_chart_order"));
+  makeSortable(g,()=>saveOrder(g,"vllm_chart_order"),".grip");
   wireCardButtons(g);
   applyHidden();
   CHARTS.forEach(mkChart);
@@ -1536,8 +1665,11 @@ applyDensity(store.get("vllm_density")||"normal");
   gmenu.querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>gmenu.classList.remove("open")));
   document.addEventListener("click",e=>{ if(!gmenu.contains(e.target)&&e.target!==gear) gmenu.classList.remove("open"); });
 })();
-document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeVal());fetchConfig();startRefresh();fetchCompare();};
+document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeVal());fetchConfig();startRefresh();fetchCompare();fetchAnnotations();};
+document.getElementById("annbtn").onclick=addAnnotation;
 document.getElementById("compare").onchange=()=>{store.set("vllm_compare",document.getElementById("compare").value);fetchCompare();};
+document.getElementById("hostfilter").onchange=()=>{hostFilter=document.getElementById("hostfilter").value;store.set("vllm_host",hostFilter);
+  renderInstances();renderKPIs();if(lastData)redrawCharts(lastData.models);};
 document.getElementById("pct").onchange=()=>{if(lastData)applySeries(lastData);};
 document.getElementById("mode").onchange=startRefresh;
 document.getElementById("reload").onclick=()=>{fetchConfig();fetchOnce();};
@@ -1576,10 +1708,11 @@ document.getElementById("restore").onclick=()=>{ saveHidden([]); applyHidden(); 
     const el=cont.querySelector(':scope > [data-id="'+id+'"]'); if(el)cont.appendChild(el);
   });
   makeSortable(cont,()=>{ saveOrder(cont,"vllm_section_order");
-    setTimeout(()=>Object.values(charts).forEach(c=>{try{c.resize();}catch(e){}}),80); },".shandle",true);
-  // Klick auf die Bereichs-Überschrift klappt auf/zu (Drag erst ab Bewegung)
-  cont.querySelectorAll(":scope > .card > h2.shandle").forEach(h=>{
-    h.addEventListener("click",()=>{ const btn=h.parentElement.querySelector(".cardbtns .cbtn"); if(btn)btn.click(); });
+    setTimeout(()=>Object.values(charts).forEach(c=>{try{c.resize();}catch(e){}}),80); },".sgrip",true);
+  // Klick auf die Bereichs-Überschrift (nicht auf den Griff/Rasterbuttons) klappt auf/zu
+  cont.querySelectorAll(":scope > .card > h2").forEach(h=>{
+    h.addEventListener("click",e=>{ if(e.target.closest(".sgrip,.densgroup"))return;
+      const btn=h.parentElement.querySelector(".cardbtns .cbtn"); if(btn)btn.click(); });
   });
 })();
 // Instanzen-Karte einklappbar (Zustand im Cookie)
@@ -1617,6 +1750,20 @@ function renderAlerts(j){
   });
 }
 async function fetchAlerts(){try{renderAlerts(await(await fetch("/api/alerts?limit=100")).json());}catch(e){}}
+// --- Zeitachsen-Annotationen (Deploy/Restart …) ---
+async function fetchAnnotations(){
+  try{ const j=await(await fetch("/api/annotations?range="+rangeVal())).json();
+    annotations=j.annotations||[]; Object.values(charts).forEach(o=>o.draw()); }catch(e){}
+}
+async function addAnnotation(){
+  const label=prompt('Annotation für den aktuellen Zeitpunkt (z. B. „Deploy v0.22.2"):');
+  if(!label||!label.trim())return;
+  try{ await fetch("/api/annotations",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({label:label.trim()})}); fetchAnnotations(); }catch(e){}
+}
+async function delAnnotation(id){
+  try{ await fetch("/api/annotations?id="+id,{method:"DELETE"}); fetchAnnotations(); }catch(e){}
+}
 // Effizienz-Karte einklappbar
 (function(){
   const ec=document.getElementById("effcard"), et=document.getElementById("efftoggle");
@@ -1685,8 +1832,10 @@ fetchConfig();
 startRefresh();
 fetchAlerts();
 fetchCompare();
+fetchAnnotations();
 setInterval(fetchConfig,30000);
 setInterval(fetchAlerts,30000);
+setInterval(fetchAnnotations,30000);
 
 // --- Verbindungssicherheit & Zertifikat ---
 (function(){
@@ -1878,5 +2027,16 @@ if __name__ == "__main__":
         p, body = write_report(rng)
         print(body)
         print("\n[i] Report gespeichert: %s" % p)
+    elif len(sys.argv) > 1 and sys.argv[1] == "annotate":
+        # vllm_dashboard.sh annotate "Label" [ts_sekunden]   – z. B. aus Deploy-Skripten
+        label = sys.argv[2] if len(sys.argv) > 2 else ""
+        ts = None
+        if len(sys.argv) > 3:
+            try:
+                ts = int(sys.argv[3])
+            except ValueError:
+                ts = None
+        res = add_annotation(ts, label)
+        print("Annotation angelegt: %s" % res if res.get("ok") else "Fehler: %s" % res.get("error"))
     else:
         main()

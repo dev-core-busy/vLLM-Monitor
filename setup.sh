@@ -225,6 +225,8 @@ ${dcgm_env}
 ExecStart=$PY $DIR/vllm_collector.sh loop
 Restart=always
 RestartSec=10
+WatchdogSec=120
+NotifyAccess=main
 
 [Install]
 WantedBy=default.target

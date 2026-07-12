@@ -4,6 +4,22 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.14.0] – 2026-07-12
+
+### Neu
+- **Zeitachsen-Annotationen** (Deploy/Restart …): senkrechte Linien mit Label in
+  allen Diagrammen. API `GET/POST/DELETE /api/annotations`, Toolbar-Button
+  **🏷 Notiz**, Klick auf eine Linie löscht sie, sowie CLI
+  `vllm_dashboard.sh annotate "Label" [ts]` für Deploy-Skripte.
+- **Mehrere Hosts/Cluster:** `VLLM_TARGETS` akzeptiert jetzt `[host:]port[:label]`
+  (rückwärtskompatibel). Neuer **Host-Filter** im Dashboard (erscheint ab zwei
+  Hosts) filtert Instanzen, KPI-Karten und Diagramme; Auswahl im Cookie.
+- **Self-Monitoring:** Collector schreibt einen Heartbeat (`collector_status`),
+  den das Dashboard in `/api/config` ausliefert und im Header anzeigt
+  („Collector aktiv · Xs" bzw. rot bei Stillstand). Zusätzlich **systemd-
+  Watchdog** über `sd_notify` (`WATCHDOG=1`) + `WatchdogSec=120` in der
+  Collector-Unit (Auto-Neustart bei Hänger). Alles stdlib-only.
+
 ## [0.13.2] – 2026-07-11
 
 ### Neu
