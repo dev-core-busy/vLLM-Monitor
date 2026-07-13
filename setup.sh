@@ -157,7 +157,7 @@ do_install() {
         if valid_ip "$ip"; then break; fi
         bad "Ungültige IP-Adresse – bitte erneut."
     done
-    targets="$(ask "vLLM-Instanzen (port:label,port:label)" "$D_TARGETS")"
+    targets="$(ask "vLLM-Instanzen ([host:]port[:label], mehrere per Komma; Host-Präfix = anderer Host)" "$D_TARGETS")"
     ollama="$(ask "Ollama-Instanz(en)? host:port:label (leer=keine, Autoscan bleibt aktiv)" "$D_OLLAMA")"
     stt="$(ask "STT-Server (faster-whisper)? host:port:label (leer=keiner)" "$D_STT")"
     dcgm="$(ask "NVIDIA DCGM-Exporter (GPU)? host:port (leer=keiner)" "$D_DCGM")"

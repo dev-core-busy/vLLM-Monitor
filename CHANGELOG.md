@@ -4,6 +4,12 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.14.1] – 2026-07-12
+
+### Geändert
+- `setup.sh`: Abfrage der vLLM-Instanzen weist jetzt auf das Host-Präfix hin
+  (`[host:]port[:label]`), sodass mehrere Hosts direkt beim Setup eintragbar sind.
+
 ## [0.14.0] – 2026-07-12
 
 ### Neu
