@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.14.1"
+__version__ = "0.15.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -356,6 +356,106 @@ def del_annotation(aid):
 
 
 # ---------------------------------------------------------------------------
+# Prometheus-Exporter (GET /metrics) – additiv für vorhandenes Grafana/Prometheus
+# ---------------------------------------------------------------------------
+
+# (samples-Spalte, Prom-Name, Typ, HELP). Counter kumulativ -> Prometheus bildet rate().
+PROM_METRICS = [
+    ("kv_cache_usage", "vllm_monitor_kv_cache_usage_ratio", "gauge", "KV-Cache-Auslastung (0..1)"),
+    ("requests_running", "vllm_monitor_requests_running", "gauge", "Laufende Requests"),
+    ("requests_waiting", "vllm_monitor_requests_waiting", "gauge", "Wartende Requests"),
+    ("prompt_tokens_total", "vllm_monitor_prompt_tokens_total", "counter", "Prompt-Tokens (kumulativ)"),
+    ("generation_tokens_total", "vllm_monitor_generation_tokens_total", "counter", "Generierte Tokens (kumulativ)"),
+    ("requests_success_total", "vllm_monitor_request_success_total", "counter", "Erfolgreiche Requests (kumulativ)"),
+    ("requests_error_total", "vllm_monitor_request_error_total", "counter", "Fehlerhafte Requests (kumulativ)"),
+    ("prefix_queries_total", "vllm_monitor_prefix_cache_queries_total", "counter", "Prefix-Cache-Anfragen (kumulativ)"),
+    ("prefix_hits_total", "vllm_monitor_prefix_cache_hits_total", "counter", "Prefix-Cache-Treffer (kumulativ)"),
+    ("preemptions_total", "vllm_monitor_preemptions_total", "counter", "Preemptions (kumulativ)"),
+    ("ttft_sum", "vllm_monitor_ttft_seconds_sum", "counter", "Time-to-First-Token Summe (s)"),
+    ("ttft_count", "vllm_monitor_ttft_seconds_count", "counter", "Time-to-First-Token Anzahl"),
+    ("e2e_sum", "vllm_monitor_e2e_seconds_sum", "counter", "E2E-Latenz Summe (s)"),
+    ("e2e_count", "vllm_monitor_e2e_seconds_count", "counter", "E2E-Latenz Anzahl"),
+    ("itl_sum", "vllm_monitor_itl_seconds_sum", "counter", "Inter-Token-Latenz Summe (s)"),
+    ("itl_count", "vllm_monitor_itl_seconds_count", "counter", "Inter-Token-Latenz Anzahl"),
+    ("gpu_util", "vllm_monitor_gpu_utilization_percent", "gauge", "GPU-Auslastung (%)"),
+    ("gpu_mem_util", "vllm_monitor_gpu_memory_utilization_percent", "gauge", "GPU-Speicher-Auslastung (%)"),
+    ("gpu_temp", "vllm_monitor_gpu_temperature_celsius", "gauge", "GPU-Temperatur (°C)"),
+    ("gpu_power", "vllm_monitor_gpu_power_watts", "gauge", "GPU-Leistung (W)"),
+    ("vram_bytes", "vllm_monitor_vram_used_bytes", "gauge", "Belegter VRAM (Bytes)"),
+]
+
+
+def _prom_esc(v):
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _prom_num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "0"
+    return str(int(f)) if f == int(f) else repr(f)
+
+
+def build_prometheus():
+    now = int(time.time())
+    out = {}   # name -> {"type","help","rows":[(labels, val)]}
+
+    def add(name, typ, help_, labels, val):
+        if val is None:
+            return
+        e = out.setdefault(name, {"type": typ, "help": help_, "rows": []})
+        e["rows"].append((labels, val))
+
+    if os.path.exists(DB_PATH):
+        conn = _connect()
+        # Neueste Probe je Instanz (nur kürzlich gesehene -> „lebende" Instanzen)
+        rows = conn.execute("""
+            SELECT s.* FROM samples s
+            JOIN (SELECT host,port,model,MAX(ts) AS mts FROM samples
+                   WHERE ts >= ? GROUP BY host,port,model) g
+              ON s.host=g.host AND s.port=g.port AND s.model=g.model AND s.ts=g.mts
+        """, (now - 600,)).fetchall()
+        for r in rows:
+            lab = {"host": r["host"], "port": str(r["port"]), "model": r["model"]}
+            for col, name, typ, help_ in PROM_METRICS:
+                add(name, typ, help_, lab, r[col])
+        # Instanz online/offline aus config
+        for c in conn.execute("SELECT host,port,model,up,updated,kind FROM config"):
+            age = now - (c["updated"] or 0)
+            up = 1 if (c["up"] and age <= STALE_AFTER) else 0
+            add("vllm_monitor_instance_up", "gauge", "Instanz online (1) / offline (0)",
+                {"host": c["host"], "port": str(c["port"]), "model": c["model"],
+                 "kind": (c["kind"] if "kind" in c.keys() and c["kind"] else "vllm")}, up)
+        # Collector-Self-Monitoring
+        try:
+            cs = conn.execute("SELECT ts,scrapes,errors,interval FROM collector_status WHERE id=1").fetchone()
+        except sqlite3.OperationalError:
+            cs = None
+        if cs and cs["ts"]:
+            iv = cs["interval"] or 15
+            add("vllm_monitor_collector_last_scrape_timestamp_seconds", "gauge",
+                "Unix-Zeit des letzten Collector-Scrapes", {}, cs["ts"])
+            add("vllm_monitor_collector_scrapes_total", "counter", "Anzahl Scrapes seit Start", {}, cs["scrapes"])
+            add("vllm_monitor_collector_errors_total", "counter", "Anzahl Scrape-Fehler", {}, cs["errors"])
+            add("vllm_monitor_collector_up", "gauge", "Collector-Heartbeat frisch (1) / veraltet (0)",
+                {}, 1 if (now - cs["ts"]) <= max(3 * iv, 60) else 0)
+        conn.close()
+
+    text = []
+    for name, e in out.items():
+        text.append("# HELP %s %s" % (name, e["help"]))
+        text.append("# TYPE %s %s" % (name, e["type"]))
+        for labels, val in e["rows"]:
+            if labels:
+                ls = "{%s}" % ",".join('%s="%s"' % (k, _prom_esc(v)) for k, v in labels.items())
+            else:
+                ls = ""
+            text.append("%s%s %s" % (name, ls, _prom_num(val)))
+    return ("\n".join(text) + "\n").encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
 # HTTP-Handler
 # ---------------------------------------------------------------------------
 
@@ -480,6 +580,8 @@ class Handler(BaseHTTPRequestHandler):
             if "range" in qs:
                 rng = _range_from(qs)
             self._json(build_annotations(rng))
+        elif parsed.path == "/metrics":
+            self._send(200, "text/plain; version=0.0.4; charset=utf-8", build_prometheus())
         elif parsed.path == "/api/stream":
             self._stream(_range_from(qs))
         elif parsed.path == "/api/cert":
@@ -749,11 +851,12 @@ PAGE = r"""<!DOCTYPE html>
   <span style="font-size:11px;color:var(--muted)">v__VERSION__</span>
   <span id="collstat" title="Status des Metrik-Collectors (Self-Monitoring)" style="font-size:11px"></span>
   <label class="ctl" title="Zeitfenster, das in allen Diagrammen dargestellt wird. Bei großen Fenstern werden die Daten automatisch verdichtet (Downsampling).">Zeitraum
-    <select id="range" title="Zeitfenster der Diagramme (15 min bis 7 Tage)">
+    <select id="range" title="Zeitfenster der Diagramme (15 min bis 7 Tage; „heute“ = seit Mitternacht)">
       <option value="900">15 min</option>
-      <option value="3600" selected>1 h</option>
+      <option value="3600">1 h</option>
       <option value="21600">6 h</option>
       <option value="86400">24 h</option>
+      <option value="today" selected>heute</option>
       <option value="604800">7 Tage</option>
     </select>
   </label>
@@ -804,6 +907,7 @@ PAGE = r"""<!DOCTYPE html>
       </label>
       <button id="export" title="Aktuell angezeigte Zeitreihen als CSV-Datei herunterladen">⬇ Export CSV</button>
       <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">⬇ Export JSON</button>
+      <a href="/metrics" target="_blank" rel="noopener" title="Prometheus-Exporter: aktuelle Werte im Prometheus-Textformat (für vorhandenes Prometheus/Grafana). Präfix vllm_monitor_, Labels host/port/model." style="display:block;font-size:12px;padding:2px 0;color:var(--fg);text-decoration:none;border-top:1px solid var(--border);margin-top:2px;padding-top:6px">📡 Prometheus /metrics ↗</a>
     </div>
   </div>
   <span id="countdown"></span>
@@ -1334,7 +1438,11 @@ async function fetchOnce(){try{applySeries(await(await fetch("/api/series?range=
 
 // --- Refresh-Steuerung: Live (SSE) oder Intervall ---
 let es=null, remaining=0, period=0, lastMsg=Date.now();
-const rangeVal=()=>document.getElementById("range").value;
+const rangeSel=()=>document.getElementById("range").value;   // Roh-Auswahl (auch "today")
+const rangeVal=()=>{ const v=rangeSel();
+  if(v==="today"){ const d=new Date(); d.setHours(0,0,0,0);
+    return String(Math.max(60, Math.floor((Date.now()-d.getTime())/1000))); }  // seit Mitternacht
+  return v; };
 const cd=document.getElementById("countdown");
 function setCd(t,cls){cd.className=cls||"";cd.textContent=t;}
 function stopAll(){if(es){es.close();es=null;}}
@@ -1424,10 +1532,20 @@ function applyHidden(){
 function toggleMax(card,id){
   const on=card.classList.toggle("maximized");
   document.body.style.overflow=on?"hidden":"";
+  const cv=card.querySelector("canvas");
   if(on){ window.scrollTo(0,0);
     const hdr=document.querySelector("header");
-    card.style.top=((hdr?hdr.offsetHeight:56)+8)+"px";   // unter der Titelleiste beginnen
-  } else { card.style.top=""; }
+    const top=(hdr?hdr.offsetHeight:56)+8;
+    card.style.top=top+"px";                               // unter der Titelleiste beginnen
+    // Canvas exakt an den verbleibenden Platz einpassen (echte Maße messen) ->
+    // Achsenbeschriftung ohne Scrollen. clientHeight enthält Padding, aber nicht Rand/Scrollbar.
+    const ccs=getComputedStyle(card);
+    const pad=parseFloat(ccs.paddingTop)+parseFloat(ccs.paddingBottom);
+    const h2=card.querySelector("h2");
+    let h2h=0; if(h2){ h2h=h2.offsetHeight+(parseFloat(getComputedStyle(h2).marginBottom)||0); }
+    const avail=card.clientHeight - pad - h2h - 6;          // 6px Puffer
+    if(cv) cv.style.maxHeight=Math.max(140,avail)+"px";
+  } else { card.style.top=""; if(cv) cv.style.maxHeight=""; }
   const c=charts[id]; if(c) setTimeout(()=>{try{c.resize();}catch(e){}},60);
 }
 function wireCardButtons(container){
@@ -1665,7 +1783,7 @@ applyDensity(store.get("vllm_density")||"normal");
   gmenu.querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>gmenu.classList.remove("open")));
   document.addEventListener("click",e=>{ if(!gmenu.contains(e.target)&&e.target!==gear) gmenu.classList.remove("open"); });
 })();
-document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeVal());fetchConfig();startRefresh();fetchCompare();fetchAnnotations();};
+document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeSel());fetchConfig();startRefresh();fetchCompare();fetchAnnotations();};
 document.getElementById("annbtn").onclick=addAnnotation;
 document.getElementById("compare").onchange=()=>{store.set("vllm_compare",document.getElementById("compare").value);fetchCompare();};
 document.getElementById("hostfilter").onchange=()=>{hostFilter=document.getElementById("hostfilter").value;store.set("vllm_host",hostFilter);

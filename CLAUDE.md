@@ -54,7 +54,10 @@ single collector can watch **multiple hosts/clusters**; the dashboard shows a
 host filter when more than one host is present. **Self-monitoring:** the
 collector writes a heartbeat into `collector_status` (surfaced in `/api/config`
 and the header) and supports the **systemd watchdog** via `sd_notify`
-(`READY=1`/`WATCHDOG=1`; `WatchdogSec=120` in the unit).
+(`READY=1`/`WATCHDOG=1`; `WatchdogSec=120` in the unit). The dashboard also
+exposes a **Prometheus exporter** at `GET /metrics` (`build_prometheus()`,
+prefix `vllm_monitor_`, labels host/port/model; cumulative values as counters)
+for scraping by an existing Prometheus/Grafana — additive to the SQLite pipeline.
 
 Both files are named `*.sh` but are **Python 3** (shebang `#!/usr/bin/env
 python3`) and use **only the standard library** — no `pip install` needed.

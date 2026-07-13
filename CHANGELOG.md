@@ -4,6 +4,22 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.15.0] – 2026-07-12
+
+### Neu
+- **Prometheus-Exporter:** `GET /metrics` liefert die aktuellen Werte im
+  Prometheus-Textformat (Präfix `vllm_monitor_`, Labels `host`/`port`/`model`) –
+  Gauges, kumulative Counter (rate-fähig), GPU- und Collector-Status. Additiv zur
+  SQLite-Pipeline, stdlib-only. Ein Link **📡 Prometheus /metrics** im ⚙-Menü
+  macht den Endpunkt auffindbar.
+- **Zeitraum „heute"** im Zeitraum-Pulldown (direkt hinter „24 h", neuer
+  Default): dynamisch seit lokaler Mitternacht.
+
+### Behoben
+- Maximierte Diagramm-Karte: Canvas-Höhe wird jetzt aus den echten Maßen
+  berechnet (statt fester CSS-Höhe), sodass die untere Achsenbeschriftung ohne
+  Scrollen sichtbar bleibt – unabhängig von der Höhe der (sticky) Titelleiste.
+
 ## [0.14.1] – 2026-07-12
 
 ### Geändert

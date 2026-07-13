@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.14.1-blue)
+![Version](https://img.shields.io/badge/version-0.15.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -78,6 +78,10 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
 - 🫀 **Self-Monitoring** – der Collector schreibt einen Heartbeat (Status im
   Header sichtbar) und unterstützt den **systemd-Watchdog** (Auto-Neustart bei
   Hänger).
+- 📡 **Prometheus-Exporter** – `GET /metrics` liefert die aufbereiteten Werte
+  (Gauges + kumulative Counter, GPU, Collector-Status) im Prometheus-Textformat,
+  sodass vorhandenes **Prometheus/Grafana** sie scrapen kann. Rein additiv zur
+  eigenen SQLite-Pipeline.
 - 📐 **Latenz-Perzentile P50/P95/P99** (TTFT/E2E/ITL) aus den Histogramm-Buckets.
 - ⚡ **Live-Push (SSE)**, Zoom/Pan, synchrones Fadenkreuz, Counter-Reset-Marker,
   CSV-/JSON-Export, Hell/Dunkel, frei wählbare Kachelfarben & -dichte,
@@ -220,6 +224,22 @@ Acht Panels, jeweils **eine Linie pro Modell**:
 Zeitraum wählbar (15 min – 7 Tage), Auto-Refresh alle 15 s mit Countdown in der
 Kopfzeile (`0` = wird gerade aktualisiert). Die JSON-API unter
 `GET /api/series?range=<sekunden>` liefert die aufbereiteten Reihen direkt.
+
+### Prometheus / Grafana
+
+`GET /metrics` liefert die aktuellen Werte im **Prometheus-Textformat** (Präfix
+`vllm_monitor_`, Labels `host`/`port`/`model`), inkl. GPU- und Collector-Status.
+Kumulative Werte sind `counter` – Prometheus bildet Raten selbst per `rate()`.
+Beispiel-Scrape:
+
+```yaml
+scrape_configs:
+  - job_name: vllm-monitor
+    scheme: https            # bei aktivem TLS; sonst http
+    tls_config: { insecure_skip_verify: true }
+    static_configs:
+      - targets: ["dein-host:8899"]
+```
 
 ## Als Dienst betreiben (systemd)
 
