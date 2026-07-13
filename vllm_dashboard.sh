@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.15.0"
+__version__ = "0.15.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -877,15 +877,14 @@ PAGE = r"""<!DOCTYPE html>
     <button class="dbtn" data-d="kompakt" title="Mittel (4×3)"><svg class="dg" viewBox="0 0 26 20"><circle cx="5.2" cy="5.0" r="1.7"/><circle cx="10.4" cy="5.0" r="1.7"/><circle cx="15.6" cy="5.0" r="1.7"/><circle cx="20.8" cy="5.0" r="1.7"/><circle cx="5.2" cy="10.0" r="1.7"/><circle cx="10.4" cy="10.0" r="1.7"/><circle cx="15.6" cy="10.0" r="1.7"/><circle cx="20.8" cy="10.0" r="1.7"/><circle cx="5.2" cy="15.0" r="1.7"/><circle cx="10.4" cy="15.0" r="1.7"/><circle cx="15.6" cy="15.0" r="1.7"/><circle cx="20.8" cy="15.0" r="1.7"/></svg></button>
     <button class="dbtn" data-d="normal" title="Große Kacheln (3×2)"><svg class="dg" viewBox="0 0 26 20"><circle cx="6.5" cy="6.7" r="2.2"/><circle cx="13.0" cy="6.7" r="2.2"/><circle cx="19.5" cy="6.7" r="2.2"/><circle cx="6.5" cy="13.3" r="2.2"/><circle cx="13.0" cy="13.3" r="2.2"/><circle cx="19.5" cy="13.3" r="2.2"/></svg></button>
   </span>
-  <button id="reload" title="Daten und Instanz-Konfiguration sofort neu laden">Neu laden</button>
   <button id="resetzoom" title="Zoom/Verschieben in allen Diagrammen zurücksetzen (Mausrad = Zoom, Ziehen = Verschieben)">Zoom ⟲</button>
   <button id="anombtn" title="Ausreißer (robuste MAD-Anomalie-Erkennung) in allen Diagrammen als rote Punkte markieren">⚠ Anomalien</button>
   <button id="reportbtn" title="KI-Gesamt-Report über alle Diagramme (Kennzahlen, Ausreißer, Prognosen)">📋 KI-Report</button>
-  <button id="annbtn" title="Annotation (Deploy/Restart …) für den aktuellen Zeitpunkt setzen – erscheint als senkrechte Linie in allen Diagrammen; Klick auf eine Linie löscht sie">🏷 Notiz</button>
   <button id="theme" title="Zwischen hellem und dunklem Design umschalten (wird gespeichert)">◐</button>
   <button id="notif" title="Browser-Benachrichtigungen bei Warnungen (KV-Cache voll, Fehler, Instanz offline) erlauben">🔔</button>
   <button id="secbtn" title="Verbindungssicherheit & Zertifikat">🔒</button>
   <button id="restore" title="Ausgeblendete Kacheln wieder einblenden" style="display:none">Ausgeblendet: 0 ⟲</button>
+  <button id="reload" title="Daten und Instanz-Konfiguration sofort neu laden">⟳</button>
   <div class="menuwrap">
     <button id="gear" title="Weitere Optionen (Aktualisierung, Latenz-Perzentil, Export)">⚙</button>
     <div id="gearmenu" class="menu">
@@ -905,6 +904,7 @@ PAGE = r"""<!DOCTYPE html>
           <option value="p99">P99</option>
         </select>
       </label>
+      <button id="annbtn" title="Annotation (Deploy/Restart …) für den aktuellen Zeitpunkt setzen – erscheint als senkrechte Linie in allen Diagrammen; Klick auf eine Linie löscht sie">🏷 Notiz setzen</button>
       <button id="export" title="Aktuell angezeigte Zeitreihen als CSV-Datei herunterladen">⬇ Export CSV</button>
       <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">⬇ Export JSON</button>
       <a href="/metrics" target="_blank" rel="noopener" title="Prometheus-Exporter: aktuelle Werte im Prometheus-Textformat (für vorhandenes Prometheus/Grafana). Präfix vllm_monitor_, Labels host/port/model." style="display:block;font-size:12px;padding:2px 0;color:var(--fg);text-decoration:none;border-top:1px solid var(--border);margin-top:2px;padding-top:6px">📡 Prometheus /metrics ↗</a>

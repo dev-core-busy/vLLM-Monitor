@@ -4,6 +4,13 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.15.1] – 2026-07-12
+
+### Geändert
+- Toolbar aufgeräumt: **„Notiz"** in das ⚙-Menü verschoben; **„Neu laden"** ist
+  jetzt ein **⟳-Symbol** und sitzt zwischen dem 🔒-Sicherheits-Button und dem
+  ⚙-Menü.
+
 ## [0.15.0] – 2026-07-12
 
 ### Neu
