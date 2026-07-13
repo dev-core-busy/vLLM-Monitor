@@ -4,6 +4,21 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.16.0] – 2026-07-13
+
+### Neu
+- **LDAP-/AD-Authentifizierung** (optional): HTTP Basic-Auth → LDAP Simple Bind
+  gegen den Domain-Controller (nur Standardbibliothek, BER über Socket – kein
+  `ldap3`). Schützt Seite, alle `/api/*` und `/metrics`; Login als
+  `benutzer@domäne`, leere Passwörter werden abgelehnt, erfolgreiche Prüfungen
+  werden `VLLM_AUTH_TTL` s gecacht. Aktiv über `VLLM_LDAP_HOST`/`VLLM_LDAP_DOMAIN`
+  (weitere: `VLLM_LDAP_TLS/PORT/PORT_TLS/ALLOW`, `VLLM_AUTH_REALM`). `setup.sh`
+  fragt DC + Domäne ab. Nur mit HTTPS betreiben.
+- **Instanzen im UI verwalten:** zusätzliche vLLM-/Ollama-/STT-/DCGM-Ziele über
+  das ⚙-Menü hinzufügen, pausieren oder entfernen – persistent in `targets.json`
+  (`VLLM_TARGETS_FILE`), vom Collector bei jedem Scrape neu geladen; ohne
+  Unit-Editieren. API `GET/POST/DELETE /api/targets` (auth-geschützt).
+
 ## [0.15.1] – 2026-07-12
 
 ### Geändert

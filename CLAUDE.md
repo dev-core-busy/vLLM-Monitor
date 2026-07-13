@@ -59,6 +59,20 @@ exposes a **Prometheus exporter** at `GET /metrics` (`build_prometheus()`,
 prefix `vllm_monitor_`, labels host/port/model; cumulative values as counters)
 for scraping by an existing Prometheus/Grafana — additive to the SQLite pipeline.
 
+**UI-managed instances:** extra vLLM/Ollama/STT/DCGM targets can be added,
+paused or removed from the ⚙ menu; they persist in `targets.json`
+(`VLLM_TARGETS_FILE`) which the collector re-reads every scrape
+(`load_extra_targets()` → `scrape_vllm_target()`/`scrape_ollama`/… ) on top of
+the env-defined targets. Dashboard write endpoints: `GET/POST/DELETE
+/api/targets` (auth-guarded).
+
+**Optional LDAP/AD auth:** setting `VLLM_LDAP_HOST` (+ `VLLM_LDAP_DOMAIN`) turns
+on HTTP Basic auth verified via a hand-rolled **LDAP simple bind** (`ldap_
+authenticate()`, BER over a socket — stdlib only, no `ldap3`); `_require_auth()`
+guards every request (page, `/api/*`, `/metrics`) with a short success cache
+(`VLLM_AUTH_TTL`). Login is `user@domain`; empty passwords are rejected. Only
+meaningful with HTTPS. `setup.sh` prompts for DC host + domain.
+
 Both files are named `*.sh` but are **Python 3** (shebang `#!/usr/bin/env
 python3`) and use **only the standard library** — no `pip install` needed.
 

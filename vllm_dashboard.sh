@@ -29,12 +29,16 @@ import json
 import math
 import time
 import html
+import base64
+import socket
+import hashlib
 import sqlite3
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.15.1"
+__version__ = "0.16.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -64,6 +68,21 @@ ALERT_OFFLINE_MIN = float(os.environ.get("VLLM_ALERT_OFFLINE_MIN", "1"))
 REPORT_DIR = os.environ.get("VLLM_REPORT_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "reports")
 REPORT_RANGE = int(os.environ.get("VLLM_REPORT_RANGE", str(8 * 3600)))
+
+# --- LDAP-/AD-Authentifizierung (optional; aktiv sobald VLLM_LDAP_HOST gesetzt) ---
+LDAP_HOST = os.environ.get("VLLM_LDAP_HOST", "").strip()      # Domain-Controller
+LDAP_DOMAIN = os.environ.get("VLLM_LDAP_DOMAIN", "").strip()  # z. B. nexus.int (UPN-Suffix)
+LDAP_PORT = int(os.environ.get("VLLM_LDAP_PORT", "389"))
+LDAP_PORT_TLS = int(os.environ.get("VLLM_LDAP_PORT_TLS", "636"))
+# TLS-Präferenz: "auto" (LDAPS versuchen, sonst Klartext), "1"/"require", "0"/"off"
+LDAP_TLS = os.environ.get("VLLM_LDAP_TLS", "auto").strip().lower()
+# optionale Allow-Liste (sAMAccountName oder UPN, kommagetrennt); leer = jeder gültige Domänen-Nutzer
+LDAP_ALLOW = [u.strip().lower() for u in os.environ.get("VLLM_LDAP_ALLOW", "").split(",") if u.strip()]
+AUTH_REALM = os.environ.get("VLLM_AUTH_REALM", "vLLM Monitor")
+AUTH_TTL = int(os.environ.get("VLLM_AUTH_TTL", "300"))        # Sekunden, erfolgreiche Prüfung cachen
+AUTH_ENABLED = bool(LDAP_HOST)
+_auth_cache = {}                                             # cred-hash -> Ablaufzeit
+_auth_lock = threading.Lock()
 
 # Counter-Spalten -> Raten-Feld (Δwert / Δt)
 RATES = {
@@ -356,6 +375,73 @@ def del_annotation(aid):
 
 
 # ---------------------------------------------------------------------------
+# UI-verwaltete Instanzen (targets.json; der Collector lädt sie zur Laufzeit neu)
+# ---------------------------------------------------------------------------
+
+TARGETS_FILE = os.environ.get("VLLM_TARGETS_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "targets.json")
+_targets_lock = threading.Lock()
+_TARGET_KINDS = ("vllm", "ollama", "stt", "dcgm")
+
+
+def _load_targets():
+    try:
+        with open(TARGETS_FILE) as f:
+            data = json.load(f)
+        return data.get("targets", []) if isinstance(data, dict) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_targets(targets):
+    tmp = TARGETS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"targets": targets}, f, indent=2)
+    os.replace(tmp, TARGETS_FILE)
+
+
+def _target_id(t):
+    return "%s:%s:%s" % (t.get("kind"), t.get("host"), t.get("port"))
+
+
+def build_targets():
+    return {"targets": _load_targets(), "file": TARGETS_FILE}
+
+
+def add_target(body):
+    kind = (body.get("kind") or "").strip().lower()
+    host = (body.get("host") or "").strip()
+    label = (body.get("label") or "").strip()
+    if kind not in _TARGET_KINDS:
+        return {"error": "ungültiger Typ"}
+    if not host:
+        return {"error": "Host fehlt"}
+    try:
+        port = int(body.get("port"))
+    except (ValueError, TypeError):
+        return {"error": "ungültiger Port"}
+    newt = {"kind": kind, "host": host, "port": port, "label": label,
+            "enabled": bool(body.get("enabled", True))}
+    nid = _target_id(newt)
+    with _targets_lock:
+        targets = _load_targets()
+        for i, t in enumerate(targets):
+            if _target_id(t) == nid:
+                targets[i] = newt
+                break
+        else:
+            targets.append(newt)
+        _save_targets(targets)
+    return {"ok": True, "id": nid}
+
+
+def del_target(tid):
+    with _targets_lock:
+        _save_targets([t for t in _load_targets() if _target_id(t) != tid])
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Prometheus-Exporter (GET /metrics) – additiv für vorhandenes Grafana/Prometheus
 # ---------------------------------------------------------------------------
 
@@ -453,6 +539,165 @@ def build_prometheus():
                 ls = ""
             text.append("%s%s %s" % (name, ls, _prom_num(val)))
     return ("\n".join(text) + "\n").encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# LDAP-/AD-Authentifizierung (Simple Bind, nur Standardbibliothek – kein ldap3)
+# ---------------------------------------------------------------------------
+
+def _ber_len(n):
+    if n < 0x80:
+        return bytes([n])
+    b = b""
+    while n:
+        b = bytes([n & 0xFF]) + b
+        n >>= 8
+    return bytes([0x80 | len(b)]) + b
+
+
+def _ber_tlv(tag, value):
+    return bytes([tag]) + _ber_len(len(value)) + value
+
+
+def _ber_int(n):
+    b = b""
+    x = n
+    while True:
+        b = bytes([x & 0xFF]) + b
+        x >>= 8
+        if (x == 0 and not (b[0] & 0x80)) or (x == -1 and (b[0] & 0x80)):
+            break
+    return _ber_tlv(0x02, b)
+
+
+def _recvn(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def _read_ldap_message(sock):
+    tag = _recvn(sock, 1)
+    if not tag:
+        return None
+    l0 = _recvn(sock, 1)[0]
+    if l0 < 0x80:
+        length = l0
+    else:
+        length = int.from_bytes(_recvn(sock, l0 & 0x7F), "big")
+    return _recvn(sock, length)
+
+
+def _parse_tlv(data, i=0):
+    tag = data[i]; i += 1
+    l0 = data[i]; i += 1
+    if l0 < 0x80:
+        length = l0
+    else:
+        nb = l0 & 0x7F
+        length = int.from_bytes(data[i:i + nb], "big"); i += nb
+    return tag, data[i:i + length], i + length
+
+
+def _ldap_bind_result(body):
+    # LDAPMessage: SEQUENCE { messageID INTEGER, [APPLICATION 1] BindResponse }
+    _, _, i = _parse_tlv(body, 0)          # messageID überspringen
+    _, op, _ = _parse_tlv(body, i)         # BindResponse
+    _, rc, _ = _parse_tlv(op, 0)           # resultCode ENUMERATED
+    return int.from_bytes(rc, "big")
+
+
+def _ldap_bind(host, port, use_tls, dn, password, timeout=6):
+    raw = socket.create_connection((host, port), timeout=timeout)
+    try:
+        s = raw
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            s = ctx.wrap_socket(raw, server_hostname=None)
+        # BindRequest [APPLICATION 0] { version=3, name=DN, [0] simple-password }
+        bind = _ber_int(3) + _ber_tlv(0x04, dn.encode("utf-8")) + _ber_tlv(0x80, password.encode("utf-8"))
+        msg = _ber_tlv(0x30, _ber_int(1) + _ber_tlv(0x60, bind))
+        s.sendall(msg)
+        body = _read_ldap_message(s)
+        try:
+            s.close()
+        except OSError:
+            pass
+        if not body:
+            return None
+        return _ldap_bind_result(body)     # 0 = success, 49 = invalidCredentials, …
+    finally:
+        try:
+            raw.close()
+        except OSError:
+            pass
+
+
+def ldap_authenticate(username, password):
+    """True, wenn Simple Bind gegen den DC gelingt. Leeres Passwort wird
+    abgelehnt (verhindert unauthenticated/anonymous bind)."""
+    username = (username or "").strip()
+    if not username or not password:
+        return False
+    if LDAP_ALLOW:
+        short = username.split("@")[0].split("\\")[-1].lower()
+        if short not in LDAP_ALLOW and username.lower() not in LDAP_ALLOW:
+            return False
+    # Bind-Name als UPN (user@domain), sofern nicht schon voll qualifiziert
+    if "@" in username or "\\" in username:
+        dn = username
+    elif LDAP_DOMAIN:
+        dn = "%s@%s" % (username, LDAP_DOMAIN)
+    else:
+        dn = username
+    if LDAP_TLS in ("1", "require", "yes", "on", "ldaps"):
+        attempts = [(True, LDAP_PORT_TLS)]
+    elif LDAP_TLS in ("0", "off", "no", "none"):
+        attempts = [(False, LDAP_PORT)]
+    else:  # auto: erst LDAPS, dann Klartext
+        attempts = [(True, LDAP_PORT_TLS), (False, LDAP_PORT)]
+    for use_tls, port in attempts:
+        try:
+            rc = _ldap_bind(LDAP_HOST, port, use_tls, dn, password)
+        except Exception:
+            continue
+        if rc is None:
+            continue
+        return rc == 0
+    return False
+
+
+def _auth_ok(header):
+    """Prüft den Authorization-Header (Basic) gegen LDAP, mit kurzem Cache."""
+    if not header or not header.startswith("Basic "):
+        return False
+    try:
+        user, _, pw = base64.b64decode(header[6:]).decode("utf-8", "replace").partition(":")
+    except Exception:
+        return False
+    if not user or not pw:
+        return False
+    key = hashlib.sha256(("%s\0%s" % (user, pw)).encode("utf-8")).hexdigest()
+    now = time.time()
+    with _auth_lock:
+        exp = _auth_cache.get(key)
+        if exp and exp > now:
+            return True
+    if ldap_authenticate(user, pw):
+        with _auth_lock:
+            _auth_cache[key] = now + AUTH_TTL
+            # aufräumen
+            for k, e in list(_auth_cache.items()):
+                if e <= now:
+                    _auth_cache.pop(k, None)
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +802,26 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def _require_auth(self):
+        """Bei aktiver LDAP-Auth: 401 mit Basic-Challenge, wenn nicht angemeldet."""
+        if not AUTH_ENABLED or _auth_ok(self.headers.get("Authorization")):
+            return True
+        body = "Anmeldung erforderlich (Domänen-Konto).\n".encode("utf-8")
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="%s"' % AUTH_REALM)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return False
+
     def do_GET(self):
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         if parsed.path == "/api/series":
@@ -580,6 +844,8 @@ class Handler(BaseHTTPRequestHandler):
             if "range" in qs:
                 rng = _range_from(qs)
             self._json(build_annotations(rng))
+        elif parsed.path == "/api/targets":
+            self._json(build_targets())
         elif parsed.path == "/metrics":
             self._send(200, "text/plain; version=0.0.4; charset=utf-8", build_prometheus())
         elif parsed.path == "/api/stream":
@@ -604,6 +870,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def do_POST(self):
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/analyze":
             body = self._read_body()
@@ -623,10 +891,18 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError, TypeError):
                     ts = None
             self._json(add_annotation(ts, body.get("label", "")))
+        elif parsed.path == "/api/targets":
+            body = self._read_body()
+            if body is None:
+                self._json({"error": "ungültige Anfrage"})
+                return
+            self._json(add_target(body))
         else:
             self._send(404, "text/plain", b"not found")
 
     def do_DELETE(self):
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         if parsed.path == "/api/annotations" and "id" in qs:
@@ -634,6 +910,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(del_annotation(int(qs["id"][0])))
             except ValueError:
                 self._json({"error": "ungültige id"})
+        elif parsed.path == "/api/targets" and "id" in qs:
+            self._json(del_target(qs["id"][0]))
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -905,6 +1183,7 @@ PAGE = r"""<!DOCTYPE html>
         </select>
       </label>
       <button id="annbtn" title="Annotation (Deploy/Restart …) für den aktuellen Zeitpunkt setzen – erscheint als senkrechte Linie in allen Diagrammen; Klick auf eine Linie löscht sie">🏷 Notiz setzen</button>
+      <button id="targetsbtn" title="Zusätzliche Instanzen (vLLM/Ollama/STT/GPU) ohne Unit-Editieren hinzufügen/entfernen">🖧 Instanzen verwalten</button>
       <button id="export" title="Aktuell angezeigte Zeitreihen als CSV-Datei herunterladen">⬇ Export CSV</button>
       <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">⬇ Export JSON</button>
       <a href="/metrics" target="_blank" rel="noopener" title="Prometheus-Exporter: aktuelle Werte im Prometheus-Textformat (für vorhandenes Prometheus/Grafana). Präfix vllm_monitor_, Labels host/port/model." style="display:block;font-size:12px;padding:2px 0;color:var(--fg);text-decoration:none;border-top:1px solid var(--border);margin-top:2px;padding-top:6px">📡 Prometheus /metrics ↗</a>
@@ -980,6 +1259,31 @@ PAGE = r"""<!DOCTYPE html>
   <span>⚠️ Unverschlüsselte Verbindung (HTTP) – Browser-Benachrichtigungen sind hier nicht möglich.</span>
   <button id="secbanner-btn">Zertifikat / HTTPS</button>
   <button id="secbanner-x" title="Ausblenden">×</button>
+</div>
+
+<div id="targetmodal" class="modal-ov">
+  <div class="modal-card" style="max-width:680px">
+    <h2 style="display:flex;align-items:center;gap:10px">🖧 Instanzen verwalten
+      <button class="cbtn close" id="tgt-close" title="Schließen" style="margin-left:auto">×</button></h2>
+    <p>Zusätzliche Instanzen werden persistent in <code>targets.json</code> gespeichert und vom
+       Collector automatisch beim nächsten Scrape (≤ 15 s) übernommen – ohne systemd-Unit zu
+       ändern. Die per Setup/Unit definierten Instanzen bleiben unberührt.</p>
+    <table id="tgttable"><thead><tr>
+      <th>Typ</th><th>Host</th><th>Port</th><th>Label</th><th>Aktiv</th><th></th>
+    </tr></thead><tbody></tbody></table>
+    <h4 style="margin:14px 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">Neu hinzufügen</h4>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      <select id="tgt-kind" style="background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
+        <option value="vllm">vLLM</option><option value="ollama">Ollama</option>
+        <option value="stt">STT</option><option value="dcgm">DCGM/GPU</option>
+      </select>
+      <input id="tgt-host" placeholder="Host/IP" style="flex:1;min-width:140px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
+      <input id="tgt-port" placeholder="Port" style="width:80px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
+      <input id="tgt-label" placeholder="Label (optional)" style="width:150px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
+      <button class="abtn" id="tgt-add">Hinzufügen</button>
+    </div>
+    <div id="tgt-msg" style="color:var(--muted);font-size:12px;margin-top:8px;min-height:16px"></div>
+  </div>
 </div>
 
 <div id="certmodal" class="modal-ov">
@@ -1786,6 +2090,52 @@ applyDensity(store.get("vllm_density")||"normal");
 document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeSel());fetchConfig();startRefresh();fetchCompare();fetchAnnotations();};
 document.getElementById("annbtn").onclick=addAnnotation;
 document.getElementById("compare").onchange=()=>{store.set("vllm_compare",document.getElementById("compare").value);fetchCompare();};
+// --- Instanzen verwalten (targets.json über /api/targets) ---
+async function loadTargets(){
+  const tb=document.querySelector("#tgttable tbody"); if(!tb)return;
+  try{
+    const j=await(await fetch("/api/targets")).json();
+    tb.innerHTML="";
+    const ts=j.targets||[];
+    if(!ts.length){ tb.innerHTML='<tr><td colspan="6" class="placeholder">Noch keine zusätzlichen Instanzen.</td></tr>'; return; }
+    ts.forEach(t=>{
+      const tr=document.createElement("tr");
+      tr.innerHTML='<td>'+t.kind+'</td><td>'+t.host+'</td><td>'+t.port+'</td><td>'+(t.label||"")+'</td>'+
+        '<td style="text-align:center"><input type="checkbox" '+(t.enabled!==false?"checked":"")+'></td>'+
+        '<td><button class="cbtn close" title="Entfernen">×</button></td>';
+      tr.querySelector('input[type=checkbox]').onchange=e=>saveTarget(Object.assign({},t,{enabled:e.target.checked}));
+      tr.querySelector('.cbtn.close').onclick=()=>delTarget(t);
+      tb.appendChild(tr);
+    });
+  }catch(e){}
+}
+async function saveTarget(t){
+  try{ await fetch("/api/targets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(t)}); }catch(e){}
+  loadTargets();
+}
+async function delTarget(t){
+  try{ await fetch("/api/targets?id="+encodeURIComponent(t.kind+":"+t.host+":"+t.port),{method:"DELETE"}); }catch(e){}
+  loadTargets();
+}
+document.getElementById("targetsbtn").onclick=()=>{ document.getElementById("targetmodal").style.display="flex"; loadTargets(); };
+document.getElementById("tgt-close").onclick=()=>document.getElementById("targetmodal").style.display="none";
+document.getElementById("targetmodal").onclick=e=>{ if(e.target===e.currentTarget) e.currentTarget.style.display="none"; };
+document.getElementById("tgt-add").onclick=async()=>{
+  const kind=document.getElementById("tgt-kind").value;
+  const host=document.getElementById("tgt-host").value.trim();
+  const port=document.getElementById("tgt-port").value.trim();
+  const label=document.getElementById("tgt-label").value.trim();
+  const msg=document.getElementById("tgt-msg");
+  if(!host||!port){ msg.textContent="Host und Port sind erforderlich."; return; }
+  try{
+    const r=await(await fetch("/api/targets",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({kind,host,port,label,enabled:true})})).json();
+    if(r.error){ msg.textContent="⚠️ "+r.error; return; }
+    msg.textContent="Hinzugefügt – wird beim nächsten Scrape (≤ 15 s) übernommen.";
+    document.getElementById("tgt-host").value=""; document.getElementById("tgt-port").value=""; document.getElementById("tgt-label").value="";
+    loadTargets();
+  }catch(e){ msg.textContent="Fehler: "+e; }
+};
 document.getElementById("hostfilter").onchange=()=>{hostFilter=document.getElementById("hostfilter").value;store.set("vllm_host",hostFilter);
   renderInstances();renderKPIs();if(lastData)redrawCharts(lastData.models);};
 document.getElementById("pct").onchange=()=>{if(lastData)applySeries(lastData);};
@@ -2125,8 +2475,13 @@ def main():
     print("vLLM-Dashboard %s läuft:  %s://%s:%d  (Bind %s)" % (__version__, scheme, shown, port, bind))
     if scheme == "https":
         print("  [i] Self-signed? Der Browser zeigt einmalig eine Warnung – Ausnahme bestätigen.")
-    if bind in ("0.0.0.0", ""):
-        print("  [!] Ohne Auth im Netzwerk erreichbar – ggf. per Firewall einschränken.")
+    if AUTH_ENABLED:
+        print("  [i] LDAP-Authentifizierung aktiv: DC %s, Domäne %s%s"
+              % (LDAP_HOST, LDAP_DOMAIN or "?", (" (Allow-Liste: %d)" % len(LDAP_ALLOW)) if LDAP_ALLOW else ""))
+        if scheme != "https":
+            print("  [!] ACHTUNG: Auth ohne HTTPS – Zugangsdaten gehen im Klartext übers Netz. TLS aktivieren!")
+    elif bind in ("0.0.0.0", ""):
+        print("  [!] Ohne Auth im Netzwerk erreichbar – ggf. per Firewall einschränken oder VLLM_LDAP_HOST setzen.")
     print("DB: %s   (Strg+C zum Beenden)" % DB_PATH)
     try:
         srv.serve_forever()

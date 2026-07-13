@@ -19,3 +19,4 @@ vllm_monitor.conf
 # Python
 __pycache__/
 *.pyc
+targets.json

@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.15.1-blue)
+![Version](https://img.shields.io/badge/version-0.16.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -82,6 +82,13 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
   (Gauges + kumulative Counter, GPU, Collector-Status) im Prometheus-Textformat,
   sodass vorhandenes **Prometheus/Grafana** sie scrapen kann. Rein additiv zur
   eigenen SQLite-Pipeline.
+- 🔐 **Optionale LDAP-/AD-Authentifizierung** – Domänen-Anmeldung per Basic-Auth
+  → LDAP Simple Bind gegen den Domain-Controller (nur Standardbibliothek, kein
+  `ldap3`); aktiv über `VLLM_LDAP_HOST`/`VLLM_LDAP_DOMAIN`.
+- 🖧 **Instanzen im UI verwalten** – zusätzliche vLLM-/Ollama-/STT-/GPU-Ziele
+  über das ⚙-Menü hinzufügen, pausieren oder entfernen (persistent in
+  `targets.json`; der Collector lädt sie zur Laufzeit) – ohne systemd-Unit zu
+  editieren. Schreibzugriff nur mit aktiver Authentifizierung sinnvoll.
 - 📐 **Latenz-Perzentile P50/P95/P99** (TTFT/E2E/ITL) aus den Histogramm-Buckets.
 - ⚡ **Live-Push (SSE)**, Zoom/Pan, synchrones Fadenkreuz, Counter-Reset-Marker,
   CSV-/JSON-Export, Hell/Dunkel, frei wählbare Kachelfarben & -dichte,
@@ -168,6 +175,7 @@ Der Collector wird vollständig über **Umgebungsvariablen** gesteuert:
 | `VLLM_RETENTION_DAYS` | `30` | Aufbewahrungsdauer; ältere Daten werden gelöscht |
 | `VLLM_HTTP_TIMEOUT` | `15` | Timeout pro `/metrics`-Abruf (Sekunden) |
 | `VLLM_DB` | *(Projektordner)* | Alternativer Pfad zur SQLite-Datei |
+| `VLLM_TARGETS_FILE` | *(Projektordner)*`/targets.json` | Über das Dashboard verwaltete Zusatz-Instanzen; der Collector lädt die Datei bei jedem Scrape neu. Ergänzt `VLLM_TARGETS` & Co. |
 | `VLLM_OLLAMA_TARGETS` | *(leer)* | Ollama-Instanzen `host:port:label,…` (Health/VRAM + Probe) |
 | `VLLM_OLLAMA_PROBE` | `1` | Synthetischen Ollama-Probe (`/api/generate`) an/aus |
 | `VLLM_OLLAMA_AUTOSCAN` | `<host>:11434,127.0.0.1:11434` | Endpunkte, die auf ein Ollama geprüft und automatisch eingebunden werden (`""` = aus) |
@@ -191,6 +199,12 @@ Dashboard:
 | `VLLM_AI_NO_THINK` | `0` | `1` schaltet die Denk-Phase von Reasoning-Modellen (Qwen3 u. a.) ab (`chat_template_kwargs.enable_thinking=false`) – liefert direkte, saubere Antworten. Empfohlen bei vLLM. |
 | `VLLM_REPORT_DIR` | `reports/` | Zielordner für geplante KI-Schicht-Reports |
 | `VLLM_REPORT_RANGE` | `28800` | Zeitfenster des Reports in Sekunden (Default 8 h) |
+| `VLLM_LDAP_HOST` | *(leer)* | Domain-Controller (Host/IP). **Gesetzt = LDAP-/AD-Authentifizierung aktiv** (Basic-Auth → LDAP Simple Bind, nur stdlib). Schützt Seite, `/api/*` und `/metrics`. |
+| `VLLM_LDAP_DOMAIN` | *(leer)* | AD-Domäne / UPN-Suffix (z. B. `nexus.int`); Login als `benutzer@domäne`. |
+| `VLLM_LDAP_TLS` | `auto` | `auto` (LDAPS 636, sonst Klartext 389), `require` (nur LDAPS) oder `off`. |
+| `VLLM_LDAP_PORT` / `VLLM_LDAP_PORT_TLS` | `389` / `636` | LDAP- bzw. LDAPS-Port. |
+| `VLLM_LDAP_ALLOW` | *(leer)* | Optionale Allow-Liste (Benutzernamen, kommagetrennt); leer = jeder gültige Domänen-Nutzer. |
+| `VLLM_AUTH_TTL` | `300` | Sekunden, wie lange eine erfolgreiche Anmeldung server-seitig gecacht wird. |
 
 **Geplanter KI-Schicht-Report:** `python3 vllm_dashboard.sh report [sekunden]`
 erzeugt einen deutschen Betriebs-Report (Kennzahlen + Alarme + KI-Bewertung) und
@@ -329,11 +343,18 @@ CORS/OPTIONS, Embeddings/Rerank …) und stellt sie je nach erkanntem Servertyp
 
 ## Sicherheit
 
-- Das **Dashboard hat keine Authentifizierung**. Standardmäßig lauscht es nur
-  auf `127.0.0.1`. Wird es an `0.0.0.0` gebunden, ist es (lesend) für jeden im
-  Netz sichtbar – dann per Firewall/Reverse-Proxy absichern.
-- Die Tools senden **keine** Daten nach außen; alle Metriken bleiben lokal in
-  der SQLite-DB.
+- **Optionale LDAP-/AD-Authentifizierung:** Ist `VLLM_LDAP_HOST` gesetzt,
+  verlangt das Dashboard eine Domänen-Anmeldung (HTTP Basic → LDAP Simple Bind
+  gegen den Domain-Controller, nur Standardbibliothek). Geschützt sind Seite,
+  alle `/api/*` und `/metrics`. Login als `benutzer@domäne`; leere Passwörter
+  werden abgelehnt. **Nur mit HTTPS betreiben** – sonst gehen die Zugangsdaten im
+  Klartext übers Netz. Ohne `VLLM_LDAP_HOST` bleibt das Dashboard offen.
+- Ist keine Auth gesetzt und wird an `0.0.0.0` gebunden, ist das Dashboard
+  (lesend) für jeden im Netz sichtbar – dann per Auth, Firewall oder
+  Reverse-Proxy absichern.
+- Die Tools senden **keine** Metrikdaten nach außen; alles bleibt lokal in der
+  SQLite-DB. (Ausnahme: die optionale KI-Auswertung ruft den konfigurierten
+  Chat-Endpunkt auf, und die LDAP-Auth spricht mit dem Domain-Controller.)
 
 ### HTTPS
 

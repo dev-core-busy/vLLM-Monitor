@@ -34,7 +34,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.15.1"
+__version__ = "0.16.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -84,6 +84,38 @@ ALERT_OFFLINE_MIN = float(os.environ.get("VLLM_ALERT_OFFLINE_MIN", "1"))  # Minu
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
+
+# Über die Oberfläche verwaltete Zusatz-Instanzen (persistent, zur Laufzeit neu
+# geladen) – ergänzen die per Env/Unit definierten Targets.
+TARGETS_FILE = os.environ.get("VLLM_TARGETS_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "targets.json")
+
+
+def load_extra_targets():
+    """Liest targets.json (vom Dashboard gepflegt). Nur aktivierte Einträge."""
+    out = {"vllm": [], "ollama": [], "stt": [], "dcgm": []}
+    try:
+        with open(TARGETS_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return out
+    for t in data.get("targets", []):
+        if not t.get("enabled", True):
+            continue
+        kind, host, port = t.get("kind"), t.get("host"), t.get("port")
+        if not host or port is None or kind not in out:
+            continue
+        try:
+            port = int(port)
+        except (ValueError, TypeError):
+            continue
+        if kind == "dcgm":
+            out["dcgm"].append((host, port))
+        elif kind == "vllm":
+            out["vllm"].append({"host": host, "port": port})
+        else:  # ollama / stt
+            out[kind].append({"host": host, "port": port, "label": t.get("label") or kind})
+    return out
 
 
 # --- Ollama (anderes API als vLLM: kein Prometheus /metrics) ---
@@ -682,92 +714,99 @@ def scrape_dcgm(conn, ts, host, port, verbose=True):
 # Scrape-Zyklus
 # ---------------------------------------------------------------------------
 
+def scrape_vllm_target(conn, ts, host, port, verbose=True):
+    """Ein vLLM-Ziel scrapen (Metriken + Config + Alarme). Rückgabe: gespeicherte Modelle."""
+    text = fetch_text(host, port, "/metrics")
+    if text is None:
+        mark_down(conn, host, port)
+        _down_since.setdefault((host, port), ts)
+        if ts - _down_since[(host, port)] >= ALERT_OFFLINE_MIN * 60:
+            record_alert(conn, ts, host, port, None, "offline", True,
+                         msg="Instanz offline", severity="crit")
+        return 0
+    _down_since.pop((host, port), None)
+    record_alert(conn, ts, host, port, None, "offline", False, severity="crit")
+    samples = parse_prometheus(text)
+    per_model = extract(samples)
+    cfg = extract_config(samples)
+
+    models_doc = fetch_text(host, port, "/v1/models")
+    maxlen = {}
+    if models_doc:
+        try:
+            for m in json.loads(models_doc).get("data", []):
+                maxlen[m.get("id")] = _num(m.get("max_model_len"))
+        except ValueError:
+            pass
+    ver_doc = fetch_text(host, port, "/version")
+    version = None
+    if ver_doc:
+        try:
+            version = json.loads(ver_doc).get("version")
+        except ValueError:
+            pass
+
+    if not per_model:
+        if verbose:
+            print("  [!] %s:%d: keine model_name-Metriken." % (host, port))
+        return 0
+    n = 0
+    for model, values in per_model.items():
+        store_sample(conn, ts, host, port, model, values)
+        mc = dict(cfg)
+        mc["up"] = 1
+        mc["max_model_len"] = maxlen.get(model)
+        mc["version"] = version
+        mc["kind"] = "vllm"
+        store_config(conn, host, port, model, mc)
+        kv = values.get("kv_cache_usage")
+        if kv is not None:
+            record_alert(conn, ts, host, port, model, "kv", (kv * 100.0) > ALERT_KV,
+                         value=kv * 100.0, msg="KV-Cache %.0f%%" % (kv * 100.0))
+        et = values.get("requests_error_total")
+        if et is not None:
+            prev = _prev_err.get((host, port, model))
+            _prev_err[(host, port, model)] = et
+            if prev is not None:
+                new = et - prev
+                record_alert(conn, ts, host, port, model, "error", new > ALERT_ERR,
+                             value=new, msg="%d neue Fehler" % int(new))
+        n += 1
+        if verbose:
+            print("  [+] %-40s run=%s kv=%s gen=%s"
+                  % (model, _fmt(values.get("requests_running")),
+                     _fmt(values.get("kv_cache_usage")),
+                     _fmt(values.get("generation_tokens_total"))))
+    return n
+
+
 def scrape_once(conn, verbose=True):
     ts = int(time.time())
     total = 0
+    extra = load_extra_targets()   # über die Oberfläche verwaltete Zusatz-Instanzen
+
+    # vLLM (Env/Unit + Datei)
     for tgt in TARGETS:
-        host = tgt.get("host", HOST)
-        port = tgt["port"]
-        text = fetch_text(host, port, "/metrics")
-        if text is None:
-            mark_down(conn, host, port)
-            _down_since.setdefault((host, port), ts)
-            if ts - _down_since[(host, port)] >= ALERT_OFFLINE_MIN * 60:
-                record_alert(conn, ts, host, port, None, "offline", True,
-                             msg="Instanz offline", severity="crit")
-            continue
-        # erreichbar -> evtl. bestehenden Offline-Alarm auflösen
-        _down_since.pop((host, port), None)
-        record_alert(conn, ts, host, port, None, "offline", False, severity="crit")
-        samples = parse_prometheus(text)
-        per_model = extract(samples)
-        cfg = extract_config(samples)
+        total += scrape_vllm_target(conn, ts, tgt.get("host", HOST), tgt["port"], verbose)
+    for t in extra["vllm"]:
+        total += scrape_vllm_target(conn, ts, t["host"], t["port"], verbose)
 
-        # max_model_len + version je Modell aus der API
-        models_doc = fetch_text(host, port, "/v1/models")
-        maxlen = {}
-        if models_doc:
-            try:
-                for m in json.loads(models_doc).get("data", []):
-                    maxlen[m.get("id")] = _num(m.get("max_model_len"))
-            except ValueError:
-                pass
-        ver_doc = fetch_text(host, port, "/version")
-        version = None
-        if ver_doc:
-            try:
-                version = json.loads(ver_doc).get("version")
-            except ValueError:
-                pass
-
-        if not per_model:
-            if verbose:
-                print("  [!] %s:%d: keine model_name-Metriken." % (host, port))
-            continue
-        for model, values in per_model.items():
-            store_sample(conn, ts, host, port, model, values)
-            mc = dict(cfg)
-            mc["up"] = 1
-            mc["max_model_len"] = maxlen.get(model)
-            mc["version"] = version
-            mc["kind"] = "vllm"
-            store_config(conn, host, port, model, mc)
-            # Schwellwert-Alarme (KV-Cache, neue Fehler)
-            kv = values.get("kv_cache_usage")
-            if kv is not None:
-                record_alert(conn, ts, host, port, model, "kv", (kv * 100.0) > ALERT_KV,
-                             value=kv * 100.0, msg="KV-Cache %.0f%%" % (kv * 100.0))
-            et = values.get("requests_error_total")
-            if et is not None:
-                prev = _prev_err.get((host, port, model))
-                _prev_err[(host, port, model)] = et
-                if prev is not None:
-                    new = et - prev
-                    record_alert(conn, ts, host, port, model, "error", new > ALERT_ERR,
-                                 value=new, msg="%d neue Fehler" % int(new))
-            total += 1
-            if verbose:
-                print("  [+] %-40s run=%s kv=%s gen=%s"
-                      % (model, _fmt(values.get("requests_running")),
-                         _fmt(values.get("kv_cache_usage")),
-                         _fmt(values.get("generation_tokens_total"))))
-
-    # Ollama-Instanzen (konfiguriert + automatisch entdeckt)
-    for tgt in OLLAMA_TARGETS + discover_ollama():
+    # Ollama-Instanzen (konfiguriert + automatisch entdeckt + Datei)
+    for tgt in OLLAMA_TARGETS + discover_ollama() + extra["ollama"]:
         try:
             total += scrape_ollama(conn, ts, tgt, verbose)
         except Exception as e:
             print("  [!] Ollama-Fehler %s:%d: %s" % (tgt["host"], tgt["port"], e))
 
     # STT-Server (nur /health)
-    for tgt in STT_TARGETS:
+    for tgt in STT_TARGETS + extra["stt"]:
         try:
             total += scrape_stt(conn, ts, tgt, verbose)
         except Exception as e:
             print("  [!] STT-Fehler %s:%d: %s" % (tgt["host"], tgt["port"], e))
 
     # NVIDIA DCGM-Exporter (GPU-Hardware)
-    for host, port in DCGM_TARGETS:
+    for host, port in DCGM_TARGETS + extra["dcgm"]:
         try:
             total += scrape_dcgm(conn, ts, host, port, verbose)
         except Exception as e:
