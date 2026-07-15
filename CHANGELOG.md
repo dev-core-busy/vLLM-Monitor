@@ -4,6 +4,16 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.16.1] – 2026-07-13
+
+### Behoben
+- **Login „klebt" jetzt:** Nach erfolgreicher LDAP-Anmeldung setzt der Server ein
+  signiertes, persistentes **Session-Cookie** (`vllm_auth`, HMAC-signiert,
+  `HttpOnly`, `SameSite=Lax`, `Secure` bei HTTPS; Default 7 Tage, gleitend
+  verlängert). Damit entfällt das wiederholte Eintippen der Zugangsdaten (auch
+  nach Browser-Neustart). Neu: `VLLM_AUTH_COOKIE_DAYS`, `VLLM_AUTH_SECRET`
+  (sonst automatisch in `.auth_secret` persistiert).
+
 ## [0.16.0] – 2026-07-13
 
 ### Neu

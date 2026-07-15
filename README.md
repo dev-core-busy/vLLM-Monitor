@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.16.0-blue)
+![Version](https://img.shields.io/badge/version-0.16.1-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -205,6 +205,8 @@ Dashboard:
 | `VLLM_LDAP_PORT` / `VLLM_LDAP_PORT_TLS` | `389` / `636` | LDAP- bzw. LDAPS-Port. |
 | `VLLM_LDAP_ALLOW` | *(leer)* | Optionale Allow-Liste (Benutzernamen, kommagetrennt); leer = jeder gültige Domänen-Nutzer. |
 | `VLLM_AUTH_TTL` | `300` | Sekunden, wie lange eine erfolgreiche Anmeldung server-seitig gecacht wird. |
+| `VLLM_AUTH_COOKIE_DAYS` | `7` | Gültigkeit des persistenten Session-Cookies (gleitend verlängert) – kein wiederholtes Login. |
+| `VLLM_AUTH_SECRET` | *(auto)* | HMAC-Secret für die Session-Cookies; ohne Angabe wird eins in `.auth_secret` erzeugt/gespeichert. |
 
 **Geplanter KI-Schicht-Report:** `python3 vllm_dashboard.sh report [sekunden]`
 erzeugt einen deutschen Betriebs-Report (Kennzahlen + Alarme + KI-Bewertung) und

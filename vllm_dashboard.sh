@@ -29,6 +29,7 @@ import json
 import math
 import time
 import html
+import hmac
 import base64
 import socket
 import hashlib
@@ -38,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.16.0"
+__version__ = "0.16.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -81,8 +82,36 @@ LDAP_ALLOW = [u.strip().lower() for u in os.environ.get("VLLM_LDAP_ALLOW", "").s
 AUTH_REALM = os.environ.get("VLLM_AUTH_REALM", "vLLM Monitor")
 AUTH_TTL = int(os.environ.get("VLLM_AUTH_TTL", "300"))        # Sekunden, erfolgreiche Prüfung cachen
 AUTH_ENABLED = bool(LDAP_HOST)
+AUTH_COOKIE = "vllm_auth"                                    # persistentes Sitzungs-Cookie
+AUTH_COOKIE_DAYS = int(os.environ.get("VLLM_AUTH_COOKIE_DAYS", "7"))
 _auth_cache = {}                                             # cred-hash -> Ablaufzeit
 _auth_lock = threading.Lock()
+
+
+def _load_auth_secret():
+    """Stabiles HMAC-Secret für Session-Cookies (Env oder persistente Datei)."""
+    s = os.environ.get("VLLM_AUTH_SECRET")
+    if s:
+        return s.encode("utf-8")
+    path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), ".auth_secret")
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if data:
+            return data
+    except OSError:
+        pass
+    secret = os.urandom(32)
+    try:
+        with open(path, "wb") as f:
+            f.write(secret)
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return secret
+
+
+AUTH_SECRET = _load_auth_secret() if AUTH_ENABLED else b""
 
 # Counter-Spalten -> Raten-Feld (Δwert / Δt)
 RATES = {
@@ -700,6 +729,46 @@ def _auth_ok(header):
     return False
 
 
+def _basic_user(header):
+    if not header or not header.startswith("Basic "):
+        return ""
+    try:
+        return base64.b64decode(header[6:]).decode("utf-8", "replace").partition(":")[0]
+    except Exception:
+        return ""
+
+
+def _cookie_sign(payload):
+    return hmac.new(AUTH_SECRET, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _make_cookie_value(user):
+    exp = int(time.time()) + AUTH_COOKIE_DAYS * 86400
+    payload = "%s|%d" % (base64.urlsafe_b64encode(user.encode("utf-8")).decode("ascii"), exp)
+    return "%s|%s" % (payload, _cookie_sign(payload))
+
+
+def _check_cookie_value(val):
+    """Gibt (user, exp) zurück, wenn Signatur gültig und nicht abgelaufen."""
+    try:
+        b64u, exp_s, sig = val.rsplit("|", 2)
+    except ValueError:
+        return None
+    if not hmac.compare_digest(sig, _cookie_sign("%s|%s" % (b64u, exp_s))):
+        return None
+    try:
+        exp = int(exp_s)
+    except ValueError:
+        return None
+    if exp < time.time():
+        return None
+    try:
+        user = base64.urlsafe_b64decode(b64u.encode("ascii")).decode("utf-8")
+    except Exception:
+        return None
+    return (user, exp)
+
+
 # ---------------------------------------------------------------------------
 # HTTP-Handler
 # ---------------------------------------------------------------------------
@@ -802,10 +871,34 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def _get_cookie(self, name):
+        for part in (self.headers.get("Cookie", "") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return None
+
     def _require_auth(self):
-        """Bei aktiver LDAP-Auth: 401 mit Basic-Challenge, wenn nicht angemeldet."""
-        if not AUTH_ENABLED or _auth_ok(self.headers.get("Authorization")):
+        """LDAP-Auth: gültiges Session-Cookie ODER Basic-Auth (→ Cookie setzen),
+        sonst 401 mit Basic-Challenge."""
+        if not AUTH_ENABLED:
             return True
+        now = time.time()
+        # 1) Persistentes Session-Cookie (kein erneutes Eintippen)
+        cval = self._get_cookie(AUTH_COOKIE)
+        if cval:
+            chk = _check_cookie_value(cval)
+            if chk:
+                user, exp = chk
+                if exp - now < AUTH_COOKIE_DAYS * 86400 / 2:   # gleitend verlängern
+                    self._auth_cookie = _make_cookie_value(user)
+                return True
+        # 2) Basic-Auth gegen LDAP -> bei Erfolg Session-Cookie setzen
+        hdr = self.headers.get("Authorization")
+        if _auth_ok(hdr):
+            self._auth_cookie = _make_cookie_value(_basic_user(hdr))
+            return True
+        # 3) Challenge
         body = "Anmeldung erforderlich (Domänen-Konto).\n".encode("utf-8")
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="%s"' % AUTH_REALM)
@@ -960,6 +1053,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        ck = getattr(self, "_auth_cookie", None)
+        if ck:
+            secure = "; Secure" if CERT_PATH else ""
+            self.send_header("Set-Cookie", "%s=%s; Max-Age=%d; Path=/; HttpOnly; SameSite=Lax%s"
+                             % (AUTH_COOKIE, ck, AUTH_COOKIE_DAYS * 86400, secure))
         self.end_headers()
         try:
             self.wfile.write(body)

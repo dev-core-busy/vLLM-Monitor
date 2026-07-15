@@ -20,3 +20,4 @@ vllm_monitor.conf
 __pycache__/
 *.pyc
 targets.json
+.auth_secret
