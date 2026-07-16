@@ -4,6 +4,21 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.18.2] – 2026-07-16
+
+### Neu
+- **Instanzen-Tabelle sortierbar** – Klick auf jeden Spaltenkopf (Status, Typ,
+  Instanz, Modell, Version, Kapazität, max_model_len, gpu_mem, Prefix-Cache)
+  sortiert; erneuter Klick dreht die Richtung, Pfeil-Indikator (wie bei der
+  Alarm-Historie).
+
+### Behoben
+- Die Token-Diagramme in „Effizienz & Kapazität" füllen ihren **Rahmen jetzt
+  bündig** (globale Canvas-Höhendeckelung `--card-h` wird für diese Diagramme
+  aufgehoben) – keine Leerfläche mehr.
+- **Einklappen** der Karte „Effizienz & Kapazität" versteckt jetzt auch die
+  Token-Diagramme (vorher blieben sie sichtbar).
+
 ## [0.18.1] – 2026-07-16
 
 ### Geändert

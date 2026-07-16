@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.18.1"
+__version__ = "0.18.2"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -1958,8 +1958,9 @@ PAGE = r"""<!DOCTYPE html>
   .metric.warn b{color:var(--warn);} .metric.bad b{color:var(--bad);}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(var(--tile-min),1fr));gap:14px;padding:14px 16px;}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;position:relative;}
-  .tokbox{border:1px solid var(--border);border-radius:10px;padding:12px 14px;height:277px;}
-  .tokbox>div{position:relative;height:100%;}
+  .tokbox{border:1px solid var(--border);border-radius:10px;padding:12px 14px;}
+  .tokbox>div{position:relative;height:250px;}
+  #efftok canvas{max-height:none!important;}   /* globale Kachel-Deckelung hier aufheben */
   .card h2{font-size:12px;margin:0 0 6px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;}
   .cardbtns{position:absolute;top:5px;right:7px;display:flex;gap:3px;z-index:6;}
   .cbtn{background:var(--panel);border:1px solid var(--border);color:var(--muted);border-radius:5px;
@@ -1970,9 +1971,9 @@ PAGE = r"""<!DOCTYPE html>
     box-shadow:0 0 0 100vmax rgba(0,0,0,.55);}
   .card.maximized canvas{max-height:calc(100vh - 90px);}
   .cbtn.analyze:hover{color:var(--accent);border-color:var(--accent);}
-  #alerttable th[data-col]{cursor:pointer;user-select:none;white-space:nowrap;}
-  #alerttable th[data-col]:hover{color:var(--fg);}
-  #alerttable th[data-col] .sarrow{color:var(--accent);font-size:10px;margin-left:3px;}
+  #alerttable th[data-col],#insttable th[data-col]{cursor:pointer;user-select:none;white-space:nowrap;}
+  #alerttable th[data-col]:hover,#insttable th[data-col]:hover{color:var(--fg);}
+  #alerttable th[data-col] .sarrow,#insttable th[data-col] .sarrow{color:var(--accent);font-size:10px;margin-left:3px;}
   /* Analyse-Overlay */
   #analysis{position:fixed;inset:0;z-index:3000;display:none;background:rgba(0,0,0,.6);
     padding:24px;overflow:auto;}
@@ -2003,7 +2004,7 @@ PAGE = r"""<!DOCTYPE html>
   #chartcard #legend{padding:8px 0 0;}
   #instcard.collapsed #insttable{display:none;}
   #alertcard.collapsed #alerttable{display:none;}
-  #effcard.collapsed #effbody{display:none!important;}
+  #effcard.collapsed #effbody,#effcard.collapsed #efftok{display:none!important;}
   .ev-raised{color:var(--bad);} .ev-cleared{color:var(--ok);}
   .ev-crit{font-weight:600;}
   .evbadge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;border:1px solid var(--border);}
@@ -2195,8 +2196,8 @@ PAGE = r"""<!DOCTYPE html>
   <div class="cardbtns"><button class="cbtn" id="insttoggle" title="Ein-/Ausklappen">▾</button></div>
   <h2><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Instanzen</h2>
   <table id="insttable"><thead><tr>
-    <th>Status</th><th>Typ</th><th>Instanz</th><th>Modell</th><th>Version</th>
-    <th>KV-Kap. / VRAM</th><th>max_model_len</th><th>gpu_mem</th><th>Prefix-Cache</th>
+    <th data-col="status">Status</th><th data-col="kind">Typ</th><th data-col="inst">Instanz</th><th data-col="model">Modell</th><th data-col="version">Version</th>
+    <th data-col="cap">KV-Kap. / VRAM</th><th data-col="maxlen">max_model_len</th><th data-col="gpumem">gpu_mem</th><th data-col="prefix">Prefix-Cache</th>
   </tr></thead><tbody></tbody></table>
 </div>
 
@@ -2809,11 +2810,36 @@ function renderKPIs(){
   window._alerts=alerts;maybeNotify(alerts);
 }
 
+let _instSort={col:"inst",dir:1};   // Default: nach Instanz (Host:Port) aufsteigend
+function instKey(i,col){
+  switch(col){
+    case "status": return i.online?1:0;
+    case "kind":   return i.kind||"vllm";
+    case "inst":   return (i.host||"")+":"+String(i.port==null?"":i.port).padStart(6,"0");
+    case "model":  return shortModel(i.model||"");
+    case "version":return i.version||"";
+    case "cap":    return i.capacity_tokens||i.vram_bytes||0;
+    case "maxlen": return i.max_model_len||0;
+    case "gpumem": return i.gpu_memory_utilization!=null?i.gpu_memory_utilization:-1;
+    case "prefix": return i.enable_prefix_caching==="True"?1:0;
+  }
+  return "";
+}
 function renderInstances(){
   const tb=document.querySelector("#insttable tbody");tb.innerHTML="";
   if(!lastConfig)return;
-  lastConfig.instances.forEach(i=>{
-    if(hostFilter && i.host!==hostFilter)return;
+  // Sortier-Pfeile in den Kopfzellen
+  document.querySelectorAll("#insttable th[data-col]").forEach(th=>{
+    const a=th.getAttribute("data-col")===_instSort.col?(_instSort.dir>0?"▲":"▼"):"";
+    th.innerHTML=th.textContent.replace(/[ ▲▼]+$/,"")+(a?'<span class="sarrow">'+a+'</span>':"");
+  });
+  const list=lastConfig.instances.filter(i=>!(hostFilter && i.host!==hostFilter)).slice();
+  const col=_instSort.col, dir=_instSort.dir;
+  list.sort((a,b)=>{ const ka=instKey(a,col), kb=instKey(b,col);
+    let c=(typeof ka==="number"&&typeof kb==="number")?ka-kb:String(ka).localeCompare(String(kb),"de");
+    if(c===0) c=instKey(a,"inst").localeCompare(instKey(b,"inst"),"de");
+    return c*dir; });
+  list.forEach(i=>{
     const tr=document.createElement("tr");
     let capcell="–";
     if(i.capacity_tokens){capcell=Math.round(i.capacity_tokens).toLocaleString("de-DE")+" Tok"
@@ -2830,6 +2856,12 @@ function renderInstances(){
     tb.appendChild(tr);
   });
 }
+document.querySelectorAll("#insttable th[data-col]").forEach(th=>th.onclick=()=>{
+  const col=th.getAttribute("data-col");
+  if(_instSort.col===col) _instSort.dir*=-1;
+  else _instSort={col, dir:1};
+  renderInstances();
+});
 
 function applySeries(j){
   if(j.error){document.getElementById("status").textContent=j.error;return;}
