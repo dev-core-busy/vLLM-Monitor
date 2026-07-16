@@ -2,6 +2,7 @@
 vllm_metrics.db
 *.db-wal
 *.db-shm
+*.db-journal
 *.log
 reports/
 

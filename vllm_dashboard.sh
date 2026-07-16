@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -359,6 +359,61 @@ def build_config():
             "thresholds": load_thresholds(), "collector": collector}
 
 
+_tokens_cache = None      # (erzeugt_ts, ergebnis) – teure Volltabellen-Aggregation cachen
+
+
+def build_tokens():
+    """Generierte Tokens **pro Kalendertag** seit Aufzeichnungsbeginn, je Modell.
+    Aus den kumulativen Countern über positive Deltas gebildet (Counter-Resets
+    beim Server-Neustart werden verworfen). Ergebnis 60 s gecacht."""
+    global _tokens_cache
+    now = time.time()
+    if _tokens_cache and now - _tokens_cache[0] < 60:
+        return _tokens_cache[1]
+    if not os.path.exists(DB_PATH):
+        return {"days": [], "models": []}
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT ts, host, port, model, generation_tokens_total AS g, prompt_tokens_total AS p "
+        "FROM samples WHERE generation_tokens_total IS NOT NULL "
+        "ORDER BY host, port, model, ts").fetchall()
+    conn.close()
+
+    import datetime
+    days = {}                 # 'YYYY-MM-DD' -> {model: gen, '_prompt': prompt}
+    models = set()
+    prev = None
+    prevkey = None
+    for r in rows:
+        key = (r["host"], r["port"], r["model"])
+        if key == prevkey and prev is not None:
+            dg = (r["g"] or 0) - (prev["g"] or 0)
+            dp = (r["p"] or 0) - (prev["p"] or 0)
+            if dg < 0:
+                dg = 0        # Counter-Reset (Neustart)
+            if dp < 0:
+                dp = 0
+            if dg or dp:
+                d = datetime.date.fromtimestamp(r["ts"]).isoformat()
+                b = days.setdefault(d, {"models": {}, "prompt": 0})
+                if dg:
+                    b["models"][r["model"]] = b["models"].get(r["model"], 0) + dg
+                    models.add(r["model"])
+                b["prompt"] += dp
+        prev = r
+        prevkey = key
+
+    out = []
+    for d in sorted(days.keys()):
+        b = days[d]
+        gen = sum(b["models"].values())
+        out.append({"date": d, "models": {m: round(v) for m, v in b["models"].items()},
+                    "gen": round(gen), "prompt": round(b["prompt"])})
+    res = {"days": out, "models": sorted(models)}
+    _tokens_cache = (now, res)
+    return res
+
+
 def build_alerts(limit=100):
     """Letzte Alarm-Ereignisse (Historie) aus der events-Tabelle."""
     if not os.path.exists(DB_PATH):
@@ -366,17 +421,43 @@ def build_alerts(limit=100):
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT ts,host,port,model,kind,state,severity,value,message "
+            "SELECT id,ts,host,port,model,kind,state,severity,value,message "
             "FROM events ORDER BY ts DESC, id DESC LIMIT ?", (int(limit),)).fetchall()
     except sqlite3.OperationalError:
         conn.close()
         return {"events": []}   # Tabelle noch nicht vorhanden (alter Collector)
     conn.close()
-    ev = [{"ts": r["ts"] * 1000, "host": r["host"], "port": r["port"],
+    ev = [{"id": r["id"], "ts": r["ts"] * 1000, "host": r["host"], "port": r["port"],
            "model": r["model"], "kind": r["kind"], "state": r["state"],
            "severity": r["severity"], "value": r["value"], "message": r["message"]}
           for r in rows]
     return {"events": ev, "now": int(time.time()) * 1000}
+
+
+def del_alert(eid):
+    """Einzelnes Alarm-Ereignis aus der Historie löschen (Admin)."""
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM events WHERE id=?", (int(eid),))
+        conn.commit()
+    except (sqlite3.OperationalError, ValueError, TypeError):
+        conn.close()
+        return {"error": "konnte nicht löschen"}
+    conn.close()
+    return {"ok": True}
+
+
+def clear_alerts():
+    """Gesamte Alarm-Historie leeren (Admin)."""
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM events")
+        conn.commit()
+    except sqlite3.OperationalError:
+        conn.close()
+        return {"error": "konnte nicht leeren"}
+    conn.close()
+    return {"ok": True}
 
 
 def _ensure_annotations(conn):
@@ -1608,6 +1689,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(build_series(_range_from(qs), off))
         elif parsed.path == "/api/config":
             self._json(build_config())
+        elif parsed.path == "/api/tokens":
+            self._json(build_tokens())
         elif parsed.path == "/api/alerts":
             try:
                 lim = int(qs.get("limit", ["100"])[0])
@@ -1744,6 +1827,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(del_target(qs["id"][0]))
         elif parsed.path == "/api/users" and "username" in qs:
             self._json(users_delete(qs["username"][0], qs.get("kind", ["local"])[0]))
+        elif parsed.path == "/api/alerts":
+            if "id" in qs:
+                self._json(del_alert(qs["id"][0]))
+            else:
+                self._json(clear_alerts())
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -1880,6 +1968,9 @@ PAGE = r"""<!DOCTYPE html>
     box-shadow:0 0 0 100vmax rgba(0,0,0,.55);}
   .card.maximized canvas{max-height:calc(100vh - 90px);}
   .cbtn.analyze:hover{color:var(--accent);border-color:var(--accent);}
+  #alerttable th[data-col]{cursor:pointer;user-select:none;white-space:nowrap;}
+  #alerttable th[data-col]:hover{color:var(--fg);}
+  #alerttable th[data-col] .sarrow{color:var(--accent);font-size:10px;margin-left:3px;}
   /* Analyse-Overlay */
   #analysis{position:fixed;inset:0;z-index:3000;display:none;background:rgba(0,0,0,.6);
     padding:24px;overflow:auto;}
@@ -2109,9 +2200,10 @@ PAGE = r"""<!DOCTYPE html>
 
 <div class="card collapsed" id="alertcard" data-id="alerts" style="margin:14px 16px 0">
   <div class="cardbtns"><button class="cbtn" id="alerttoggle" title="Ein-/Ausklappen">▸</button></div>
-  <h2><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Alarm-Historie <span id="alertcount" style="color:var(--muted);font-weight:400"></span></h2>
+  <h2><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Alarm-Historie <span id="alertcount" style="color:var(--muted);font-weight:400"></span>
+    <button id="alertclear" class="adminonly" title="Gesamte Alarm-Historie leeren (nur Admins)" style="margin-left:10px;font-weight:400;font-size:12px">🗑 Leeren</button></h2>
   <table id="alerttable"><thead><tr>
-    <th>Zeit</th><th>Status</th><th>Typ</th><th>Instanz / Modell</th><th>Meldung</th>
+    <th data-col="ts">Zeit</th><th data-col="state">Status</th><th data-col="kind">Typ</th><th data-col="who">Instanz / Modell</th><th data-col="message">Meldung</th><th class="adminonly"></th>
   </tr></thead><tbody></tbody></table>
 </div>
 
@@ -2119,6 +2211,16 @@ PAGE = r"""<!DOCTYPE html>
   <div class="cardbtns"><button class="cbtn" id="efftoggle" title="Ein-/Ausklappen">▸</button></div>
   <h2><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Effizienz & Kapazität <span style="color:var(--muted);font-weight:400;font-size:11px">(Ø über Zeitfenster, hochgerechnet)</span></h2>
   <div id="effbody" style="display:flex;flex-wrap:wrap;gap:18px;padding-top:4px"></div>
+  <div id="efftok" style="padding-top:14px;display:flex;flex-direction:column;gap:22px">
+    <div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Generierte Tokens im gewählten Zeitraum (je Modell)</div>
+      <div style="position:relative;height:230px"><canvas id="rangetokchart"></canvas></div>
+    </div>
+    <div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Generierte Tokens pro Tag – seit Aufzeichnungsbeginn (je Modell gestapelt)</div>
+      <div style="position:relative;height:230px"><canvas id="tokchart"></canvas></div>
+    </div>
+  </div>
 </div>
 
 <div class="card" id="chartcard" data-id="chart" style="margin:14px 16px 0">
@@ -2744,11 +2846,13 @@ function applySeries(j){
 function renderCollector(){
   const el=document.getElementById("collstat"); if(!el)return;
   const c=lastConfig&&lastConfig.collector;
-  if(!c){ el.textContent=""; return; }
-  const dot='<span class="dot '+(c.ok?"on":"off")+'" style="margin-right:4px"></span>';
-  el.innerHTML=dot+(c.ok?("Collector aktiv · "+durTxt(c.age)):("Collector inaktiv – letzter Scrape vor "+durTxt(c.age)))
+  // Im Normalfall nichts anzeigen (der Refresh-Zähler rechts zeigt die Frische);
+  // nur warnen, wenn der Collector hängt/aus ist – das erkennt sonst niemand.
+  if(!c || c.ok){ el.innerHTML=""; return; }
+  el.innerHTML='<span class="dot off" style="margin-right:4px"></span>'
+    +"Collector inaktiv – letzter Scrape vor "+durTxt(c.age)
     +(c.errors?(" · "+c.errors+" Fehler"):"");
-  el.style.color = c.ok?"var(--muted)":"var(--bad)";
+  el.style.color="var(--bad)";
 }
 async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderHostFilter();renderInstances();renderKPIs();renderCollector();}catch(e){}}
 async function fetchOnce(){try{applySeries(await(await fetch("/api/series?"+seriesQuery())).json());}catch(e){document.getElementById("status").textContent="Fehler: "+e;}}
@@ -2839,9 +2943,9 @@ function exportCSV(){
 function notifyAvailable(){return (typeof window.Notification!=="undefined" && !!window.Notification
   && typeof window.Notification.requestPermission==="function");}
 function maybeNotify(alerts){
-  if(!alerts.length||!notifyAvailable()||Notification.permission!=="granted")return;
+  if(!window._notifOn||!alerts.length||!notifyAvailable()||Notification.permission!=="granted")return;
   const key=alerts.join("|");if(key===window._lastNotifKey)return;window._lastNotifKey=key;
-  try{new Notification("vLLM Monitor – Warnung",{body:alerts.join("\n")});}catch(e){}
+  try{new Notification("KI Monitor – Warnung",{body:alerts.join("\n")});}catch(e){}
 }
 
 // --- Theme ---
@@ -2849,7 +2953,14 @@ function applyTheme(t){document.body.dataset.theme=t;store.set("vllm_theme",t);
   // Chart-Farben neu setzen
   Object.values(charts).forEach(c=>{c.options.scales.x.ticks.color=css("--muted");c.options.scales.x.grid.color=css("--grid");
     c.options.scales.y.ticks.color=css("--muted");c.options.scales.y.grid.color=css("--grid");
-    c.update();});}
+    c.update();});
+  if(tokChart){ tokChart.options.scales.x.ticks.color=css("--muted");
+    tokChart.options.scales.y.ticks.color=css("--muted"); tokChart.options.scales.y.grid.color=css("--grid");
+    if(tokChart.options.plugins.legend.labels) tokChart.options.plugins.legend.labels.color=css("--muted");
+    if(lastTokens) renderTokenChart(lastTokens); else tokChart.update(); }
+  if(rangeTokChart){ rangeTokChart.options.scales.x.ticks.color=css("--muted");
+    rangeTokChart.options.scales.y.ticks.color=css("--muted"); rangeTokChart.options.scales.y.grid.color=css("--grid");
+    renderRangeTokenChart(); }}
 
 // --- Init ---
 function buildGrid(){
@@ -3107,6 +3218,7 @@ document.getElementById("an_copy").onclick=()=>{
   if(navigator.clipboard)navigator.clipboard.writeText(txt).catch(()=>{});
 };
 
+let tokChart=null, rangeTokChart=null, lastTokens=null, _tokTs=0;   // früh deklariert (applyTheme greift darauf zu)
 buildGrid();
 applyTheme(store.get("vllm_theme")||"dark");
 // Anomalie-Marker in allen Diagrammen (Umschalter, Zustand im Cookie)
@@ -3274,13 +3386,35 @@ document.getElementById("restore").onclick=()=>{ saveHidden([]); applyHidden(); 
   at.onclick=()=>{ store.set("vllm_alert_collapsed", ac.classList.toggle("collapsed")?"1":"0"); sync(); };
 })();
 const EV_LABEL={offline:"Offline",kv:"KV-Cache",temp:"GPU-Temp",error:"Fehler"};
+let lastAlerts=[], _alertSort={col:"ts",dir:-1};   // Default: neueste zuerst
+function alertKey(e,col){
+  if(col==="ts")   return e.ts;
+  if(col==="state")return e.state||"";
+  if(col==="kind") return EV_LABEL[e.kind]||e.kind||"";
+  if(col==="who")  return e.model?shortModel(e.model):("Port "+(e.port||""));
+  if(col==="message")return e.message||"";
+  return "";
+}
 function renderAlerts(j){
+  lastAlerts=(j&&j.events)||[];
+  drawAlerts();
+}
+function drawAlerts(){
   const tb=document.querySelector("#alerttable tbody"); if(!tb)return;
-  const ev=(j&&j.events)||[]; tb.innerHTML="";
   const cnt=document.getElementById("alertcount");
-  const active=ev.filter(e=>e.state==="raised").length;
-  if(cnt) cnt.textContent = ev.length ? "· "+ev.length+" Ereignisse" : "· keine";
-  if(!ev.length){ tb.innerHTML='<tr><td colspan="5" class="placeholder">Noch keine Alarm-Ereignisse.</td></tr>'; return; }
+  if(cnt) cnt.textContent = lastAlerts.length ? "· "+lastAlerts.length+" Ereignisse" : "· keine";
+  // Sortier-Pfeile in den Kopfzellen aktualisieren
+  document.querySelectorAll("#alerttable th[data-col]").forEach(th=>{
+    const a=th.getAttribute("data-col")===_alertSort.col?(_alertSort.dir>0?" ▲":" ▼"):"";
+    th.innerHTML=th.textContent.replace(/[ ▲▼]+$/,"")+(a?'<span class="sarrow">'+a.trim()+'</span>':"");
+  });
+  tb.innerHTML="";
+  if(!lastAlerts.length){ tb.innerHTML='<tr><td colspan="6" class="placeholder">Noch keine Alarm-Ereignisse.</td></tr>'; return; }
+  const ev=lastAlerts.slice(), col=_alertSort.col, dir=_alertSort.dir;
+  ev.sort((a,b)=>{ const ka=alertKey(a,col), kb=alertKey(b,col);
+    let c = (typeof ka==="number"&&typeof kb==="number") ? ka-kb : String(ka).localeCompare(String(kb),"de");
+    if(c===0) c=a.ts-b.ts;   // stabiler Zweitschlüssel
+    return c*dir; });
   ev.forEach(e=>{
     const t=new Date(e.ts).toLocaleString("de-DE");
     const stCls="ev-"+e.state+(e.severity==="crit"?" ev-crit":"");
@@ -3288,9 +3422,27 @@ function renderAlerts(j){
     const who=(e.model?shortModel(e.model):("Port "+e.port));
     tb.innerHTML+=`<tr><td>${t}</td><td class="${stCls}">${stTxt}</td>`+
       `<td><span class="evbadge">${EV_LABEL[e.kind]||e.kind}</span></td>`+
-      `<td>${who}</td><td>${e.message||""}</td></tr>`;
+      `<td>${who}</td><td>${e.message||""}</td>`+
+      `<td class="adminonly" style="text-align:right"><button class="cbtn adel" data-id="${e.id}" title="Diesen Eintrag löschen">✕</button></td></tr>`;
   });
+  tb.querySelectorAll("button.adel").forEach(b=>b.onclick=()=>delAlert(b.getAttribute("data-id")));
 }
+document.querySelectorAll("#alerttable th[data-col]").forEach(th=>th.onclick=()=>{
+  const col=th.getAttribute("data-col");
+  if(_alertSort.col===col) _alertSort.dir*=-1;
+  else _alertSort={col, dir: col==="ts"?-1:1};   // Text aufsteigend, Zeit absteigend
+  drawAlerts();
+});
+async function delAlert(id){
+  try{ await fetch("/api/alerts?id="+encodeURIComponent(id),{method:"DELETE"}); }catch(e){}
+  fetchAlerts();
+}
+async function clearAlerts(){
+  if(!confirm("Gesamte Alarm-Historie unwiderruflich leeren?"))return;
+  try{ await fetch("/api/alerts",{method:"DELETE"}); }catch(e){}
+  fetchAlerts();
+}
+document.getElementById("alertclear").onclick=(e)=>{ e.stopPropagation(); clearAlerts(); };
 async function fetchAlerts(){try{renderAlerts(await(await fetch("/api/alerts?limit=100")).json());}catch(e){}}
 // --- Zeitachsen-Annotationen (Deploy/Restart …) ---
 async function fetchAnnotations(){
@@ -3313,7 +3465,9 @@ async function delAnnotation(id){
   const sync=()=>{ et.textContent = ec.classList.contains("collapsed") ? "▸" : "▾"; };
   if(store.get("vllm_eff_collapsed")!=="0") ec.classList.add("collapsed"); else ec.classList.remove("collapsed");
   sync();
-  et.onclick=()=>{ store.set("vllm_eff_collapsed", ec.classList.toggle("collapsed")?"1":"0"); sync(); };
+  et.onclick=()=>{ const collapsed=ec.classList.toggle("collapsed"); store.set("vllm_eff_collapsed", collapsed?"1":"0"); sync();
+    if(!collapsed){ fetchTokens(true); renderRangeTokenChart();
+      setTimeout(()=>{ try{ tokChart&&tokChart.resize(); rangeTokChart&&rangeTokChart.resize(); }catch(e){} },60); } };
 })();
 function avgField(series,key){ let s=0,n=0; series.forEach(p=>{const v=p[key]; if(v!=null&&!isNaN(v)){s+=v;n++;}}); return n?s/n:null; }
 function fmtBig(v){ if(v==null)return "–"; const a=Math.abs(v);
@@ -3330,6 +3484,7 @@ function renderEfficiency(){
   });
   const M=(v,l)=>'<div class="metric"><b>'+v+'</b>'+l+'</div>';
   let h="";
+  h+=M(fmtBig(tokensInRange()),"Tokens im Zeitraum");
   h+=M(fmtBig(totTps*86400),"Tokens/Tag (gesamt)");
   h+=M(num(totTps,1),"gen tok/s Ø (gesamt)");
   if(gpuUtil!=null) h+=M(num(gpuUtil,0)+" %","GPU-Auslastung Ø");
@@ -3337,33 +3492,106 @@ function renderEfficiency(){
   if(gpuPow!=null) h+=M(num(gpuPow,0)+" W","GPU-Leistung Ø");
   if(gpuPow) h+=M(num(totTps/gpuPow,2),"tok/s pro Watt");
   body.innerHTML=h||'<span class="placeholder">Keine Daten.</span>';
+  renderRangeTokenChart();
+  fetchTokens();
 }
-document.getElementById("notif").onclick=()=>{
-  const st=document.getElementById("status");
-  const say=t=>{ if(st)st.textContent=t; };
-  // Notifications brauchen einen sicheren Kontext (HTTPS oder http://localhost).
+// Tokens im aktuell gewählten Zeitfenster – je Modell (Integration von gen tok/s über die Zeit)
+function tokensPerModelRange(){
+  const out={}; if(!lastData)return out;
+  Object.entries(lastData.models).forEach(([m,s])=>{ let t=0;
+    for(let i=1;i<s.length;i++){ const dt=(s[i].t-s[i-1].t)/1000, r=s[i].gen_tps;
+      if(r!=null&&dt>0&&dt<3600) t+=r*dt; }
+    if(t>0) out[m]=t; });
+  return out;
+}
+function tokensInRange(){ let tot=0; const p=tokensPerModelRange(); for(const m in p) tot+=p[m]; return tot; }
+// Diagramm (a): generierte Tokens je Modell im gewählten Zeitraum
+function renderRangeTokenChart(){
+  const cv=document.getElementById("rangetokchart"); if(!cv)return;
+  const per=tokensPerModelRange(), models=Object.keys(per);
+  const labels=models.map(shortModel), data=models.map(m=>per[m]), colors=models.map(m=>colorFor(m));
+  if(!rangeTokChart){
+    rangeTokChart=new Chart(cv,{type:"bar",data:{labels,datasets:[{data,backgroundColor:colors,borderWidth:0,borderRadius:2}]},
+      options:{animation:false,responsive:true,maintainAspectRatio:false,
+        scales:{x:{ticks:{color:css("--muted"),maxRotation:0,autoSkip:false},grid:{display:false}},
+                y:{beginAtZero:true,ticks:{color:css("--muted"),callback:v=>fmtBig(v)},grid:{color:css("--grid")}}},
+        plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>fmtBig(c.parsed.y)+" Tok"}}}}});
+  } else {
+    rangeTokChart.data.labels=labels; rangeTokChart.data.datasets[0].data=data;
+    rangeTokChart.data.datasets[0].backgroundColor=colors; rangeTokChart.update();
+  }
+}
+// Balkendiagramm: generierte Tokens pro Tag seit Aufzeichnungsbeginn (je Modell gestapelt)
+async function fetchTokens(force){
+  const now=Date.now();
+  if(!force && now-_tokTs<55000) return;   // deckt sich mit dem 60-s-Server-Cache
+  _tokTs=now;
+  try{ lastTokens=await(await fetch("/api/tokens")).json(); renderTokenChart(lastTokens); }catch(e){}
+}
+function renderTokenChart(data){
+  const cv=document.getElementById("tokchart"); if(!cv||!data)return;
+  const days=data.days||[], models=data.models||[];
+  const labels=days.map(d=>d.date);
+  const dsets=(models.length?models:["gen"]).map(m=>({
+    label: models.length?shortModel(m):"Tokens",
+    data: days.map(d=> models.length ? (d.models[m]||0) : d.gen),
+    backgroundColor: models.length?colorFor(m):css("--accent"),
+    stack:"t", borderWidth:0, borderRadius:2 }));
+  if(!tokChart){
+    tokChart=new Chart(cv,{type:"bar",data:{labels,datasets:dsets},
+      options:{animation:false,responsive:true,maintainAspectRatio:false,
+        scales:{x:{stacked:true,ticks:{color:css("--muted"),maxRotation:0,autoSkip:true,maxTicksLimit:14},grid:{display:false}},
+                y:{stacked:true,beginAtZero:true,ticks:{color:css("--muted"),callback:v=>fmtBig(v)},grid:{color:css("--grid")}}},
+        plugins:{legend:{display:models.length>1,labels:{color:css("--muted"),boxWidth:10,font:{size:10}}},
+          tooltip:{callbacks:{label:c=>c.dataset.label+": "+fmtBig(c.parsed.y)+" Tok"}}}}});
+  } else {
+    tokChart.data.labels=labels; tokChart.data.datasets=dsets;
+    tokChart.options.plugins.legend.display=models.length>1; tokChart.update();
+  }
+}
+window._notifOn = store.get("vllm_notif")==="1";
+function syncNotifBtn(){
+  const b=document.getElementById("notif"); if(!b)return;
+  const on = window._notifOn && notifyAvailable() && Notification.permission==="granted";
+  b.textContent = on ? "🔔" : "🔕";
+  b.title = on ? "Browser-Benachrichtigungen aktiv – klicken zum Deaktivieren"
+              : "Browser-Benachrichtigungen bei Warnungen (KV-Cache, Fehler, offline) aktivieren";
+  b.classList.toggle("activebtn", on);
+}
+function enableNotif(){
+  const st=document.getElementById("status"); const say=t=>{ if(st)st.textContent=t; };
   if(!window.isSecureContext || !notifyAvailable()){
     alert("Browser-Benachrichtigungen brauchen einen sicheren Kontext (HTTPS oder http://localhost).\n\n"+
-          "Du rufst das Dashboard über http://"+location.hostname+" auf – dort lässt der Browser sie nicht zu "+
-          "(deshalb 'nicht erlaubt').\n\nAlternativen: das Dashboard per HTTPS bereitstellen, oder direkt auf der "+
-          "Maschine über http://localhost:"+location.port+" öffnen.\n\nDie farbigen Alarm-Rahmen an den Kacheln "+
-          "funktionieren unabhängig davon.");
+          "Du rufst das Dashboard über http://"+location.hostname+" auf – dort lässt der Browser sie nicht zu.\n\n"+
+          "Alternativen: das Dashboard per HTTPS bereitstellen, oder direkt auf der Maschine über "+
+          "http://localhost:"+location.port+" öffnen.\n\nDie farbigen Alarm-Rahmen an den Kacheln funktionieren unabhängig davon.");
     say("Benachrichtigungen über http://"+location.hostname+" nicht möglich (nur HTTPS/localhost).");
     return;
   }
-  if(Notification.permission==="granted"){ say("Benachrichtigungen sind bereits aktiv."); alert("Benachrichtigungen sind bereits aktiv."); return; }
   if(Notification.permission==="denied"){
     alert("Benachrichtigungen sind im Browser für diese Seite blockiert.\n\nBitte über das Schloss-/Info-Symbol "+
           "in der Adressleiste unter 'Benachrichtigungen' auf 'Zulassen' setzen.");
     say("Benachrichtigungen im Browser blockiert – bitte in den Seiteneinstellungen erlauben."); return;
   }
+  if(Notification.permission==="granted"){
+    window._notifOn=true; store.set("vllm_notif","1"); say("Benachrichtigungen aktiviert."); syncNotifBtn(); return;
+  }
   Notification.requestPermission().then(p=>{
-    if(p==="granted"){ say("Benachrichtigungen aktiviert.");
-      try{new Notification("vLLM Monitor",{body:"Benachrichtigungen sind jetzt aktiv."});}catch(e){}
-      alert("Benachrichtigungen aktiviert."); }
-    else { say("Benachrichtigungen: "+p); alert("Benachrichtigungen wurden nicht erlaubt ("+p+")."); }
+    if(p==="granted"){ window._notifOn=true; store.set("vllm_notif","1"); say("Benachrichtigungen aktiviert.");
+      try{new Notification("KI Monitor",{body:"Benachrichtigungen sind jetzt aktiv."});}catch(e){} }
+    else { say("Benachrichtigungen wurden nicht erlaubt ("+p+")."); }
+    syncNotifBtn();
   });
+}
+function disableNotif(){
+  window._notifOn=false; store.set("vllm_notif","0"); syncNotifBtn();
+  const st=document.getElementById("status"); if(st) st.textContent="Benachrichtigungen deaktiviert.";
+}
+document.getElementById("notif").onclick=()=>{
+  if(window._notifOn && notifyAvailable() && Notification.permission==="granted") disableNotif();
+  else enableNotif();
 };
+syncNotifBtn();
 // Zuletzt gewählten Zeitraum + Vergleich aus dem Cookie wiederherstellen
 (function(){
   const saved=store.get("vllm_range"), sel=document.getElementById("range");

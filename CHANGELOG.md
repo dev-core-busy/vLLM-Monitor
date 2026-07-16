@@ -4,6 +4,38 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.18.0] – 2026-07-16
+
+### Neu
+- **Token-Auswertung als Diagramme** in „Effizienz & Kapazität" (untereinander):
+  (a) **generierte Tokens im gewählten Zeitraum je Modell** (aus den Serien
+  integriert) und (b) **generierte Tokens pro Tag seit Aufzeichnungsbeginn**
+  (gestapelt je Modell, aus den kumulativen Countern als Tages-Deltas mit
+  Reset-Behandlung, 60 s server-seitig gecacht). Neuer Endpunkt
+  `GET /api/tokens`.
+- **Benachrichtigungen als Umschalter:** Die 🔔/🔕-Schaltfläche aktiviert **und
+  deaktiviert** Browser-Benachrichtigungen; Zustand im Cookie (`vllm_notif`).
+- **Alarm-Historie verwaltbar (nur Admins):** einzelne Einträge löschen (✕) und
+  gesamte Historie leeren (🗑) – im Frontend rollenabhängig sichtbar, server-
+  seitig erzwungen (`DELETE /api/alerts[?id=…]`). Zusätzlich sind die **Spalten
+  sortierbar** (Klick auf den Kopf, Pfeil-Indikator).
+
+### Geändert
+- **Collector-Status** wird im Header nur noch **bei Problemen** angezeigt (rote
+  Warnung „Collector inaktiv …") statt als Dauer-Pille – die Aktualität zeigt der
+  Refresh-Zähler rechts.
+
+### Behoben / Robustheit
+- **Kein Rot/Grün-Flackern mehr** durch langsame Ollama-Hosts: Die Generierungs-
+  Probe läuft nur noch gegen **bereits geladene** Modelle (kein selbst ausgelöster
+  Kalt-Load eines großen Modells, der den ganzen Scrape-Loop blockierte), mit
+  begrenztem Timeout (`VLLM_OLLAMA_PROBE_TIMEOUT`, 15 s). Erreichbarkeits-/Meta-
+  Aufrufe für Ollama/STT nutzen einen kurzen Timeout (`VLLM_OLLAMA_TIMEOUT`, 3 s),
+  damit ein toter Host den Sammler nicht ausbremst.
+- **Offline-Entprellung** (`VLLM_OFFLINE_GRACE`, 60 s): Eine Instanz wird erst nach
+  anhaltender Nichterreichbarkeit als offline markiert – kurze Netz-/Lastspitzen
+  führen nicht mehr zu sofortigem „offline".
+
 ## [0.17.0] – 2026-07-16
 
 ### Neu

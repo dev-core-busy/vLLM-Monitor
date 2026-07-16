@@ -34,7 +34,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -74,6 +74,13 @@ TARGETS = _parse_targets(os.environ.get("VLLM_TARGETS", "8000:default"))
 INTERVAL = int(os.environ.get("VLLM_INTERVAL", "15"))
 RETENTION_DAYS = int(os.environ.get("VLLM_RETENTION_DAYS", "30"))
 HTTP_TIMEOUT = float(os.environ.get("VLLM_HTTP_TIMEOUT", "15"))
+# Kurzer Timeout für Ollama-/STT-Erreichbarkeitsprüfungen (toter Host darf den
+# Sammler nicht je Scrape ausbremsen).
+OLLAMA_TIMEOUT = float(os.environ.get("VLLM_OLLAMA_TIMEOUT", "3"))
+# Begrenzter Timeout für die Ollama-Generierungs-Probe. Die Probe läuft nur gegen
+# BEREITS geladene Modelle (siehe scrape_ollama), damit kein Kalt-Ladevorgang eines
+# großen Modells den ganzen Scrape-Loop blockiert und alle Instanzen „flackern".
+OLLAMA_PROBE_TIMEOUT = float(os.environ.get("VLLM_OLLAMA_PROBE_TIMEOUT", "15"))
 PURGE_EVERY = 240
 
 # --- Schwellwerte für Alarme (Env = Default; im Dashboard editierbar -> settings.json) ---
@@ -81,6 +88,10 @@ ALERT_KV = float(os.environ.get("VLLM_ALERT_KV", "90"))                    # KV-
 ALERT_TEMP = float(os.environ.get("VLLM_ALERT_TEMP", "85"))               # GPU-Temperatur °C (>)
 ALERT_ERR = float(os.environ.get("VLLM_ALERT_ERR", "0"))                  # neue Fehler je Scrape (>)
 ALERT_OFFLINE_MIN = float(os.environ.get("VLLM_ALERT_OFFLINE_MIN", "1"))  # Minuten offline bis Alarm
+# Entprellung: erst nach so vielen Sekunden ununterbrochener Nichterreichbarkeit
+# wird eine Instanz als offline (up=0) angezeigt – vermeidet Rot/Grün-Flackern bei
+# kurzen Netz-/Lastspitzen (z. B. ausgelasteter Ollama-Host).
+OFFLINE_GRACE = float(os.environ.get("VLLM_OFFLINE_GRACE", "60"))
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -407,8 +418,13 @@ def store_config(conn, host, port, model, cfg):
 
 
 def mark_down(conn, host, port):
-    conn.execute("UPDATE config SET up=0, updated=? WHERE host=? AND port=?",
-                 (int(time.time()), host, port))
+    """Nichterreichbarkeit vermerken – aber up=0 erst nach OFFLINE_GRACE Sekunden
+    ununterbrochener Aussetzer setzen (Entprellung gegen kurzes Flackern)."""
+    ts = int(time.time())
+    since = _down_since.setdefault((host, port), ts)
+    if ts - since >= OFFLINE_GRACE:
+        conn.execute("UPDATE config SET up=0, updated=? WHERE host=? AND port=?",
+                     (ts, host, port))
 
 
 # --- Alarm-Erkennung: nur Zustandswechsel werden als Ereignis protokolliert ---
@@ -622,7 +638,7 @@ def ollama_probe(host, port, model):
     req = request.Request("http://%s:%d/api/generate" % (host, port), data=body,
                           headers={"Content-Type": "application/json"}, method="POST")
     try:
-        resp = request.urlopen(req, timeout=max(HTTP_TIMEOUT, 60))
+        resp = request.urlopen(req, timeout=OLLAMA_PROBE_TIMEOUT)
         d = json.loads(resp.read().decode("utf-8", "replace"))
     except (error.URLError, OSError, ValueError):
         return None
@@ -640,15 +656,18 @@ def ollama_probe(host, port, model):
 
 def scrape_ollama(conn, ts, tgt, verbose=True):
     host, port = tgt["host"], tgt["port"]
-    ver = get_json(host, port, "/api/version")
+    # Kurzer Timeout für die Erreichbarkeits-/Metadaten-Aufrufe, damit ein toter
+    # Host (z. B. Laptop im Standby) den Sammler nicht je Scrape blockiert.
+    ver = get_json(host, port, "/api/version", timeout=OLLAMA_TIMEOUT)
     if ver is None:
         mark_down(conn, host, port)
         if verbose:
             print("  [!] Ollama %s:%d nicht erreichbar." % (host, port))
         return 0
+    _down_since.pop((host, port), None)   # wieder erreichbar -> Entprellung zurücksetzen
     version = ver.get("version")
-    ps = get_json(host, port, "/api/ps") or {}
-    tags = get_json(host, port, "/api/tags") or {}
+    ps = get_json(host, port, "/api/ps", timeout=OLLAMA_TIMEOUT) or {}
+    tags = get_json(host, port, "/api/tags", timeout=OLLAMA_TIMEOUT) or {}
     loaded = ps.get("models") or []
     model, vram = None, None
     if loaded:
@@ -664,7 +683,10 @@ def scrape_ollama(conn, ts, tgt, verbose=True):
     if vram is not None:
         values["vram_bytes"] = float(vram)
 
-    if OLLAMA_PROBE:
+    # Nur proben, wenn tatsächlich ein Modell geladen ist – sonst würde die
+    # Generierung ein großes Modell erst laden (Sekunden bis Minute) und den
+    # gesamten Scrape-Loop blockieren (alle Instanzen „flackern" rot/grün).
+    if OLLAMA_PROBE and loaded:
         pr = ollama_probe(host, port, model)
         if pr:
             acc = _oll_acc.setdefault((host, port, model), _oll_new())
@@ -697,12 +719,13 @@ def scrape_ollama(conn, ts, tgt, verbose=True):
 def scrape_stt(conn, ts, tgt, verbose=True):
     """STT-Server (faster-whisper o.ä.): /health -> Status + aktive Sessions."""
     host, port = tgt["host"], tgt["port"]
-    h = get_json(host, port, "/health")
+    h = get_json(host, port, "/health", timeout=OLLAMA_TIMEOUT)
     if h is None:
         mark_down(conn, host, port)
         if verbose:
             print("  [!] STT %s:%d nicht erreichbar." % (host, port))
         return 0
+    _down_since.pop((host, port), None)   # wieder erreichbar -> Entprellung zurücksetzen
     mp = h.get("modelPath") or ""
     model = os.path.basename(mp) or tgt["label"] or "stt"
     values = {c: None for c in (NUM_COLUMNS + JSON_COLUMNS)}
