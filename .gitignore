@@ -21,3 +21,5 @@ __pycache__/
 *.pyc
 targets.json
 .auth_secret
+auth.json
+settings.json

@@ -66,12 +66,29 @@ paused or removed from the ⚙ menu; they persist in `targets.json`
 the env-defined targets. Dashboard write endpoints: `GET/POST/DELETE
 /api/targets` (auth-guarded).
 
-**Optional LDAP/AD auth:** setting `VLLM_LDAP_HOST` (+ `VLLM_LDAP_DOMAIN`) turns
-on HTTP Basic auth verified via a hand-rolled **LDAP simple bind** (`ldap_
-authenticate()`, BER over a socket — stdlib only, no `ldap3`); `_require_auth()`
-guards every request (page, `/api/*`, `/metrics`) with a short success cache
-(`VLLM_AUTH_TTL`). Login is `user@domain`; empty passwords are rejected. Only
-meaningful with HTTPS. `setup.sh` prompts for DC host + domain.
+**Authentication & user management (always on):** the dashboard now *always*
+requires a login. All accounts, roles and the LDAP config live in **`auth.json`**
+(`VLLM_AUTH_FILE`, next to the DB, 0600, gitignored) — created on first start
+with a default **admin/admin** whose password change is forced at first login
+(`must_change`). Two roles: **admin** (full access + management) and
+**readonly** (view + AI analysis, blocked from all writes/management).
+Local passwords are **PBKDF2-HMAC-SHA256** (`_hash_pw`/`_verify_pw`, stdlib).
+`resolve_login()` checks local users first, then LDAP. Login uses an **HTML
+form** (`/api/login` → signed session cookie carrying user+role+source), not the
+browser Basic-Auth popup; `/api/logout`, `/api/password`, `/api/me` round it out.
+Basic-Auth is still accepted on every request (cookie-less scrapers like
+Prometheus → `_basic_login`, short `VLLM_AUTH_TTL` cache). `_require_auth()`
+guards everything except the page shell and `/api/me`; role/`must_change` are
+enforced on `do_POST`/`do_DELETE`.
+
+**LDAP/AD** is configured in the UI (⚙ → 👥 *Benutzer & Zugriff*), stored in
+`auth.json.ldap`; the `VLLM_LDAP_*` env vars only **seed** it on first creation.
+`ldap_login()` does a hand-rolled **simple bind** and, if an admin/readonly group
+is configured, an **LDAP search for `memberOf`** (BER `SearchRequest`, stdlib) to
+map AD groups → role. Role resolution (`resolve_ad_role`): explicit AD-user entry
+> group mapping (`group_admin`/`group_readonly`) > `default_role`. Admin endpoints:
+`GET/POST/DELETE /api/users`, `POST /api/ldap`, `POST /api/ldap/test`. Only
+meaningful with HTTPS. `setup.sh` no longer prompts for LDAP.
 
 Both files are named `*.sh` but are **Python 3** (shebang `#!/usr/bin/env
 python3`) and use **only the standard library** — no `pip install` needed.

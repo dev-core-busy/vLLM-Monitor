@@ -34,7 +34,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.16.1"
+__version__ = "0.17.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -76,7 +76,7 @@ RETENTION_DAYS = int(os.environ.get("VLLM_RETENTION_DAYS", "30"))
 HTTP_TIMEOUT = float(os.environ.get("VLLM_HTTP_TIMEOUT", "15"))
 PURGE_EVERY = 240
 
-# --- Schwellwerte für Alarme (konfigurierbar; das Dashboard liest dieselben Env) ---
+# --- Schwellwerte für Alarme (Env = Default; im Dashboard editierbar -> settings.json) ---
 ALERT_KV = float(os.environ.get("VLLM_ALERT_KV", "90"))                    # KV-Cache % (>)
 ALERT_TEMP = float(os.environ.get("VLLM_ALERT_TEMP", "85"))               # GPU-Temperatur °C (>)
 ALERT_ERR = float(os.environ.get("VLLM_ALERT_ERR", "0"))                  # neue Fehler je Scrape (>)
@@ -89,6 +89,73 @@ DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
 # geladen) – ergänzen die per Env/Unit definierten Targets.
 TARGETS_FILE = os.environ.get("VLLM_TARGETS_FILE") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "targets.json")
+
+# Im Dashboard editierbare Schwellwerte (settings.json überschreibt die Env-Defaults;
+# bei jedem Scrape neu gelesen, sodass Änderungen ohne Neustart greifen).
+SETTINGS_FILE = os.environ.get("VLLM_SETTINGS_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "settings.json")
+THRESH = {"kv": ALERT_KV, "temp": ALERT_TEMP, "err": ALERT_ERR, "offline_min": ALERT_OFFLINE_MIN}
+
+
+def refresh_thresholds():
+    """Lädt die Alarm-Schwellwerte aus settings.json (Fallback: Env-Defaults)."""
+    defaults = {"kv": ALERT_KV, "temp": ALERT_TEMP, "err": ALERT_ERR, "offline_min": ALERT_OFFLINE_MIN}
+    try:
+        with open(SETTINGS_FILE) as f:
+            t = json.load(f).get("thresholds", {})
+    except (OSError, ValueError):
+        t = {}
+    for k, dv in defaults.items():
+        try:
+            THRESH[k] = float(t[k]) if k in t else dv
+        except (ValueError, TypeError):
+            THRESH[k] = dv
+
+
+def _read_targets_file():
+    try:
+        with open(TARGETS_FILE) as f:
+            data = json.load(f)
+        return data.get("targets", []) if isinstance(data, dict) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _write_targets_file(targets):
+    tmp = TARGETS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"targets": targets}, f, indent=2)
+    os.replace(tmp, TARGETS_FILE)
+
+
+def seed_vllm_from_env():
+    """Übernimmt die per Env/Unit definierten vLLM-Instanzen EINMALIG in
+    targets.json, damit sie im Dashboard verwaltet (bearbeitet/pausiert/gelöscht)
+    werden können. Läuft nur, solange die Datei noch keinen vLLM-Eintrag hat."""
+    existing = _read_targets_file()
+    if any(t.get("kind") == "vllm" for t in existing) or not TARGETS:
+        return
+    have = {(t.get("host"), t.get("port")) for t in existing}
+    seeded = list(existing)
+    for t in TARGETS:
+        key = (t.get("host", HOST), t["port"])
+        if key in have:
+            continue
+        seeded.append({"kind": "vllm", "host": t.get("host", HOST), "port": t["port"],
+                       "label": t.get("label") or "vLLM", "enabled": True})
+    if len(seeded) != len(existing):
+        try:
+            _write_targets_file(seeded)
+            print("  [i] %d vLLM-Instanz(en) aus der Unit nach %s übernommen "
+                  "(jetzt im Dashboard verwaltbar)." % (len(seeded) - len(existing), TARGETS_FILE))
+        except OSError as e:
+            print("  [!] Konnte targets.json nicht seeden: %s" % e)
+
+
+def _file_has_vllm():
+    """True, sobald targets.json überhaupt einen vLLM-Eintrag hat (auch pausiert).
+    Dann ist die Datei maßgeblich und die Env-Targets dienen nur noch als Seed."""
+    return any(t.get("kind") == "vllm" for t in _read_targets_file())
 
 
 def load_extra_targets():
@@ -698,7 +765,7 @@ def scrape_dcgm(conn, ts, host, port, verbose=True):
                      {"up": 1, "version": d.get("modelName") or "GPU", "kind": "gpu"})
         temp = values.get("gpu_temp")
         if temp is not None:
-            record_alert(conn, ts, host, port, model, "temp", temp > ALERT_TEMP,
+            record_alert(conn, ts, host, port, model, "temp", temp > THRESH["temp"],
                          value=temp, msg="GPU %.0f °C" % temp, severity="crit")
         count += 1
         if verbose:
@@ -720,7 +787,7 @@ def scrape_vllm_target(conn, ts, host, port, verbose=True):
     if text is None:
         mark_down(conn, host, port)
         _down_since.setdefault((host, port), ts)
-        if ts - _down_since[(host, port)] >= ALERT_OFFLINE_MIN * 60:
+        if ts - _down_since[(host, port)] >= THRESH["offline_min"] * 60:
             record_alert(conn, ts, host, port, None, "offline", True,
                          msg="Instanz offline", severity="crit")
         return 0
@@ -761,7 +828,7 @@ def scrape_vllm_target(conn, ts, host, port, verbose=True):
         store_config(conn, host, port, model, mc)
         kv = values.get("kv_cache_usage")
         if kv is not None:
-            record_alert(conn, ts, host, port, model, "kv", (kv * 100.0) > ALERT_KV,
+            record_alert(conn, ts, host, port, model, "kv", (kv * 100.0) > THRESH["kv"],
                          value=kv * 100.0, msg="KV-Cache %.0f%%" % (kv * 100.0))
         et = values.get("requests_error_total")
         if et is not None:
@@ -769,7 +836,7 @@ def scrape_vllm_target(conn, ts, host, port, verbose=True):
             _prev_err[(host, port, model)] = et
             if prev is not None:
                 new = et - prev
-                record_alert(conn, ts, host, port, model, "error", new > ALERT_ERR,
+                record_alert(conn, ts, host, port, model, "error", new > THRESH["err"],
                              value=new, msg="%d neue Fehler" % int(new))
         n += 1
         if verbose:
@@ -783,13 +850,18 @@ def scrape_vllm_target(conn, ts, host, port, verbose=True):
 def scrape_once(conn, verbose=True):
     ts = int(time.time())
     total = 0
+    refresh_thresholds()           # im UI geänderte Schwellwerte übernehmen
     extra = load_extra_targets()   # über die Oberfläche verwaltete Zusatz-Instanzen
 
-    # vLLM (Env/Unit + Datei)
-    for tgt in TARGETS:
-        total += scrape_vllm_target(conn, ts, tgt.get("host", HOST), tgt["port"], verbose)
-    for t in extra["vllm"]:
-        total += scrape_vllm_target(conn, ts, t["host"], t["port"], verbose)
+    # vLLM: sobald targets.json vLLM-Einträge enthält, ist die Datei maßgeblich
+    # (Env/Unit dient dann nur noch als Erst-Seed). So gibt es kein Doppel-Scrape,
+    # und im UI gelöschte/pausierte Instanzen verschwinden wirklich.
+    if _file_has_vllm():
+        vllm_list = [(t["host"], t["port"]) for t in extra["vllm"]]
+    else:
+        vllm_list = [(tgt.get("host", HOST), tgt["port"]) for tgt in TARGETS]
+    for host, port in vllm_list:
+        total += scrape_vllm_target(conn, ts, host, port, verbose)
 
     # Ollama-Instanzen (konfiguriert + automatisch entdeckt + Datei)
     for tgt in OLLAMA_TARGETS + discover_ollama() + extra["ollama"]:
@@ -849,6 +921,7 @@ def _sd_notify(state):
 def run_loop():
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
+    seed_vllm_from_env()               # Env-Instanzen einmalig ins UI übernehmen
     _sd_notify("READY=1")
     print("vllm_collector %s – Ziel %s, Ports %s, Intervall %ds"
           % (__version__, HOST, [t["port"] for t in TARGETS], INTERVAL))

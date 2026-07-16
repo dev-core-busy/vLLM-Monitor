@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.16.1"
+__version__ = "0.17.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -70,22 +70,22 @@ REPORT_DIR = os.environ.get("VLLM_REPORT_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "reports")
 REPORT_RANGE = int(os.environ.get("VLLM_REPORT_RANGE", str(8 * 3600)))
 
-# --- LDAP-/AD-Authentifizierung (optional; aktiv sobald VLLM_LDAP_HOST gesetzt) ---
-LDAP_HOST = os.environ.get("VLLM_LDAP_HOST", "").strip()      # Domain-Controller
-LDAP_DOMAIN = os.environ.get("VLLM_LDAP_DOMAIN", "").strip()  # z. B. nexus.int (UPN-Suffix)
-LDAP_PORT = int(os.environ.get("VLLM_LDAP_PORT", "389"))
-LDAP_PORT_TLS = int(os.environ.get("VLLM_LDAP_PORT_TLS", "636"))
-# TLS-Präferenz: "auto" (LDAPS versuchen, sonst Klartext), "1"/"require", "0"/"off"
-LDAP_TLS = os.environ.get("VLLM_LDAP_TLS", "auto").strip().lower()
-# optionale Allow-Liste (sAMAccountName oder UPN, kommagetrennt); leer = jeder gültige Domänen-Nutzer
-LDAP_ALLOW = [u.strip().lower() for u in os.environ.get("VLLM_LDAP_ALLOW", "").split(",") if u.strip()]
+# --- Authentifizierung: lokale Nutzer + optional LDAP/AD; alles in auth.json ---
+# Auth ist IMMER aktiv (Default-Konto admin/admin, Passwortwechsel erzwungen).
+# LDAP-/Nutzer-Konfiguration wird im Frontend gepflegt und in auth.json abgelegt.
+# Die VLLM_LDAP_*-Env-Variablen dienen nur noch als Erst-Seed beim allerersten Start.
+AUTH_FILE = os.environ.get("VLLM_AUTH_FILE",
+                           os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "auth.json"))
 AUTH_REALM = os.environ.get("VLLM_AUTH_REALM", "vLLM Monitor")
 AUTH_TTL = int(os.environ.get("VLLM_AUTH_TTL", "300"))        # Sekunden, erfolgreiche Prüfung cachen
-AUTH_ENABLED = bool(LDAP_HOST)
+AUTH_ENABLED = True                                           # immer an
 AUTH_COOKIE = "vllm_auth"                                    # persistentes Sitzungs-Cookie
 AUTH_COOKIE_DAYS = int(os.environ.get("VLLM_AUTH_COOKIE_DAYS", "7"))
-_auth_cache = {}                                             # cred-hash -> Ablaufzeit
+PBKDF2_ITER = int(os.environ.get("VLLM_PBKDF2_ITER", "200000"))
+ROLES = ("admin", "readonly")
+_auth_cache = {}                                             # cred-hash -> (Ablaufzeit, userdict)
 _auth_lock = threading.Lock()
+_auth_file_lock = threading.Lock()
 
 
 def _load_auth_secret():
@@ -111,7 +111,7 @@ def _load_auth_secret():
     return secret
 
 
-AUTH_SECRET = _load_auth_secret() if AUTH_ENABLED else b""
+AUTH_SECRET = _load_auth_secret()
 
 # Counter-Spalten -> Raten-Feld (Δwert / Δt)
 RATES = {
@@ -217,14 +217,17 @@ def _connect():
 # Zeitreihen
 # ---------------------------------------------------------------------------
 
-def build_series(range_s, offset_s=0):
+def build_series(range_s, offset_s=0, start=None, end=None):
     if not os.path.exists(DB_PATH):
         return {"error": "Keine Datenbank – läuft der Collector?", "models": {}}
 
     now = int(time.time())
-    end = now - offset_s
-    since = end - range_s
-    bucket = max(1, range_s // 800)
+    if start is not None and end is not None:
+        since = start                       # absolutes Fenster (Von/Bis)
+    else:
+        end = now - offset_s
+        since = end - range_s
+    bucket = max(1, (end - since) // 800)
 
     conn = _connect()
     in_window = conn.execute("""
@@ -313,6 +316,27 @@ def build_config():
             "version": c["version"],
             "vram_bytes": (vram[0] if vram else None),
         })
+    # Konfigurierte, aber (noch) nie erreichte Instanzen ergänzen, damit
+    # eingetragene Ziele auch offline sichtbar sind (statt zu „verschwinden").
+    seen = {(i["host"], str(i["port"])) for i in inst}
+    for t in _load_targets():
+        if t.get("enabled", True) is False:
+            continue
+        key = (t.get("host"), str(t.get("port")))
+        if not t.get("host") or t.get("port") is None or key in seen:
+            continue
+        seen.add(key)
+        inst.append({
+            "host": t.get("host"), "port": t.get("port"),
+            "model": t.get("label") or t.get("kind") or "—",
+            "kind": t.get("kind") or "vllm", "online": False, "age": None,
+            "num_gpu_blocks": None, "block_size": None, "capacity_tokens": 0,
+            "max_model_len": None, "gpu_memory_utilization": None,
+            "kv_cache_dtype": None, "enable_prefix_caching": None,
+            "version": None, "vram_bytes": None, "configured": True,
+        })
+    inst.sort(key=lambda i: (i["host"] or "", i["port"] or 0))
+
     # Self-Monitoring: Herzschlag des Collectors
     collector = None
     try:
@@ -331,10 +355,8 @@ def build_config():
     # NIE ausgeliefert – nur, ob server-seitig einer gesetzt ist.
     ai = {"url": AI_URL, "model": AI_MODEL, "key_set": bool(AI_KEY),
           "configured": bool(AI_URL)}
-    thresholds = {"kv": ALERT_KV, "temp": ALERT_TEMP, "err": ALERT_ERR,
-                  "offline_min": ALERT_OFFLINE_MIN}
     return {"now": now * 1000, "instances": inst, "ai": ai,
-            "thresholds": thresholds, "collector": collector}
+            "thresholds": load_thresholds(), "collector": collector}
 
 
 def build_alerts(limit=100):
@@ -363,13 +385,16 @@ def _ensure_annotations(conn):
         ts INTEGER NOT NULL, label TEXT, created INTEGER)""")
 
 
-def build_annotations(range_s=None):
+def build_annotations(range_s=None, start=None, end=None):
     """Manuelle Zeitachsen-Annotationen (Deploy/Restart o. ä.)."""
     if not os.path.exists(DB_PATH):
         return {"annotations": []}
     conn = _connect()
     _ensure_annotations(conn)
-    if range_s:
+    if start is not None and end is not None:
+        rows = conn.execute("SELECT id,ts,label FROM annotations WHERE ts>=? AND ts<? ORDER BY ts",
+                            (start, end)).fetchall()
+    elif range_s:
         since = int(time.time()) - range_s
         rows = conn.execute("SELECT id,ts,label FROM annotations WHERE ts>=? ORDER BY ts",
                             (since,)).fetchall()
@@ -466,8 +491,64 @@ def add_target(body):
 
 def del_target(tid):
     with _targets_lock:
-        _save_targets([t for t in _load_targets() if _target_id(t) != tid])
+        targets = _load_targets()
+        victim = next((t for t in targets if _target_id(t) == tid), None)
+        if victim is None:
+            return {"ok": True}
+        if victim.get("kind") == "vllm" and sum(1 for t in targets if t.get("kind") == "vllm") <= 1:
+            return {"error": "Die letzte vLLM-Instanz kann nicht gelöscht werden."}
+        _save_targets([t for t in targets if _target_id(t) != tid])
     return {"ok": True}
+
+
+# --- Alarm-Schwellwerte (im UI editierbar, vom Collector zur Laufzeit gelesen) ---
+SETTINGS_FILE = os.environ.get("VLLM_SETTINGS_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "settings.json")
+_settings_lock = threading.Lock()
+_THRESH_DEFAULTS = {"kv": ALERT_KV, "temp": ALERT_TEMP, "err": ALERT_ERR,
+                    "offline_min": ALERT_OFFLINE_MIN}
+
+
+def load_thresholds():
+    """Schwellwerte: settings.json überschreibt die Env-Defaults."""
+    t = dict(_THRESH_DEFAULTS)
+    try:
+        with open(SETTINGS_FILE) as f:
+            d = json.load(f)
+        for k in t:
+            if k in d.get("thresholds", {}):
+                t[k] = float(d["thresholds"][k])
+    except (OSError, ValueError, TypeError):
+        pass
+    return t
+
+
+def save_thresholds(body):
+    if not isinstance(body, dict):
+        return {"error": "ungültige Anfrage"}
+    cur = load_thresholds()
+    for k in _THRESH_DEFAULTS:
+        if k in body:
+            try:
+                v = float(body[k])
+            except (ValueError, TypeError):
+                return {"error": "ungültiger Wert für %s" % k}
+            if v < 0:
+                return {"error": "Werte dürfen nicht negativ sein"}
+            cur[k] = v
+    with _settings_lock:
+        data = {}
+        try:
+            with open(SETTINGS_FILE) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        data["thresholds"] = cur
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, SETTINGS_FILE)
+    return {"ok": True, "thresholds": cur}
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +652,120 @@ def build_prometheus():
 
 
 # ---------------------------------------------------------------------------
-# LDAP-/AD-Authentifizierung (Simple Bind, nur Standardbibliothek – kein ldap3)
+# Auth-Store: lokale Nutzer + AD-Nutzer + LDAP-Config in auth.json
+# ---------------------------------------------------------------------------
+
+def _default_ldap_cfg():
+    """Erst-Seed der LDAP-Config aus den Env-Variablen (nur beim allerersten
+    Anlegen von auth.json; danach wird alles im Frontend gepflegt)."""
+    host = os.environ.get("VLLM_LDAP_HOST", "").strip()
+    return {
+        "enabled": bool(host),
+        "host": host,
+        "domain": os.environ.get("VLLM_LDAP_DOMAIN", "").strip(),
+        "port": int(os.environ.get("VLLM_LDAP_PORT", "389")),
+        "port_tls": int(os.environ.get("VLLM_LDAP_PORT_TLS", "636")),
+        "tls": os.environ.get("VLLM_LDAP_TLS", "auto").strip().lower(),
+        "base_dn": os.environ.get("VLLM_LDAP_BASE_DN", "").strip(),
+        "group_admin": "",
+        "group_readonly": "",
+        "default_role": "",   # "" = kein Zugriff ohne Gruppen-/Einzelfreigabe
+    }
+
+
+def _hash_pw(password, salt=None, iterations=PBKDF2_ITER):
+    salt = salt or os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return {"salt": salt.hex(), "hash": dk.hex(), "iter": iterations}
+
+
+def _verify_pw(rec, password):
+    try:
+        salt = bytes.fromhex(rec.get("salt", ""))
+        it = int(rec.get("iter", PBKDF2_ITER))
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, it)
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(dk.hex(), rec.get("hash", ""))
+
+
+def _default_auth():
+    """Frische auth.json mit Default-Admin (admin/admin, Wechsel erzwungen)."""
+    rec = _hash_pw("admin")
+    rec.update({"username": "admin", "role": "admin", "must_change": True,
+                "created": int(time.time())})
+    return {"version": 1, "users": [rec], "ad_users": [], "ldap": _default_ldap_cfg()}
+
+
+def load_auth():
+    """Lädt auth.json (legt sie beim ersten Aufruf mit Default-Admin an)."""
+    with _auth_file_lock:
+        if not os.path.exists(AUTH_FILE):
+            au = _default_auth()
+            _write_auth(au)
+            return au
+        try:
+            with open(AUTH_FILE, "r", encoding="utf-8") as f:
+                au = json.load(f)
+        except (ValueError, OSError):
+            au = _default_auth()
+            _write_auth(au)
+            return au
+    # fehlende Felder tolerant ergänzen
+    au.setdefault("users", [])
+    au.setdefault("ad_users", [])
+    if "ldap" not in au or not isinstance(au["ldap"], dict):
+        au["ldap"] = _default_ldap_cfg()
+    else:
+        base = _default_ldap_cfg()
+        base.update(au["ldap"])
+        au["ldap"] = base
+    return au
+
+
+def _write_auth(au):
+    """Atomar schreiben (Datei enthält Passwort-Hashes -> 0600)."""
+    tmp = AUTH_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(au, f, indent=2, ensure_ascii=False)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, AUTH_FILE)
+
+
+def save_auth(au):
+    with _auth_file_lock:
+        _write_auth(au)
+
+
+def _find_local(au, username):
+    u = (username or "").strip().lower()
+    for rec in au.get("users", []):
+        if rec.get("username", "").lower() == u:
+            return rec
+    return None
+
+
+def _find_ad_user(au, username):
+    short = (username or "").split("@")[0].split("\\")[-1].strip().lower()
+    full = (username or "").strip().lower()
+    for rec in au.get("ad_users", []):
+        n = rec.get("username", "").strip().lower()
+        if n and (n == short or n == full):
+            return rec
+    return None
+
+
+def _pub_user(rec, source):
+    """Für die Ausgabe ans Frontend – ohne Hash/Salt."""
+    return {"username": rec.get("username", ""), "role": rec.get("role", "readonly"),
+            "source": source, "must_change": bool(rec.get("must_change"))}
+
+
+# ---------------------------------------------------------------------------
+# LDAP-/AD-Authentifizierung (Simple Bind + memberOf-Suche, nur Standardbibliothek)
 # ---------------------------------------------------------------------------
 
 def _ber_len(n):
@@ -640,121 +834,516 @@ def _ldap_bind_result(body):
     return int.from_bytes(rc, "big")
 
 
-def _ldap_bind(host, port, use_tls, dn, password, timeout=6):
+def _ber_enum(n):
+    return _ber_tlv(0x0A, bytes([n & 0xFF]))
+
+
+def _ber_bool(b):
+    return _ber_tlv(0x01, b"\xff" if b else b"\x00")
+
+
+def _domain_to_base(domain):
+    return ",".join("DC=%s" % p for p in (domain or "").split(".") if p)
+
+
+def _ldap_connect(host, port, use_tls, timeout=6):
     raw = socket.create_connection((host, port), timeout=timeout)
-    try:
-        s = raw
-        if use_tls:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            s = ctx.wrap_socket(raw, server_hostname=None)
-        # BindRequest [APPLICATION 0] { version=3, name=DN, [0] simple-password }
-        bind = _ber_int(3) + _ber_tlv(0x04, dn.encode("utf-8")) + _ber_tlv(0x80, password.encode("utf-8"))
-        msg = _ber_tlv(0x30, _ber_int(1) + _ber_tlv(0x60, bind))
-        s.sendall(msg)
-        body = _read_ldap_message(s)
-        try:
-            s.close()
-        except OSError:
-            pass
+    if use_tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx.wrap_socket(raw, server_hostname=None), raw
+    return raw, raw
+
+
+def _ldap_do_bind(sock, dn, password, msgid=1):
+    # BindRequest [APPLICATION 0] { version=3, name=DN, [0] simple-password }
+    bind = _ber_int(3) + _ber_tlv(0x04, dn.encode("utf-8")) + _ber_tlv(0x80, password.encode("utf-8"))
+    sock.sendall(_ber_tlv(0x30, _ber_int(msgid) + _ber_tlv(0x60, bind)))
+    body = _read_ldap_message(sock)
+    if not body:
+        return None
+    return _ldap_bind_result(body)         # 0 = success, 49 = invalidCredentials, …
+
+
+def _parse_entry_memberof(op):
+    _, _obj, i = _parse_tlv(op, 0)          # objectName
+    _, attrs, _ = _parse_tlv(op, i)         # PartialAttributeList SEQUENCE
+    out, j = [], 0
+    while j < len(attrs):
+        _, attr, j = _parse_tlv(attrs, j)   # attribute SEQUENCE { type, vals SET }
+        _, atype, k = _parse_tlv(attr, 0)
+        if atype.decode("utf-8", "replace").lower() == "memberof":
+            _, vset, _ = _parse_tlv(attr, k)
+            m = 0
+            while m < len(vset):
+                _, vv, m = _parse_tlv(vset, m)
+                out.append(vv.decode("utf-8", "replace"))
+    return out
+
+
+def _ldap_search_memberof(sock, base_dn, upn, msgid=2):
+    """Sucht den Nutzer per (|(sAMAccountName=..)(userPrincipalName=..)) und
+    liefert dessen memberOf-Gruppen (Liste von DNs)."""
+    short = upn.split("@")[0].split("\\")[-1]
+    f1 = _ber_tlv(0xA3, _ber_tlv(0x04, b"sAMAccountName") + _ber_tlv(0x04, short.encode("utf-8")))
+    f2 = _ber_tlv(0xA3, _ber_tlv(0x04, b"userPrincipalName") + _ber_tlv(0x04, upn.encode("utf-8")))
+    filt = _ber_tlv(0xA1, f1 + f2)          # or [1]
+    req = (_ber_tlv(0x04, base_dn.encode("utf-8")) +
+           _ber_enum(2) + _ber_enum(0) +    # scope=wholeSubtree, deref=never
+           _ber_int(5) + _ber_int(10) + _ber_bool(False) +
+           filt + _ber_tlv(0x30, _ber_tlv(0x04, b"memberOf")))
+    sock.sendall(_ber_tlv(0x30, _ber_int(msgid) + _ber_tlv(0x63, req)))
+    groups = []
+    for _ in range(500):
+        body = _read_ldap_message(sock)
         if not body:
-            return None
-        return _ldap_bind_result(body)     # 0 = success, 49 = invalidCredentials, …
-    finally:
-        try:
-            raw.close()
-        except OSError:
-            pass
+            break
+        _, _, i = _parse_tlv(body, 0)       # messageID
+        optag = body[i]
+        _, op, _ = _parse_tlv(body, i)
+        if optag == 0x64:                   # SearchResultEntry
+            groups += _parse_entry_memberof(op)
+        else:                               # SearchResultDone (0x65) o. a. -> Ende
+            break
+    return groups
 
 
-def ldap_authenticate(username, password):
-    """True, wenn Simple Bind gegen den DC gelingt. Leeres Passwort wird
-    abgelehnt (verhindert unauthenticated/anonymous bind)."""
-    username = (username or "").strip()
-    if not username or not password:
-        return False
-    if LDAP_ALLOW:
-        short = username.split("@")[0].split("\\")[-1].lower()
-        if short not in LDAP_ALLOW and username.lower() not in LDAP_ALLOW:
-            return False
-    # Bind-Name als UPN (user@domain), sofern nicht schon voll qualifiziert
-    if "@" in username or "\\" in username:
-        dn = username
-    elif LDAP_DOMAIN:
-        dn = "%s@%s" % (username, LDAP_DOMAIN)
+# --- Verzeichnissuche (Benutzer/Gruppen im AD durchsuchen) ---
+
+def _ldap_escape(s):
+    out = []
+    for ch in (s or ""):
+        if ch in "\\*()\0":
+            out.append("\\%02x" % ord(ch))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _f_eq(attr, val):
+    return _ber_tlv(0xA3, _ber_tlv(0x04, attr.encode("utf-8")) + _ber_tlv(0x04, val.encode("utf-8")))
+
+
+def _f_sub(attr, val):     # substrings: (attr=*val*)  -> ein 'any'-Element [1]
+    return _ber_tlv(0xA4, _ber_tlv(0x04, attr.encode("utf-8")) +
+                    _ber_tlv(0x30, _ber_tlv(0x81, val.encode("utf-8"))))
+
+
+def _f_or(*subs):
+    return _ber_tlv(0xA1, b"".join(subs))
+
+
+def _f_and(*subs):
+    return _ber_tlv(0xA0, b"".join(subs))
+
+
+def _parse_entry_attrs(op):
+    _, objname, i = _parse_tlv(op, 0)       # objectName (DN)
+    d = {"dn": [objname.decode("utf-8", "replace")]}
+    _, attrs, _ = _parse_tlv(op, i)
+    j = 0
+    while j < len(attrs):
+        _, attr, j = _parse_tlv(attrs, j)
+        _, atype, k = _parse_tlv(attr, 0)
+        name = atype.decode("utf-8", "replace").lower()
+        _, vset, _ = _parse_tlv(attr, k)
+        vals, m = [], 0
+        while m < len(vset):
+            _, vv, m = _parse_tlv(vset, m)
+            vals.append(vv.decode("utf-8", "replace"))
+        d[name] = vals
+    return d
+
+
+def _ldap_search(sock, base, filt, attrs, sizelimit=25, msgid=2):
+    aseq = _ber_tlv(0x30, b"".join(_ber_tlv(0x04, a.encode("utf-8")) for a in attrs))
+    req = (_ber_tlv(0x04, base.encode("utf-8")) + _ber_enum(2) + _ber_enum(0) +
+           _ber_int(sizelimit) + _ber_int(15) + _ber_bool(False) + filt + aseq)
+    sock.sendall(_ber_tlv(0x30, _ber_int(msgid) + _ber_tlv(0x63, req)))
+    out = []
+    for _ in range(2000):
+        body = _read_ldap_message(sock)
+        if not body:
+            break
+        _, _, i = _parse_tlv(body, 0)
+        optag = body[i]
+        _, op, _ = _parse_tlv(body, i)
+        if optag == 0x64:                   # SearchResultEntry
+            out.append(_parse_entry_attrs(op))
+        elif optag == 0x65:                 # SearchResultDone
+            break
+        # 0x73 = SearchResultReference u. a. überspringen
+    return out
+
+
+def ldap_directory_search(cfg, kind, q, user, password, limit=25):
+    """Durchsucht das AD nach Benutzern oder Gruppen (Substring). Bindet mit den
+    übergebenen Anmeldedaten (kein gespeichertes Dienstkonto)."""
+    q = (q or "").strip()
+    if not cfg.get("host"):
+        return {"error": "Kein LDAP-Host konfiguriert."}
+    if not user or not password:
+        return {"error": "Für die Suche Test-Benutzer/-Passwort angeben."}
+    if not q:
+        return {"error": "Suchbegriff angeben."}
+    domain = (cfg.get("domain") or "").strip()
+
+    def _dn(u):
+        return u if ("@" in u or "\\" in u or "=" in u) else ("%s@%s" % (u, domain) if domain else u)
+
+    base = (cfg.get("base_dn") or "").strip() or _domain_to_base(domain)
+    if not base:
+        return {"error": "Basis-DN bzw. Domäne fehlt."}
+    qe = _ldap_escape(q)
+    if kind == "group":
+        filt = _f_and(_f_eq("objectClass", "group"),
+                      _f_or(_f_sub("cn", qe), _f_sub("sAMAccountName", qe)))
+        attrs = ["cn", "distinguishedName", "sAMAccountName"]
     else:
-        dn = username
-    if LDAP_TLS in ("1", "require", "yes", "on", "ldaps"):
-        attempts = [(True, LDAP_PORT_TLS)]
-    elif LDAP_TLS in ("0", "off", "no", "none"):
-        attempts = [(False, LDAP_PORT)]
-    else:  # auto: erst LDAPS, dann Klartext
-        attempts = [(True, LDAP_PORT_TLS), (False, LDAP_PORT)]
-    for use_tls, port in attempts:
+        filt = _f_and(_f_eq("objectClass", "user"), _f_eq("objectCategory", "person"),
+                      _f_or(_f_sub("sAMAccountName", qe), _f_sub("displayName", qe),
+                            _f_sub("userPrincipalName", qe)))
+        attrs = ["sAMAccountName", "displayName", "userPrincipalName", "distinguishedName"]
+    tls = (cfg.get("tls") or "auto").lower()
+    port = int(cfg.get("port", 389)); port_tls = int(cfg.get("port_tls", 636))
+    if tls in ("1", "require", "yes", "on", "ldaps"):
+        attempts = [(True, port_tls)]
+    elif tls in ("0", "off", "no", "none"):
+        attempts = [(False, port)]
+    else:
+        attempts = [(True, port_tls), (False, port)]
+    for use_tls, p in attempts:
+        sock = raw = None
         try:
-            rc = _ldap_bind(LDAP_HOST, port, use_tls, dn, password)
+            sock, raw = _ldap_connect(cfg["host"], p, use_tls)
+            rc = _ldap_do_bind(sock, _dn(user), password)
+            if rc is None:
+                continue
+            if rc != 0:
+                return {"error": "Bind fehlgeschlagen (Anmeldedaten prüfen)."}
+            entries = _ldap_search(sock, base, filt, attrs, limit)
+            res = []
+            for e in entries:
+                if kind == "group":
+                    cn = (e.get("cn") or [""])[0]
+                    dn = (e.get("distinguishedname") or e.get("dn") or [""])[0]
+                    if cn or dn:
+                        res.append({"name": cn or dn, "dn": dn})
+                else:
+                    sam = (e.get("samaccountname") or [""])[0]
+                    if sam:
+                        res.append({"name": sam,
+                                    "display": (e.get("displayname") or [""])[0],
+                                    "upn": (e.get("userprincipalname") or [""])[0]})
+            return {"ok": True, "results": res}
         except Exception:
             continue
-        if rc is None:
+        finally:
+            for s in (sock, raw):
+                if s:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+    return {"error": "Verbindung zum Domain-Controller fehlgeschlagen."}
+
+
+def ldap_search_api(body):
+    if not isinstance(body, dict):
+        return {"error": "ungültige Anfrage"}
+    au = load_auth()
+    ld = dict(au["ldap"])
+    for k in ("host", "domain", "base_dn", "tls"):
+        if k in body and body[k] is not None:
+            ld[k] = str(body[k]).strip()
+    for k in ("port", "port_tls"):
+        if k in body:
+            try:
+                ld[k] = int(body[k])
+            except (ValueError, TypeError):
+                pass
+    return ldap_directory_search(ld, body.get("kind", "user"), body.get("q", ""),
+                                 (body.get("username") or "").strip(), body.get("password") or "")
+
+
+def ldap_login(cfg, username, password):
+    """Simple Bind gegen den DC; bei Erfolg optional memberOf-Gruppen holen.
+    Gibt (ok, groups) zurück. Leeres Passwort wird abgelehnt."""
+    username = (username or "").strip()
+    if not (cfg.get("enabled") and cfg.get("host")) or not username or not password:
+        return False, []
+    domain = (cfg.get("domain") or "").strip()
+    if "@" in username or "\\" in username:
+        dn = username
+    elif domain:
+        dn = "%s@%s" % (username, domain)
+    else:
+        dn = username
+    base = (cfg.get("base_dn") or "").strip() or _domain_to_base(domain)
+    tls = (cfg.get("tls") or "auto").lower()
+    port = int(cfg.get("port", 389)); port_tls = int(cfg.get("port_tls", 636))
+    if tls in ("1", "require", "yes", "on", "ldaps"):
+        attempts = [(True, port_tls)]
+    elif tls in ("0", "off", "no", "none"):
+        attempts = [(False, port)]
+    else:                                   # auto: erst LDAPS, dann Klartext
+        attempts = [(True, port_tls), (False, port)]
+    need_groups = bool(cfg.get("group_admin") or cfg.get("group_readonly"))
+    for use_tls, p in attempts:
+        sock = raw = None
+        try:
+            sock, raw = _ldap_connect(cfg["host"], p, use_tls)
+            rc = _ldap_do_bind(sock, dn, password)
+            if rc is None:
+                continue
+            if rc != 0:
+                return False, []
+            groups = []
+            if need_groups and base:
+                try:
+                    groups = _ldap_search_memberof(sock, base, dn)
+                except Exception:
+                    groups = []
+            return True, groups
+        except Exception:
             continue
-        return rc == 0
+        finally:
+            for s in (sock, raw):
+                if s:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+    return False, []
+
+
+def _group_match(configured, member_dns):
+    c = (configured or "").strip().lower()
+    if not c:
+        return False
+    for dn in member_dns:
+        d = dn.strip().lower()
+        if d == c:
+            return True
+        first = d.split(",")[0]             # z. B. "cn=vllm-admins"
+        if first.startswith("cn=") and first[3:] == c:
+            return True
     return False
 
 
-def _auth_ok(header):
-    """Prüft den Authorization-Header (Basic) gegen LDAP, mit kurzem Cache."""
+def resolve_ad_role(au, username, groups):
+    """Rolle eines AD-Nutzers: expliziter Eintrag > Gruppen-Mapping > default_role."""
+    ad = _find_ad_user(au, username)
+    if ad:
+        return ad.get("role", "readonly")
+    ld = au.get("ldap", {})
+    if _group_match(ld.get("group_admin", ""), groups):
+        return "admin"
+    if _group_match(ld.get("group_readonly", ""), groups):
+        return "readonly"
+    dr = (ld.get("default_role") or "").strip()
+    return dr if dr in ROLES else None
+
+
+def resolve_login(username, password):
+    """Prüft Anmeldedaten gegen lokale Nutzer, sonst gegen LDAP/AD.
+    Gibt userdict {username, role, source, must_change} oder None zurück."""
+    username = (username or "").strip()
+    if not username or not password:
+        return None
+    au = load_auth()
+    lu = _find_local(au, username)
+    if lu:
+        if _verify_pw(lu, password):
+            return {"username": lu["username"], "role": lu.get("role", "admin"),
+                    "source": "local", "must_change": bool(lu.get("must_change"))}
+        return None            # lokaler Nutzer, falsches Passwort -> nicht via LDAP probieren
+    ld = au.get("ldap", {})
+    if ld.get("enabled") and ld.get("host"):
+        ok, groups = ldap_login(ld, username, password)
+        if ok:
+            role = resolve_ad_role(au, username, groups)
+            if role:
+                short = username.split("@")[0].split("\\")[-1]
+                return {"username": short, "role": role, "source": "ad", "must_change": False}
+    return None
+
+
+def _basic_login(header):
+    """Basic-Auth-Header -> userdict (für Scraper/CLI wie Prometheus), mit Cache."""
     if not header or not header.startswith("Basic "):
-        return False
+        return None
     try:
         user, _, pw = base64.b64decode(header[6:]).decode("utf-8", "replace").partition(":")
     except Exception:
-        return False
+        return None
     if not user or not pw:
-        return False
+        return None
     key = hashlib.sha256(("%s\0%s" % (user, pw)).encode("utf-8")).hexdigest()
     now = time.time()
     with _auth_lock:
-        exp = _auth_cache.get(key)
-        if exp and exp > now:
-            return True
-    if ldap_authenticate(user, pw):
+        ent = _auth_cache.get(key)
+        if ent and ent[0] > now:
+            return ent[1]
+    ud = resolve_login(user, pw)
+    if ud:
         with _auth_lock:
-            _auth_cache[key] = now + AUTH_TTL
-            # aufräumen
+            _auth_cache[key] = (now + AUTH_TTL, ud)
             for k, e in list(_auth_cache.items()):
-                if e <= now:
+                if e[0] <= now:
                     _auth_cache.pop(k, None)
-        return True
-    return False
+    return ud
 
 
-def _basic_user(header):
-    if not header or not header.startswith("Basic "):
-        return ""
+# ---------------------------------------------------------------------------
+# Verwaltungs-Endpunkte (nur Admins): Nutzer + LDAP-Konfiguration
+# ---------------------------------------------------------------------------
+
+def build_users():
+    au = load_auth()
+    users = [{"username": u["username"], "role": u.get("role", "admin"),
+              "must_change": bool(u.get("must_change"))} for u in au.get("users", [])]
+    return {"users": users, "ad_users": au.get("ad_users", []), "ldap": au.get("ldap", {})}
+
+
+def users_upsert(body):
+    if not isinstance(body, dict):
+        return {"error": "ungültige Anfrage"}
+    kind = body.get("kind", "local")
+    username = (body.get("username") or "").strip()
+    role = body.get("role", "readonly")
+    if not username:
+        return {"error": "Benutzername fehlt"}
+    if role not in ROLES:
+        return {"error": "ungültige Rolle"}
+    au = load_auth()
+    if kind == "ad":
+        short = username.split("@")[0].split("\\")[-1].strip()
+        ex = _find_ad_user(au, short)
+        if ex:
+            ex["role"] = role
+            ex["username"] = short
+        else:
+            au["ad_users"].append({"username": short, "role": role})
+        save_auth(au)
+        return {"ok": True}
+    # lokaler Nutzer
+    pw = body.get("password")
+    lu = _find_local(au, username)
+    if lu:
+        lu["role"] = role
+        if pw:
+            lu.update(_hash_pw(pw))
+            lu["must_change"] = bool(body.get("must_change", False))
+        save_auth(au)
+        return {"ok": True}
+    if not pw:
+        return {"error": "Passwort für neuen lokalen Nutzer erforderlich"}
+    rec = _hash_pw(pw)
+    rec.update({"username": username, "role": role,
+                "must_change": bool(body.get("must_change", False)),
+                "created": int(time.time())})
+    au["users"].append(rec)
+    save_auth(au)
+    return {"ok": True}
+
+
+def users_delete(username, kind="local"):
+    au = load_auth()
+    username = (username or "").strip()
+    if kind == "ad":
+        short = username.split("@")[0].split("\\")[-1].lower()
+        before = len(au["ad_users"])
+        au["ad_users"] = [u for u in au["ad_users"] if u.get("username", "").lower() != short]
+        save_auth(au)
+        return {"ok": before != len(au["ad_users"])}
+    lu = _find_local(au, username)
+    if not lu:
+        return {"error": "unbekannter Nutzer"}
+    admins = [u for u in au["users"] if u.get("role") == "admin"]
+    if lu.get("role") == "admin" and len(admins) <= 1:
+        return {"error": "Der letzte Admin kann nicht gelöscht werden."}
+    au["users"] = [u for u in au["users"] if u.get("username", "").lower() != username.lower()]
+    save_auth(au)
+    return {"ok": True}
+
+
+def ldap_update(body):
+    if not isinstance(body, dict):
+        return {"error": "ungültige Anfrage"}
+    au = load_auth()
+    ld = au["ldap"]
+    for k in ("host", "domain", "base_dn", "group_admin", "group_readonly"):
+        if k in body:
+            ld[k] = (body.get(k) or "").strip()
+    if "tls" in body:
+        ld["tls"] = (body.get("tls") or "auto").strip().lower()
+    if "enabled" in body:
+        ld["enabled"] = bool(body["enabled"])
+    for k in ("port", "port_tls"):
+        if k in body:
+            try:
+                ld[k] = int(body[k])
+            except (ValueError, TypeError):
+                pass
+    if "default_role" in body:
+        dr = (body.get("default_role") or "").strip()
+        ld["default_role"] = dr if dr in ROLES else ""
+    save_auth(au)
+    return {"ok": True, "ldap": ld}
+
+
+def ldap_test(body):
+    """Test-Bind mit übergebenen Zugangsdaten (Formularwerte überschreiben die
+    gespeicherte Config, damit man vor dem Speichern prüfen kann)."""
+    if not isinstance(body, dict):
+        return {"error": "ungültige Anfrage"}
+    au = load_auth()
+    ld = dict(au["ldap"])
+    for k in ("host", "domain", "base_dn", "tls", "group_admin", "group_readonly"):
+        if k in body and body[k] is not None:
+            ld[k] = str(body[k]).strip()
+    for k in ("port", "port_tls"):
+        if k in body:
+            try:
+                ld[k] = int(body[k])
+            except (ValueError, TypeError):
+                pass
+    ld["enabled"] = True
+    user = (body.get("username") or "").strip()
+    pw = body.get("password") or ""
+    if not user or not pw:
+        return {"error": "Test-Benutzer und -Passwort angeben."}
     try:
-        return base64.b64decode(header[6:]).decode("utf-8", "replace").partition(":")[0]
-    except Exception:
-        return ""
+        ok, groups = ldap_login(ld, user, pw)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if not ok:
+        return {"ok": False, "error": "Bind fehlgeschlagen (Host/Port/Benutzer/Passwort prüfen)."}
+    role = resolve_ad_role(au, user, groups)
+    return {"ok": True, "groups": groups,
+            "role": role or "(keine Rolle – Gruppen-Mapping oder Einzelfreigabe fehlt)"}
 
 
 def _cookie_sign(payload):
     return hmac.new(AUTH_SECRET, payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _make_cookie_value(user):
+def _make_cookie_value(user, role="admin", source="local"):
     exp = int(time.time()) + AUTH_COOKIE_DAYS * 86400
-    payload = "%s|%d" % (base64.urlsafe_b64encode(user.encode("utf-8")).decode("ascii"), exp)
+    b64u = base64.urlsafe_b64encode(user.encode("utf-8")).decode("ascii")
+    payload = "%s|%s|%s|%d" % (b64u, role, source, exp)
     return "%s|%s" % (payload, _cookie_sign(payload))
 
 
 def _check_cookie_value(val):
-    """Gibt (user, exp) zurück, wenn Signatur gültig und nicht abgelaufen."""
+    """Gibt dict {user, role, source, exp} zurück, wenn Signatur gültig & aktuell."""
     try:
-        b64u, exp_s, sig = val.rsplit("|", 2)
+        b64u, role, source, exp_s, sig = val.rsplit("|", 4)
     except ValueError:
         return None
-    if not hmac.compare_digest(sig, _cookie_sign("%s|%s" % (b64u, exp_s))):
+    if not hmac.compare_digest(sig, _cookie_sign("%s|%s|%s|%s" % (b64u, role, source, exp_s))):
         return None
     try:
         exp = int(exp_s)
@@ -766,7 +1355,7 @@ def _check_cookie_value(val):
         user = base64.urlsafe_b64decode(b64u.encode("ascii")).decode("utf-8")
     except Exception:
         return None
-    return (user, exp)
+    return {"user": user, "role": role, "source": source, "exp": exp}
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +1368,23 @@ def _range_from(qs):
     except ValueError:
         r = 3600
     return max(60, min(r, 30 * 86400))
+
+
+def _abs_window(qs):
+    """Optionales absolutes Zeitfenster (from/to in Sekunden). Gibt (from, to)
+    zurück oder (None, None), wenn nicht/ungültig angegeben. Deckelt auf 30 Tage."""
+    if "from" not in qs or "to" not in qs:
+        return None, None
+    try:
+        fr = int(qs["from"][0])
+        to = int(qs["to"][0])
+    except (ValueError, KeyError, IndexError):
+        return None, None
+    if to <= fr:
+        return None, None
+    if to - fr > 30 * 86400:
+        fr = to - 30 * 86400
+    return fr, to
 
 
 def _normalize_ai_url(u):
@@ -878,52 +1484,128 @@ class Handler(BaseHTTPRequestHandler):
                 return v
         return None
 
-    def _require_auth(self):
-        """LDAP-Auth: gültiges Session-Cookie ODER Basic-Auth (→ Cookie setzen),
-        sonst 401 mit Basic-Challenge."""
-        if not AUTH_ENABLED:
-            return True
-        now = time.time()
-        # 1) Persistentes Session-Cookie (kein erneutes Eintippen)
+    def _set_auth_cookie(self, user, role, source):
+        self._auth_cookie = _make_cookie_value(user, role, source)
+
+    def _clear_auth_cookie(self):
+        self._auth_cookie = ""              # leerer Wert -> _send löscht das Cookie
+
+    def _is_admin(self):
+        return bool(self._user and self._user.get("role") == "admin")
+
+    def _forbidden(self):
+        self._send(403, "application/json",
+                   json.dumps({"error": "Keine Berechtigung"}).encode("utf-8"))
+
+    def _must_change(self):
+        u = getattr(self, "_user", None)
+        if not u or u.get("source") != "local":
+            return False
+        lu = _find_local(load_auth(), u["username"])
+        return bool(lu and lu.get("must_change"))
+
+    def _auth_state(self):
+        """Anmeldestatus für /api/me – ohne 401 auszulösen."""
+        au = load_auth()
+        ldap_on = bool(au.get("ldap", {}).get("enabled"))
         cval = self._get_cookie(AUTH_COOKIE)
         if cval:
             chk = _check_cookie_value(cval)
             if chk:
-                user, exp = chk
-                if exp - now < AUTH_COOKIE_DAYS * 86400 / 2:   # gleitend verlängern
-                    self._auth_cookie = _make_cookie_value(user)
+                mc = False
+                if chk["source"] == "local":
+                    lu = _find_local(au, chk["user"])
+                    mc = bool(lu and lu.get("must_change"))
+                return {"authenticated": True, "username": chk["user"], "role": chk["role"],
+                        "source": chk["source"], "must_change": mc, "ldap_enabled": ldap_on}
+        return {"authenticated": False, "ldap_enabled": ldap_on}
+
+    def _require_auth(self):
+        """Setzt self._user aus gültigem Session-Cookie oder Basic-Auth (Scraper).
+        Ohne gültige Anmeldung: 401 als JSON (kein Basic-Popup – Login-Formular im UI)."""
+        self._user = None
+        now = time.time()
+        cval = self._get_cookie(AUTH_COOKIE)
+        if cval:
+            chk = _check_cookie_value(cval)
+            if chk:
+                self._user = {"username": chk["user"], "role": chk["role"], "source": chk["source"]}
+                if chk["exp"] - now < AUTH_COOKIE_DAYS * 86400 / 2:   # gleitend verlängern
+                    self._set_auth_cookie(chk["user"], chk["role"], chk["source"])
                 return True
-        # 2) Basic-Auth gegen LDAP -> bei Erfolg Session-Cookie setzen
-        hdr = self.headers.get("Authorization")
-        if _auth_ok(hdr):
-            self._auth_cookie = _make_cookie_value(_basic_user(hdr))
+        ud = _basic_login(self.headers.get("Authorization"))
+        if ud:
+            self._user = {"username": ud["username"], "role": ud["role"], "source": ud["source"]}
             return True
-        # 3) Challenge
-        body = "Anmeldung erforderlich (Domänen-Konto).\n".encode("utf-8")
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="%s"' % AUTH_REALM)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        self._send(401, "application/json",
+                   json.dumps({"error": "Anmeldung erforderlich"}).encode("utf-8"))
         return False
 
-    def do_GET(self):
-        if not self._require_auth():
+    def _handle_login(self):
+        body = self._read_body() or {}
+        ud = resolve_login(body.get("username", ""), body.get("password", ""))
+        if not ud:
+            self._send(401, "application/json",
+                       json.dumps({"error": "Anmeldung fehlgeschlagen"}).encode("utf-8"))
             return
+        self._set_auth_cookie(ud["username"], ud["role"], ud["source"])
+        self._json({"ok": True, "username": ud["username"], "role": ud["role"],
+                    "source": ud["source"], "must_change": ud["must_change"]})
+
+    def _handle_password(self):
+        u = getattr(self, "_user", None)
+        if not u or u.get("source") != "local":
+            self._forbidden()
+            return
+        body = self._read_body() or {}
+        newpw = body.get("new") or ""
+        if len(newpw) < 6:
+            self._json({"error": "Neues Passwort muss mindestens 6 Zeichen haben."})
+            return
+        au = load_auth()
+        lu = _find_local(au, u["username"])
+        if not lu or not _verify_pw(lu, body.get("old") or ""):
+            self._json({"error": "Aktuelles Passwort ist falsch."})
+            return
+        lu.update(_hash_pw(newpw))
+        lu["must_change"] = False
+        save_auth(au)
+        self._set_auth_cookie(u["username"], lu.get("role", "admin"), "local")
+        self._json({"ok": True})
+
+    def do_GET(self):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
+        # Öffentliche Routen (ohne Anmeldung erreichbar)
+        if parsed.path in ("/", "/index.html"):
+            sub = ("– " + html.escape(LABEL)) if LABEL else ""
+            page = (PAGE.replace("__SUBTITLE__", sub)
+                        .replace("__VERSION__", __version__)
+                        .replace("__TLSAVAIL__", "1" if CERT_PATH else "0"))
+            self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
+            return
+        if parsed.path == "/api/me":
+            self._json(self._auth_state())
+            return
+        if not self._require_auth():
+            return
+        if parsed.path == "/api/users":
+            if not self._is_admin():
+                self._forbidden()
+                return
+            self._json(build_users())
+            return
         if parsed.path == "/api/series":
             try:
                 off = int(qs.get("offset", ["0"])[0])
             except ValueError:
                 off = 0
             off = max(0, min(off, 30 * 86400))
-            self._json(build_series(_range_from(qs), off))
+            fr, to = _abs_window(qs)
+            if fr is not None:
+                self._json(build_series(to - fr, off, start=fr, end=to))
+            else:
+                self._json(build_series(_range_from(qs), off))
         elif parsed.path == "/api/config":
             self._json(build_config())
         elif parsed.path == "/api/alerts":
@@ -933,10 +1615,12 @@ class Handler(BaseHTTPRequestHandler):
                 lim = 100
             self._json(build_alerts(min(max(lim, 1), 500)))
         elif parsed.path == "/api/annotations":
-            rng = None
-            if "range" in qs:
-                rng = _range_from(qs)
-            self._json(build_annotations(rng))
+            fr, to = _abs_window(qs)
+            if fr is not None:
+                self._json(build_annotations(start=fr, end=to))
+            else:
+                rng = _range_from(qs) if "range" in qs else None
+                self._json(build_annotations(rng))
         elif parsed.path == "/api/targets":
             self._json(build_targets())
         elif parsed.path == "/metrics":
@@ -945,12 +1629,6 @@ class Handler(BaseHTTPRequestHandler):
             self._stream(_range_from(qs))
         elif parsed.path == "/api/cert":
             self._send_cert()
-        elif parsed.path in ("/", "/index.html"):
-            sub = ("– " + html.escape(LABEL)) if LABEL else ""
-            page = (PAGE.replace("__SUBTITLE__", sub)
-                        .replace("__VERSION__", __version__)
-                        .replace("__TLSAVAIL__", "1" if CERT_PATH else "0"))
-            self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -963,15 +1641,67 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def do_POST(self):
+        parsed = urlparse(self.path)
+        # öffentlich: Anmeldung
+        if parsed.path == "/api/login":
+            self._handle_login()
+            return
         if not self._require_auth():
             return
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/analyze":
+        # jeder angemeldete Nutzer: eigenes Passwort ändern, abmelden
+        if parsed.path == "/api/logout":
+            self._clear_auth_cookie()
+            self._json({"ok": True})
+            return
+        if parsed.path == "/api/password":
+            self._handle_password()
+            return
+        # solange Passwortwechsel erzwungen ist: nichts anderes zulassen
+        if self._must_change():
+            self._send(403, "application/json",
+                       json.dumps({"error": "Passwortwechsel erforderlich"}).encode("utf-8"))
+            return
+        if parsed.path == "/api/analyze":            # Auswertung (auch read-only)
             body = self._read_body()
             if body is None:
                 self._json({"error": "ungültige Anfrage"})
                 return
             self._json(ai_analyze(body))
+            return
+        # ab hier: nur Admins (schreibende/verwaltende Endpunkte)
+        if not self._is_admin():
+            self._forbidden()
+            return
+        if parsed.path == "/api/users":
+            body = self._read_body()
+            if body is None:
+                self._json({"error": "ungültige Anfrage"})
+                return
+            self._json(users_upsert(body))
+        elif parsed.path == "/api/ldap":
+            body = self._read_body()
+            if body is None:
+                self._json({"error": "ungültige Anfrage"})
+                return
+            self._json(ldap_update(body))
+        elif parsed.path == "/api/ldap/test":
+            body = self._read_body()
+            if body is None:
+                self._json({"error": "ungültige Anfrage"})
+                return
+            self._json(ldap_test(body))
+        elif parsed.path == "/api/ldap/search":
+            body = self._read_body()
+            if body is None:
+                self._json({"error": "ungültige Anfrage"})
+                return
+            self._json(ldap_search_api(body))
+        elif parsed.path == "/api/thresholds":
+            body = self._read_body()
+            if body is None:
+                self._json({"error": "ungültige Anfrage"})
+                return
+            self._json(save_thresholds(body))
         elif parsed.path == "/api/annotations":
             body = self._read_body()
             if body is None:
@@ -996,6 +1726,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self._require_auth():
             return
+        if self._must_change():
+            self._send(403, "application/json",
+                       json.dumps({"error": "Passwortwechsel erforderlich"}).encode("utf-8"))
+            return
+        if not self._is_admin():
+            self._forbidden()
+            return
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         if parsed.path == "/api/annotations" and "id" in qs:
@@ -1005,6 +1742,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "ungültige id"})
         elif parsed.path == "/api/targets" and "id" in qs:
             self._json(del_target(qs["id"][0]))
+        elif parsed.path == "/api/users" and "username" in qs:
+            self._json(users_delete(qs["username"][0], qs.get("kind", ["local"])[0]))
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -1054,10 +1793,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         ck = getattr(self, "_auth_cookie", None)
-        if ck:
+        if ck is not None:
             secure = "; Secure" if CERT_PATH else ""
-            self.send_header("Set-Cookie", "%s=%s; Max-Age=%d; Path=/; HttpOnly; SameSite=Lax%s"
-                             % (AUTH_COOKIE, ck, AUTH_COOKIE_DAYS * 86400, secure))
+            if ck == "":                     # Logout -> Cookie sofort löschen
+                self.send_header("Set-Cookie", "%s=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax%s"
+                                 % (AUTH_COOKIE, secure))
+            else:
+                self.send_header("Set-Cookie", "%s=%s; Max-Age=%d; Path=/; HttpOnly; SameSite=Lax%s"
+                                 % (AUTH_COOKIE, ck, AUTH_COOKIE_DAYS * 86400, secure))
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -1074,7 +1817,7 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>vLLM Monitor</title>
+<title>KI Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
@@ -1204,6 +1947,43 @@ PAGE = r"""<!DOCTYPE html>
   #secbanner button{font-size:12px;}
   .modal-ov{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:3000;display:none;
     align-items:flex-start;justify-content:center;padding:40px 14px;overflow:auto;}
+  /* --- Auth: Login-/Passwort-Overlay --- */
+  #authov{position:fixed;inset:0;background:var(--bg);z-index:5000;display:none;
+    align-items:center;justify-content:center;padding:20px;}
+  #authov.show{display:flex;}
+  .auth-card{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+    width:100%;max-width:360px;padding:26px 24px;color:var(--fg);box-shadow:0 8px 40px rgba(0,0,0,.5);}
+  .auth-card h2{margin:0 0 4px;font-size:20px;}
+  .auth-card .sub{color:var(--muted);font-size:13px;margin:0 0 18px;}
+  .auth-card label{display:block;font-size:12px;color:var(--muted);margin:12px 0 4px;}
+  .auth-card input{width:100%;box-sizing:border-box;background:var(--bg);color:var(--fg);
+    border:1px solid var(--border);border-radius:7px;padding:9px 11px;font-size:14px;}
+  .auth-card button.primary{width:100%;margin-top:18px;background:var(--accent);color:#fff;border:none;
+    border-radius:8px;padding:10px;font-size:14px;cursor:pointer;}
+  .auth-msg{min-height:18px;margin-top:12px;font-size:13px;color:var(--bad);}
+  #logoutbtn{color:var(--muted);display:inline-flex;align-items:center;justify-content:center;padding:5px 8px;}
+  #logoutbtn svg{width:18px;height:18px;display:block;}
+  #logoutbtn:hover{color:var(--bad);border-color:var(--bad);}
+  #gear{color:var(--muted);display:inline-flex;align-items:center;justify-content:center;padding:5px 8px;}
+  #gear svg{width:18px;height:18px;display:block;}
+  #gear:hover{color:var(--fg);}
+  #theme{color:var(--muted);display:inline-flex;align-items:center;justify-content:center;padding:5px 8px;}
+  #theme svg{width:18px;height:18px;display:block;}
+  #theme:hover{color:var(--fg);}
+  #theme .ic-sun{display:none;}
+  body[data-theme="light"] #theme .ic-moon{display:none;}
+  body[data-theme="light"] #theme .ic-sun{display:block;}
+  #reload{font-size:20px;line-height:1;padding:2px 8px;}
+  .userchip{font-size:12px;color:var(--muted);display:inline-flex;align-items:center;gap:6px;}
+  .rolebadge{font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:1px 6px;border-radius:8px;
+    border:1px solid var(--border);color:var(--muted);}
+  .rolebadge.admin{color:var(--accent);border-color:var(--accent);}
+  /* Schreib-/Admin-Controls für read-only ausblenden */
+  body:not(.is-admin) .adminonly{display:none !important;}
+  .utable{width:100%;border-collapse:collapse;font-size:13px;margin:4px 0;}
+  .utable th,.utable td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--grid);}
+  .utable th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.03em;}
+  .uinput{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px;font-size:13px;}
   .modal-card{background:var(--panel);border:1px solid var(--border);border-radius:12px;
     max-width:560px;width:100%;padding:20px 22px;color:var(--fg);}
   .modal-card h2{margin:0 0 12px;font-size:18px;}
@@ -1223,7 +2003,10 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>vLLM Monitor <span style="color:var(--muted)">__SUBTITLE__</span></h1>
+  <h1>KI Monitor</h1>
+  <label class="ctl" id="hostfilterwrap" title="Auf einen Host filtern (Instanzen, KPI-Karten, Diagramme)." style="display:none">Host
+    <select id="hostfilter"><option value="">Alle Hosts</option></select>
+  </label>
   <span style="font-size:11px;color:var(--muted)">v__VERSION__</span>
   <span id="collstat" title="Status des Metrik-Collectors (Self-Monitoring)" style="font-size:11px"></span>
   <label class="ctl" title="Zeitfenster, das in allen Diagrammen dargestellt wird. Bei großen Fenstern werden die Daten automatisch verdichtet (Downsampling).">Zeitraum
@@ -1234,8 +2017,15 @@ PAGE = r"""<!DOCTYPE html>
       <option value="86400">24 h</option>
       <option value="today" selected>heute</option>
       <option value="604800">7 Tage</option>
+      <option value="custom">benutzerdefiniert…</option>
     </select>
   </label>
+  <span class="ctl" id="absrange" style="display:none" title="Freies Zeitfenster mit Datum und Uhrzeit (Von/Bis)">
+    <input type="datetime-local" id="absfrom" title="Von – Datum und Uhrzeit">
+    <span style="color:var(--muted)">–</span>
+    <input type="datetime-local" id="absto" title="Bis – Datum und Uhrzeit">
+    <button class="dbtn" id="absapply" title="Zeitfenster anwenden">✓</button>
+  </span>
   <label class="ctl" title="Vergleicht das aktuelle Zeitfenster mit einem früheren – als gedämpfte, gestrichelte Linien in allen Diagrammen.">Vergleich
     <select id="compare" title="Vergleichszeitraum (Overlay)">
       <option value="0" selected>aus</option>
@@ -1243,9 +2033,6 @@ PAGE = r"""<!DOCTYPE html>
       <option value="86400">gestern</option>
       <option value="604800">letzte Woche</option>
     </select>
-  </label>
-  <label class="ctl" id="hostfilterwrap" title="Auf einen Host filtern (Instanzen, KPI-Karten, Diagramme). Erscheint nur bei mehreren Hosts." style="display:none">Host
-    <select id="hostfilter"><option value="">Alle Hosts</option></select>
   </label>
   <span class="densgroup" title="Kacheldichte – mehr Punkte = mehr, kleinere Kacheln">
     <button class="dbtn" data-d="sehrdicht" title="Sehr klein, sehr viele Kacheln (6×5)"><svg class="dg" viewBox="0 0 26 20"><circle cx="3.5" cy="2.8" r="1.05"/><circle cx="7.3" cy="2.8" r="1.05"/><circle cx="11.1" cy="2.8" r="1.05"/><circle cx="14.9" cy="2.8" r="1.05"/><circle cx="18.7" cy="2.8" r="1.05"/><circle cx="22.5" cy="2.8" r="1.05"/><circle cx="3.5" cy="6.4" r="1.05"/><circle cx="7.3" cy="6.4" r="1.05"/><circle cx="11.1" cy="6.4" r="1.05"/><circle cx="14.9" cy="6.4" r="1.05"/><circle cx="18.7" cy="6.4" r="1.05"/><circle cx="22.5" cy="6.4" r="1.05"/><circle cx="3.5" cy="10.0" r="1.05"/><circle cx="7.3" cy="10.0" r="1.05"/><circle cx="11.1" cy="10.0" r="1.05"/><circle cx="14.9" cy="10.0" r="1.05"/><circle cx="18.7" cy="10.0" r="1.05"/><circle cx="22.5" cy="10.0" r="1.05"/><circle cx="3.5" cy="13.6" r="1.05"/><circle cx="7.3" cy="13.6" r="1.05"/><circle cx="11.1" cy="13.6" r="1.05"/><circle cx="14.9" cy="13.6" r="1.05"/><circle cx="18.7" cy="13.6" r="1.05"/><circle cx="22.5" cy="13.6" r="1.05"/><circle cx="3.5" cy="17.2" r="1.05"/><circle cx="7.3" cy="17.2" r="1.05"/><circle cx="11.1" cy="17.2" r="1.05"/><circle cx="14.9" cy="17.2" r="1.05"/><circle cx="18.7" cy="17.2" r="1.05"/><circle cx="22.5" cy="17.2" r="1.05"/></svg></button>
@@ -1256,13 +2043,18 @@ PAGE = r"""<!DOCTYPE html>
   <button id="resetzoom" title="Zoom/Verschieben in allen Diagrammen zurücksetzen (Mausrad = Zoom, Ziehen = Verschieben)">Zoom ⟲</button>
   <button id="anombtn" title="Ausreißer (robuste MAD-Anomalie-Erkennung) in allen Diagrammen als rote Punkte markieren">⚠ Anomalien</button>
   <button id="reportbtn" title="KI-Gesamt-Report über alle Diagramme (Kennzahlen, Ausreißer, Prognosen)">📋 KI-Report</button>
-  <button id="theme" title="Zwischen hellem und dunklem Design umschalten (wird gespeichert)">◐</button>
+  <button id="theme" title="Zwischen hellem und dunklem Design umschalten (wird gespeichert)">
+    <svg class="ic-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    <svg class="ic-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+  </button>
   <button id="notif" title="Browser-Benachrichtigungen bei Warnungen (KV-Cache voll, Fehler, Instanz offline) erlauben">🔔</button>
   <button id="secbtn" title="Verbindungssicherheit & Zertifikat">🔒</button>
   <button id="restore" title="Ausgeblendete Kacheln wieder einblenden" style="display:none">Ausgeblendet: 0 ⟲</button>
   <button id="reload" title="Daten und Instanz-Konfiguration sofort neu laden">⟳</button>
   <div class="menuwrap">
-    <button id="gear" title="Weitere Optionen (Aktualisierung, Latenz-Perzentil, Export)">⚙</button>
+    <button id="gear" title="Weitere Optionen (Aktualisierung, Latenz-Perzentil, Export)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
     <div id="gearmenu" class="menu">
       <label class="mrow" title="Wie sich das Dashboard aktualisiert: Live schiebt Daten per Server-Sent-Events (Push), oder festes Poll-Intervall, oder ganz aus.">Aktualisierung
         <select id="mode" title="Aktualisierungsmodus des Dashboards">
@@ -1282,11 +2074,19 @@ PAGE = r"""<!DOCTYPE html>
       </label>
       <button id="annbtn" title="Annotation (Deploy/Restart …) für den aktuellen Zeitpunkt setzen – erscheint als senkrechte Linie in allen Diagrammen; Klick auf eine Linie löscht sie">🏷 Notiz setzen</button>
       <button id="targetsbtn" title="Zusätzliche Instanzen (vLLM/Ollama/STT/GPU) ohne Unit-Editieren hinzufügen/entfernen">🖧 Instanzen verwalten</button>
+      <button id="usersbtn" class="adminonly" title="Lokale und Active-Directory-Nutzer sowie LDAP-Zugriff verwalten (nur Admins)">👥 Benutzer &amp; Zugriff</button>
+      <button id="threshbtn" class="adminonly" title="Alarm-Schwellwerte (KV-Cache, GPU-Temperatur, Fehler, Offline) anpassen (nur Admins)">🔔 Schwellwerte</button>
       <button id="export" title="Aktuell angezeigte Zeitreihen als CSV-Datei herunterladen">⬇ Export CSV</button>
       <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">⬇ Export JSON</button>
       <a href="/metrics" target="_blank" rel="noopener" title="Prometheus-Exporter: aktuelle Werte im Prometheus-Textformat (für vorhandenes Prometheus/Grafana). Präfix vllm_monitor_, Labels host/port/model." style="display:block;font-size:12px;padding:2px 0;color:var(--fg);text-decoration:none;border-top:1px solid var(--border);margin-top:2px;padding-top:6px">📡 Prometheus /metrics ↗</a>
     </div>
   </div>
+  <button id="logoutbtn" title="Abmelden" style="display:none">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+  </button>
+  <span class="userchip" id="userchip" title="Angemeldeter Benutzer" style="display:none">
+    <span id="username"></span><span class="rolebadge" id="userrole"></span>
+  </span>
   <span id="countdown"></span>
   <span id="status" style="flex-basis:100%;text-align:right"></span>
 </header>
@@ -1363,9 +2163,11 @@ PAGE = r"""<!DOCTYPE html>
   <div class="modal-card" style="max-width:680px">
     <h2 style="display:flex;align-items:center;gap:10px">🖧 Instanzen verwalten
       <button class="cbtn close" id="tgt-close" title="Schließen" style="margin-left:auto">×</button></h2>
-    <p>Zusätzliche Instanzen werden persistent in <code>targets.json</code> gespeichert und vom
-       Collector automatisch beim nächsten Scrape (≤ 15 s) übernommen – ohne systemd-Unit zu
-       ändern. Die per Setup/Unit definierten Instanzen bleiben unberührt.</p>
+    <p>Alle Instanzen werden persistent in <code>targets.json</code> gespeichert und vom Collector
+       beim nächsten Scrape (≤ 15 s) übernommen – ohne systemd-Unit zu ändern. Die per Setup/Unit
+       definierten vLLM-Instanzen werden beim ersten Start automatisch hier übernommen und sind
+       dann bearbeit-, pausier- und löschbar (✎ bearbeiten, Häkchen = aktiv, × löschen; die letzte
+       vLLM-Instanz bleibt geschützt).</p>
     <table id="tgttable"><thead><tr>
       <th>Typ</th><th>Host</th><th>Port</th><th>Label</th><th>Aktiv</th><th></th>
     </tr></thead><tbody></tbody></table>
@@ -1422,6 +2224,113 @@ sudo update-ca-certificates</pre>
       </ol>
     </div>
     <button id="certclose" style="margin-top:14px">Schließen</button>
+  </div>
+</div>
+
+<!-- Login-/Passwortwechsel-Overlay -->
+<div id="authov">
+  <div class="auth-card" id="logincard">
+    <h2>KI Monitor</h2>
+    <p class="sub">Bitte anmelden</p>
+    <label for="li-user">Benutzer</label>
+    <input id="li-user" autocomplete="username" placeholder="Benutzername oder user@domäne">
+    <label for="li-pass">Passwort</label>
+    <input id="li-pass" type="password" autocomplete="current-password">
+    <button class="primary" id="li-submit">Anmelden</button>
+    <div class="auth-msg" id="li-msg"></div>
+  </div>
+  <div class="auth-card" id="pwcard" style="display:none">
+    <h2>Passwort ändern</h2>
+    <p class="sub" id="pw-sub">Beim ersten Login muss das Passwort geändert werden.</p>
+    <label for="pw-old">Aktuelles Passwort</label>
+    <input id="pw-old" type="password" autocomplete="current-password">
+    <label for="pw-new">Neues Passwort (mind. 6 Zeichen)</label>
+    <input id="pw-new" type="password" autocomplete="new-password">
+    <label for="pw-new2">Neues Passwort wiederholen</label>
+    <input id="pw-new2" type="password" autocomplete="new-password">
+    <button class="primary" id="pw-submit">Speichern</button>
+    <div class="auth-msg" id="pw-msg"></div>
+  </div>
+</div>
+
+<!-- Benutzer- & Zugriffsverwaltung (nur Admins) -->
+<div id="usermodal" class="modal-ov">
+  <div class="modal-card" style="max-width:760px">
+    <h2 style="display:flex;align-items:center;gap:10px">👥 Benutzer &amp; Zugriff
+      <button class="cbtn close" id="usr-close" title="Schließen" style="margin-left:auto">×</button></h2>
+
+    <h4 style="margin:6px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">Lokale Benutzer</h4>
+    <table class="utable" id="localtable"><thead><tr><th>Benutzer</th><th>Rolle</th><th>Status</th><th></th></tr></thead><tbody></tbody></table>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px">
+      <input id="nu-name" class="uinput" placeholder="Benutzername" style="flex:1;min-width:120px">
+      <input id="nu-pass" class="uinput" type="password" placeholder="Passwort" style="width:150px">
+      <select id="nu-role" class="uinput"><option value="admin">Admin</option><option value="readonly" selected>Read-only</option></select>
+      <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px"><input type="checkbox" id="nu-mc">Wechsel erzwingen</label>
+      <button class="abtn" id="nu-add">Anlegen</button>
+    </div>
+
+    <h4 style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">Active-Directory-Benutzer (Einzelfreigabe)</h4>
+    <table class="utable" id="adtable"><thead><tr><th>Benutzer (sAMAccountName)</th><th>Rolle</th><th></th></tr></thead><tbody></tbody></table>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px">
+      <input id="na-name" class="uinput" placeholder="z. B. jdoe" style="flex:1;min-width:120px">
+      <select id="na-role" class="uinput"><option value="admin">Admin</option><option value="readonly" selected>Read-only</option></select>
+      <button class="abtn" id="na-add">Freigeben</button>
+    </div>
+
+    <h4 style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">LDAP-/AD-Anbindung</h4>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 12px">
+      <label style="font-size:12px;color:var(--muted);grid-column:1/3;display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="ld-enabled"> LDAP-Anmeldung aktivieren</label>
+      <label style="font-size:12px;color:var(--muted)">Domain-Controller (Host/IP)<input id="ld-host" class="uinput" style="width:100%;box-sizing:border-box"></label>
+      <label style="font-size:12px;color:var(--muted)">Domäne (UPN-Suffix)<input id="ld-domain" class="uinput" style="width:100%;box-sizing:border-box" placeholder="z. B. firma.int"></label>
+      <label style="font-size:12px;color:var(--muted)">TLS<select id="ld-tls" class="uinput" style="width:100%"><option value="auto">auto (LDAPS, sonst Klartext)</option><option value="require">nur LDAPS</option><option value="off">nur Klartext</option></select></label>
+      <label style="font-size:12px;color:var(--muted)">Basis-DN (optional)<input id="ld-base" class="uinput" style="width:100%;box-sizing:border-box" placeholder="autom. aus Domäne"></label>
+      <label style="font-size:12px;color:var(--muted)">Admin-Gruppe (CN oder DN)<input id="ld-gadmin" class="uinput" style="width:100%;box-sizing:border-box" placeholder="z. B. vllm-admins"></label>
+      <label style="font-size:12px;color:var(--muted)">Read-only-Gruppe<input id="ld-gro" class="uinput" style="width:100%;box-sizing:border-box" placeholder="z. B. vllm-viewer"></label>
+      <label style="font-size:12px;color:var(--muted)">Standardrolle (ohne Gruppe/Freigabe)<select id="ld-defrole" class="uinput" style="width:100%"><option value="">kein Zugriff</option><option value="readonly">Read-only</option><option value="admin">Admin</option></select></label>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:10px">
+      <button class="abtn" id="ld-save">LDAP speichern</button>
+      <span style="flex:1"></span>
+      <input id="ld-tuser" class="uinput" placeholder="Test-Benutzer" style="width:130px">
+      <input id="ld-tpass" class="uinput" type="password" placeholder="Test-Passwort" style="width:130px">
+      <button class="abtn" id="ld-test">Verbindung testen</button>
+    </div>
+
+    <h4 style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">Verzeichnis durchsuchen</h4>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      <select id="ds-kind" class="uinput"><option value="user">Benutzer</option><option value="group">Gruppe</option></select>
+      <input id="ds-q" class="uinput" placeholder="Name/Teil eingeben…" style="flex:1;min-width:150px">
+      <button class="abtn" id="ds-go">🔍 Suchen</button>
+      <span style="font-size:11px;color:var(--muted)">nutzt die Test-Anmeldedaten oben</span>
+    </div>
+    <div id="ds-results" style="margin-top:6px;max-height:190px;overflow:auto"></div>
+
+    <div id="usr-msg" style="color:var(--muted);font-size:12px;margin-top:10px;min-height:16px"></div>
+  </div>
+</div>
+
+<!-- Alarm-Schwellwerte (nur Admins) -->
+<div id="threshmodal" class="modal-ov">
+  <div class="modal-card" style="max-width:460px">
+    <h2 style="display:flex;align-items:center;gap:10px">🔔 Alarm-Schwellwerte
+      <button class="cbtn close" id="th-close" title="Schließen" style="margin-left:auto">×</button></h2>
+    <p>Ab diesen Werten löst der Collector einen Alarm aus (gilt für alle Instanzen,
+       greift ohne Neustart beim nächsten Scrape ≤ 15 s).</p>
+    <div style="display:grid;grid-template-columns:1fr auto;gap:10px 12px;align-items:center">
+      <label for="th-temp">GPU-Temperatur – Alarm über (°C)</label>
+      <input id="th-temp" type="number" min="0" step="1" class="uinput" style="width:100px">
+      <label for="th-kv">KV-Cache-Auslastung – Alarm über (%)</label>
+      <input id="th-kv" type="number" min="0" max="100" step="1" class="uinput" style="width:100px">
+      <label for="th-err">Neue Fehler je Scrape – Alarm über</label>
+      <input id="th-err" type="number" min="0" step="1" class="uinput" style="width:100px">
+      <label for="th-offline">Offline-Dauer bis Alarm (Minuten)</label>
+      <input id="th-offline" type="number" min="0" step="0.5" class="uinput" style="width:100px">
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:14px">
+      <button class="abtn" id="th-save">Speichern</button>
+      <span id="th-msg" style="color:var(--muted);font-size:12px;min-height:16px"></span>
+    </div>
   </div>
 </div>
 
@@ -1710,17 +2619,22 @@ function passHost(model){
 function renderHostFilter(){
   const wrap=document.getElementById("hostfilterwrap"), sel=document.getElementById("hostfilter");
   if(!sel)return; const hosts=hostList();
-  wrap.style.display = hosts.length>1 ? "" : "none";
+  wrap.style.display = hosts.length ? "" : "none";   // direkt hinter dem Titel, Default „Alle Hosts“
   sel.innerHTML='<option value="">Alle Hosts</option>'+hosts.map(h=>'<option value="'+h+'">'+h+'</option>').join("");
   if(hostFilter && hosts.includes(hostFilter)) sel.value=hostFilter; else { hostFilter=""; sel.value=""; }
 }
 let compareData=null;
 function compareOffset(){ const v=document.getElementById("compare").value;
-  if(v==="0")return 0; if(v==="prev")return parseInt(rangeVal(),10); return parseInt(v,10)||0; }
+  if(v==="0")return 0; if(v==="prev")return windowSpan(); return parseInt(v,10)||0; }
 async function fetchCompare(){
   const off=compareOffset();
   if(!off){ compareData=null; if(lastData)applySeries(lastData); return; }
-  try{ compareData=await(await fetch("/api/series?range="+rangeVal()+"&offset="+off)).json(); }
+  let url;
+  if(isAbs()){ const w=absWindow();
+    if(!w){ compareData=null; if(lastData)applySeries(lastData); return; }
+    url="/api/series?from="+(w.from-off)+"&to="+(w.to-off)+"&offset="+off; }
+  else url="/api/series?range="+rangeVal()+"&offset="+off;
+  try{ compareData=await(await fetch(url)).json(); }
   catch(e){ compareData=null; }
   if(lastData)applySeries(lastData);
 }
@@ -1801,7 +2715,8 @@ function renderInstances(){
     if(i.capacity_tokens){capcell=Math.round(i.capacity_tokens).toLocaleString("de-DE")+" Tok"
       +(i.kv_cache_dtype?` <span style="color:var(--muted)">(${i.kv_cache_dtype})</span>`:"");}
     else if(i.vram_bytes){capcell=(i.vram_bytes/1e9).toFixed(2)+" GB VRAM";}
-    tr.innerHTML=`<td><span class="dot ${i.online?"on":"off"}"></span> ${i.online?"online":"offline"}</td>
+    const statusTxt = i.online ? "online" : (i.configured && i.age==null ? "nicht erreichbar" : "offline");
+    tr.innerHTML=`<td><span class="dot ${i.online?"on":"off"}"></span> ${statusTxt}</td>
       <td>${i.kind||"vllm"}</td>
       <td>${i.host}:${i.port}</td><td>${shortModel(i.model)}</td><td>${i.version||"–"}</td>
       <td>${capcell}</td>
@@ -1836,7 +2751,7 @@ function renderCollector(){
   el.style.color = c.ok?"var(--muted)":"var(--bad)";
 }
 async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderHostFilter();renderInstances();renderKPIs();renderCollector();}catch(e){}}
-async function fetchOnce(){try{applySeries(await(await fetch("/api/series?range="+rangeVal())).json());}catch(e){document.getElementById("status").textContent="Fehler: "+e;}}
+async function fetchOnce(){try{applySeries(await(await fetch("/api/series?"+seriesQuery())).json());}catch(e){document.getElementById("status").textContent="Fehler: "+e;}}
 
 // --- Refresh-Steuerung: Live (SSE) oder Intervall ---
 let es=null, remaining=0, period=0, lastMsg=Date.now();
@@ -1845,12 +2760,43 @@ const rangeVal=()=>{ const v=rangeSel();
   if(v==="today"){ const d=new Date(); d.setHours(0,0,0,0);
     return String(Math.max(60, Math.floor((Date.now()-d.getTime())/1000))); }  // seit Mitternacht
   return v; };
+// --- Absolutes Zeitfenster (Von/Bis mit Datum+Uhrzeit) ---
+const isAbs=()=>rangeSel()==="custom";
+function absSecs(id){ const el=document.getElementById(id);
+  if(!el||!el.value)return null; const t=new Date(el.value).getTime();
+  return isNaN(t)?null:Math.floor(t/1000); }
+function absWindow(){ const fr=absSecs("absfrom"), to=absSecs("absto");
+  if(fr==null||to==null||to<=fr)return null; return {from:fr,to:to}; }
+function seriesQuery(){ if(isAbs()){ const w=absWindow();
+    if(w)return "from="+w.from+"&to="+w.to; } return "range="+rangeVal(); }
+function windowSpan(){ if(isAbs()){ const w=absWindow(); return w?(w.to-w.from):0; }
+  return parseInt(rangeVal(),10)||0; }
+function pad2(n){return String(n).padStart(2,"0");}
+function toLocalInput(d){ return d.getFullYear()+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate())
+  +"T"+pad2(d.getHours())+":"+pad2(d.getMinutes()); }
+function ensureAbsDefaults(){ const f=document.getElementById("absfrom"), t=document.getElementById("absto");
+  if(!t.value) t.value=toLocalInput(new Date());
+  if(!f.value){ const d=new Date(); d.setHours(0,0,0,0); f.value=toLocalInput(d); } }
+function applyAbs(){ store.set("vllm_absfrom",document.getElementById("absfrom").value);
+  store.set("vllm_absto",document.getElementById("absto").value);
+  startRefresh(); fetchCompare(); fetchAnnotations(); }
+function rangeLabel(){ const sel=document.getElementById("range");
+  if(sel.value==="custom"){ const w=absWindow();
+    return w ? new Date(w.from*1000).toLocaleString()+" – "+new Date(w.to*1000).toLocaleString()
+             : "benutzerdefiniert"; }
+  return sel.options[sel.selectedIndex].text; }
 const cd=document.getElementById("countdown");
 function setCd(t,cls){cd.className=cls||"";cd.textContent=t;}
 function stopAll(){if(es){es.close();es=null;}}
 
 function startRefresh(){
   stopAll();
+  if(isAbs()){   // fester Zeitraum: kein Live/Intervall, einmalig laden
+    const w=absWindow();
+    setCd(w?"📅 fester Zeitraum":"⚠ Von/Bis unvollständig", "paused");
+    if(w)fetchOnce();
+    return;
+  }
   const mode=document.getElementById("mode").value;
   if(mode==="off"){setCd("Aktualisierung aus","paused");fetchOnce();return;}
   if(mode==="live"){
@@ -1864,6 +2810,7 @@ function startRefresh(){
   }
 }
 setInterval(()=>{
+  if(isAbs())return;   // fester Zeitraum aktualisiert sich nicht selbst
   const mode=document.getElementById("mode").value;
   if(mode==="off")return;
   if(mode==="live"){
@@ -2072,7 +3019,7 @@ function forecastAsText(fc){
   return r.length ? r.map(x=>"- "+x.label+": "+(x.perMin>=0?"+":"")+fmt(x.perMin)+"/min, "+x.eta).join("\n") : "keine kritische Entwicklung";
 }
 function aiPrompt(c){
-  const sel=document.getElementById("range"), rt=sel.options[sel.selectedIndex].text;
+  const rt=rangeLabel();
   return ["Diagramm: "+c.spec.title,
     c.spec.desc?("Bedeutung: "+c.spec.desc.replace(/\n/g," ")):"",
     "Zeitfenster: "+rt+" · Einheit: "+(c.unit||"—"), "",
@@ -2102,7 +3049,7 @@ function openAnalysis(id){
 }
 function closeAnalysis(){ document.getElementById("analysis").classList.remove("open"); }
 function buildReportPrompt(){
-  const sel=document.getElementById("range"), rt=sel.options[sel.selectedIndex].text;
+  const rt=rangeLabel();
   const lines=["Gesamt-Report über alle Monitoring-Diagramme.","Zeitfenster: "+rt,""];
   CHARTS.forEach(spec=>{
     const stats=chartStats(spec); if(!stats.some(s=>s.n))return;
@@ -2185,34 +3132,59 @@ applyDensity(store.get("vllm_density")||"normal");
   gmenu.querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>gmenu.classList.remove("open")));
   document.addEventListener("click",e=>{ if(!gmenu.contains(e.target)&&e.target!==gear) gmenu.classList.remove("open"); });
 })();
-document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeSel());fetchConfig();startRefresh();fetchCompare();fetchAnnotations();};
+document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeSel());
+  document.getElementById("absrange").style.display=isAbs()?"":"none";
+  if(isAbs())ensureAbsDefaults();
+  fetchConfig();startRefresh();fetchCompare();fetchAnnotations();};
+document.getElementById("absapply").onclick=applyAbs;
+["absfrom","absto"].forEach(id=>document.getElementById(id).addEventListener("change",()=>{ if(isAbs())applyAbs(); }));
 document.getElementById("annbtn").onclick=addAnnotation;
 document.getElementById("compare").onchange=()=>{store.set("vllm_compare",document.getElementById("compare").value);fetchCompare();};
 // --- Instanzen verwalten (targets.json über /api/targets) ---
+let _editId=null;
+function tgtResetForm(){
+  _editId=null;
+  document.getElementById("tgt-add").textContent="Hinzufügen";
+  document.getElementById("tgt-host").value=""; document.getElementById("tgt-port").value=""; document.getElementById("tgt-label").value="";
+}
 async function loadTargets(){
   const tb=document.querySelector("#tgttable tbody"); if(!tb)return;
+  tgtResetForm();
   try{
     const j=await(await fetch("/api/targets")).json();
     tb.innerHTML="";
     const ts=j.targets||[];
-    if(!ts.length){ tb.innerHTML='<tr><td colspan="6" class="placeholder">Noch keine zusätzlichen Instanzen.</td></tr>'; return; }
+    if(!ts.length){ tb.innerHTML='<tr><td colspan="6" class="placeholder">Noch keine Instanzen.</td></tr>'; return; }
     ts.forEach(t=>{
       const tr=document.createElement("tr");
       tr.innerHTML='<td>'+t.kind+'</td><td>'+t.host+'</td><td>'+t.port+'</td><td>'+(t.label||"")+'</td>'+
         '<td style="text-align:center"><input type="checkbox" '+(t.enabled!==false?"checked":"")+'></td>'+
-        '<td><button class="cbtn close" title="Entfernen">×</button></td>';
+        '<td style="white-space:nowrap;text-align:right"><button class="cbtn edit" title="Bearbeiten">✎</button> '+
+        '<button class="cbtn close" title="Entfernen">×</button></td>';
       tr.querySelector('input[type=checkbox]').onchange=e=>saveTarget(Object.assign({},t,{enabled:e.target.checked}));
+      tr.querySelector('.cbtn.edit').onclick=()=>editTarget(t);
       tr.querySelector('.cbtn.close').onclick=()=>delTarget(t);
       tb.appendChild(tr);
     });
   }catch(e){}
+}
+function editTarget(t){
+  document.getElementById("tgt-kind").value=t.kind;
+  document.getElementById("tgt-host").value=t.host;
+  document.getElementById("tgt-port").value=t.port;
+  document.getElementById("tgt-label").value=t.label||"";
+  _editId=t.kind+":"+t.host+":"+t.port;
+  document.getElementById("tgt-add").textContent="Speichern";
+  document.getElementById("tgt-msg").textContent="Bearbeiten – Werte anpassen und 'Speichern'.";
+  document.getElementById("tgt-host").focus();
 }
 async function saveTarget(t){
   try{ await fetch("/api/targets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(t)}); }catch(e){}
   loadTargets();
 }
 async function delTarget(t){
-  try{ await fetch("/api/targets?id="+encodeURIComponent(t.kind+":"+t.host+":"+t.port),{method:"DELETE"}); }catch(e){}
+  try{ const r=await(await fetch("/api/targets?id="+encodeURIComponent(t.kind+":"+t.host+":"+t.port),{method:"DELETE"})).json();
+    if(r&&r.error){ document.getElementById("tgt-msg").textContent="⚠️ "+r.error; return; } }catch(e){}
   loadTargets();
 }
 document.getElementById("targetsbtn").onclick=()=>{ document.getElementById("targetmodal").style.display="flex"; loadTargets(); };
@@ -2225,12 +3197,16 @@ document.getElementById("tgt-add").onclick=async()=>{
   const label=document.getElementById("tgt-label").value.trim();
   const msg=document.getElementById("tgt-msg");
   if(!host||!port){ msg.textContent="Host und Port sind erforderlich."; return; }
+  const editing=_editId, newId=kind+":"+host+":"+port;
   try{
     const r=await(await fetch("/api/targets",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({kind,host,port,label,enabled:true})})).json();
     if(r.error){ msg.textContent="⚠️ "+r.error; return; }
-    msg.textContent="Hinzugefügt – wird beim nächsten Scrape (≤ 15 s) übernommen.";
-    document.getElementById("tgt-host").value=""; document.getElementById("tgt-port").value=""; document.getElementById("tgt-label").value="";
+    // Bei geänderter Host/Port-Kombination den alten Eintrag entfernen
+    if(editing && editing!==newId){
+      try{ await fetch("/api/targets?id="+encodeURIComponent(editing),{method:"DELETE"}); }catch(e){}
+    }
+    msg.textContent=(editing?"Gespeichert":"Hinzugefügt")+" – wird beim nächsten Scrape (≤ 15 s) übernommen.";
     loadTargets();
   }catch(e){ msg.textContent="Fehler: "+e; }
 };
@@ -2318,7 +3294,8 @@ function renderAlerts(j){
 async function fetchAlerts(){try{renderAlerts(await(await fetch("/api/alerts?limit=100")).json());}catch(e){}}
 // --- Zeitachsen-Annotationen (Deploy/Restart …) ---
 async function fetchAnnotations(){
-  try{ const j=await(await fetch("/api/annotations?range="+rangeVal())).json();
+  try{ const q=isAbs()?(()=>{const w=absWindow();return w?"from="+w.from+"&to="+w.to:"range="+rangeVal();})():"range="+rangeVal();
+    const j=await(await fetch("/api/annotations?"+q)).json();
     annotations=j.annotations||[]; Object.values(charts).forEach(o=>o.draw()); }catch(e){}
 }
 async function addAnnotation(){
@@ -2391,17 +3368,255 @@ document.getElementById("notif").onclick=()=>{
 (function(){
   const saved=store.get("vllm_range"), sel=document.getElementById("range");
   if(saved && [...sel.options].some(o=>o.value===saved)) sel.value=saved;
+  const af=store.get("vllm_absfrom"), at=store.get("vllm_absto");
+  if(af) document.getElementById("absfrom").value=af;
+  if(at) document.getElementById("absto").value=at;
+  if(sel.value==="custom"){ ensureAbsDefaults(); document.getElementById("absrange").style.display=""; }
   const sc=store.get("vllm_compare"), cs=document.getElementById("compare");
   if(sc && [...cs.options].some(o=>o.value===sc)) cs.value=sc;
 })();
-fetchConfig();
-startRefresh();
-fetchAlerts();
-fetchCompare();
-fetchAnnotations();
-setInterval(fetchConfig,30000);
-setInterval(fetchAlerts,30000);
-setInterval(fetchAnnotations,30000);
+// --- Dashboard erst nach erfolgreicher Anmeldung starten ---
+let _booted=false;
+function bootDashboard(){
+  if(_booted)return; _booted=true;
+  fetchConfig(); startRefresh(); fetchAlerts(); fetchCompare(); fetchAnnotations();
+  setInterval(fetchConfig,30000); setInterval(fetchAlerts,30000); setInterval(fetchAnnotations,30000);
+}
+
+// ===================== Authentifizierung =====================
+function _esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+async function authInit(){
+  let me; try{ me=await(await fetch("/api/me")).json(); }catch(e){ me={authenticated:false}; }
+  applyAuthState(me);
+}
+function applyAuthState(me){
+  window._me=me;
+  const ov=document.getElementById("authov");
+  if(!me.authenticated){ showLogin(); return; }
+  if(me.must_change){ showPasswordChange(); return; }
+  ov.classList.remove("show");
+  document.getElementById("logincard").style.display="";
+  document.getElementById("pwcard").style.display="none";
+  document.body.classList.toggle("is-admin", me.role==="admin");
+  const uc=document.getElementById("userchip"); uc.style.display="";
+  document.getElementById("logoutbtn").style.display="";
+  document.getElementById("username").textContent=me.username;
+  const rb=document.getElementById("userrole");
+  rb.textContent=me.role==="admin"?"Admin":"Read-only";
+  rb.className="rolebadge"+(me.role==="admin"?" admin":"");
+  bootDashboard();
+}
+function showLogin(){
+  const ov=document.getElementById("authov");
+  document.getElementById("logincard").style.display="";
+  document.getElementById("pwcard").style.display="none";
+  ov.classList.add("show");
+  setTimeout(()=>{try{document.getElementById("li-user").focus();}catch(e){}},50);
+}
+function showPasswordChange(){
+  const ov=document.getElementById("authov");
+  document.getElementById("logincard").style.display="none";
+  document.getElementById("pwcard").style.display="";
+  ov.classList.add("show");
+  setTimeout(()=>{try{document.getElementById("pw-old").focus();}catch(e){}},50);
+}
+async function doLogin(){
+  const u=document.getElementById("li-user").value.trim();
+  const p=document.getElementById("li-pass").value;
+  const msg=document.getElementById("li-msg"); msg.textContent="";
+  if(!u||!p){ msg.textContent="Benutzer und Passwort eingeben."; return; }
+  let r; try{ r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({username:u,password:p})}); }catch(e){ msg.textContent="Netzwerkfehler."; return; }
+  document.getElementById("li-pass").value="";
+  if(!r.ok){ msg.textContent="Anmeldung fehlgeschlagen – Benutzer/Passwort prüfen."; return; }
+  const j=await r.json();
+  if(j.must_change){ showPasswordChange(); return; }
+  authInit();
+}
+async function doPassword(){
+  const o=document.getElementById("pw-old").value, n=document.getElementById("pw-new").value, n2=document.getElementById("pw-new2").value;
+  const msg=document.getElementById("pw-msg"); msg.textContent="";
+  if(n.length<6){ msg.textContent="Neues Passwort muss mindestens 6 Zeichen haben."; return; }
+  if(n!==n2){ msg.textContent="Die neuen Passwörter stimmen nicht überein."; return; }
+  let j; try{ j=await(await fetch("/api/password",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({old:o,new:n})})).json(); }catch(e){ msg.textContent="Netzwerkfehler."; return; }
+  if(j.error){ msg.textContent=j.error; return; }
+  document.getElementById("pw-old").value=document.getElementById("pw-new").value=document.getElementById("pw-new2").value="";
+  authInit();
+}
+async function doLogout(){ try{ await fetch("/api/logout",{method:"POST"}); }catch(e){} location.reload(); }
+document.getElementById("li-submit").onclick=doLogin;
+document.getElementById("li-pass").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin();});
+document.getElementById("li-user").addEventListener("keydown",e=>{if(e.key==="Enter")document.getElementById("li-pass").focus();});
+document.getElementById("pw-submit").onclick=doPassword;
+document.getElementById("pw-new2").addEventListener("keydown",e=>{if(e.key==="Enter")doPassword();});
+document.getElementById("logoutbtn").onclick=doLogout;
+
+// ---- Benutzer- & Zugriffsverwaltung (nur Admins) ----
+function umsg(t,ok){ const e=document.getElementById("usr-msg"); e.textContent=t||""; e.style.color=ok?"var(--good)":"var(--bad)"; }
+function openUsers(){ document.getElementById("usermodal").style.display="flex"; loadUsers(); }
+document.getElementById("usersbtn").onclick=openUsers;
+document.getElementById("usr-close").onclick=()=>document.getElementById("usermodal").style.display="none";
+document.getElementById("usermodal").onclick=e=>{ if(e.target===e.currentTarget) e.currentTarget.style.display="none"; };
+async function loadUsers(){
+  let j; try{ j=await(await fetch("/api/users")).json(); }catch(e){ umsg("Laden fehlgeschlagen."); return; }
+  if(j.error){ umsg(j.error); return; }
+  const lt=document.querySelector("#localtable tbody"); lt.innerHTML="";
+  (j.users||[]).forEach(u=>{
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${_esc(u.username)}</td>
+      <td><select class="uinput r"><option value="admin"${u.role==="admin"?" selected":""}>Admin</option>
+        <option value="readonly"${u.role==="readonly"?" selected":""}>Read-only</option></select></td>
+      <td style="color:var(--muted)">${u.must_change?"Passwortwechsel offen":"aktiv"}</td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="cbtn pw" title="Passwort zurücksetzen">🔑</button>
+        <button class="cbtn del" title="Löschen">🗑</button></td>`;
+    const role=()=>tr.querySelector("select.r").value;
+    tr.querySelector("select.r").onchange=()=>saveRole("local",u.username,role());
+    tr.querySelector("button.del").onclick=()=>delUser("local",u.username);
+    tr.querySelector("button.pw").onclick=()=>resetPw("local",u.username,role());
+    lt.appendChild(tr);
+  });
+  const at=document.querySelector("#adtable tbody"); at.innerHTML="";
+  (j.ad_users||[]).forEach(u=>{
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${_esc(u.username)}</td>
+      <td><select class="uinput r"><option value="admin"${u.role==="admin"?" selected":""}>Admin</option>
+        <option value="readonly"${u.role==="readonly"?" selected":""}>Read-only</option></select></td>
+      <td style="text-align:right"><button class="cbtn del" title="Löschen">🗑</button></td>`;
+    tr.querySelector("select.r").onchange=()=>saveRole("ad",u.username,tr.querySelector("select.r").value);
+    tr.querySelector("button.del").onclick=()=>delUser("ad",u.username);
+    at.appendChild(tr);
+  });
+  const L=j.ldap||{};
+  document.getElementById("ld-enabled").checked=!!L.enabled;
+  document.getElementById("ld-host").value=L.host||"";
+  document.getElementById("ld-domain").value=L.domain||"";
+  document.getElementById("ld-tls").value=L.tls||"auto";
+  document.getElementById("ld-base").value=L.base_dn||"";
+  document.getElementById("ld-gadmin").value=L.group_admin||"";
+  document.getElementById("ld-gro").value=L.group_readonly||"";
+  document.getElementById("ld-defrole").value=L.default_role||"";
+  umsg("");
+}
+async function postUsers(body){
+  const j=await(await fetch("/api/users",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)})).json();
+  if(j.error){ umsg(j.error); } else { umsg("Gespeichert.",true); }
+  return j;
+}
+async function saveRole(kind,username,role){ const j=await postUsers({kind,username,role}); if(!j.error)loadUsers(); }
+async function resetPw(kind,username,role){ const p=prompt("Neues Passwort für "+username+":"); if(!p)return;
+  const j=await postUsers({kind,username,role,password:p,must_change:false}); if(!j.error)loadUsers(); }
+async function delUser(kind,username){ if(!confirm(username+" wirklich löschen?"))return;
+  const j=await(await fetch("/api/users?username="+encodeURIComponent(username)+"&kind="+kind,{method:"DELETE"})).json();
+  if(j.error)umsg(j.error); else { umsg("Gelöscht.",true); loadUsers(); } }
+document.getElementById("nu-add").onclick=async()=>{
+  const name=document.getElementById("nu-name").value.trim(), pass=document.getElementById("nu-pass").value;
+  if(!name||!pass){ umsg("Name und Passwort angeben."); return; }
+  const j=await postUsers({kind:"local",username:name,password:pass,role:document.getElementById("nu-role").value,
+    must_change:document.getElementById("nu-mc").checked});
+  if(!j.error){ document.getElementById("nu-name").value=document.getElementById("nu-pass").value=""; loadUsers(); }
+};
+document.getElementById("na-add").onclick=async()=>{
+  const name=document.getElementById("na-name").value.trim();
+  if(!name){ umsg("Benutzername angeben."); return; }
+  const j=await postUsers({kind:"ad",username:name,role:document.getElementById("na-role").value});
+  if(!j.error){ document.getElementById("na-name").value=""; loadUsers(); }
+};
+function ldapFormBody(){ return {
+  enabled:document.getElementById("ld-enabled").checked,
+  host:document.getElementById("ld-host").value.trim(),
+  domain:document.getElementById("ld-domain").value.trim(),
+  tls:document.getElementById("ld-tls").value,
+  base_dn:document.getElementById("ld-base").value.trim(),
+  group_admin:document.getElementById("ld-gadmin").value.trim(),
+  group_readonly:document.getElementById("ld-gro").value.trim(),
+  default_role:document.getElementById("ld-defrole").value }; }
+document.getElementById("ld-save").onclick=async()=>{
+  const j=await(await fetch("/api/ldap",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(ldapFormBody())})).json();
+  if(j.error)umsg(j.error); else umsg("LDAP-Konfiguration gespeichert.",true);
+};
+document.getElementById("ld-test").onclick=async()=>{
+  const b=ldapFormBody(); b.username=document.getElementById("ld-tuser").value.trim();
+  b.password=document.getElementById("ld-tpass").value;
+  if(!b.username||!b.password){ umsg("Test-Benutzer und -Passwort angeben."); return; }
+  umsg("Teste Verbindung …"); document.getElementById("usr-msg").style.color="var(--muted)";
+  let j; try{ j=await(await fetch("/api/ldap/test",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(b)})).json(); }catch(e){ umsg("Netzwerkfehler."); return; }
+  if(j.ok){ umsg("✓ Bind erfolgreich – Rolle: "+j.role+((j.groups&&j.groups.length)?(" · "+j.groups.length+" Gruppe(n)"):""),true); }
+  else umsg("✗ "+(j.error||"Test fehlgeschlagen."));
+};
+// ---- Verzeichnissuche (AD-Benutzer/-Gruppen) ----
+async function doDirSearch(){
+  const kind=document.getElementById("ds-kind").value;
+  const q=document.getElementById("ds-q").value.trim();
+  const box=document.getElementById("ds-results");
+  const b=ldapFormBody(); b.kind=kind; b.q=q;
+  b.username=document.getElementById("ld-tuser").value.trim();
+  b.password=document.getElementById("ld-tpass").value;
+  if(!b.username||!b.password){ umsg("Für die Suche Test-Benutzer/-Passwort oben eingeben."); return; }
+  if(!q){ umsg("Suchbegriff eingeben."); return; }
+  box.innerHTML='<span style="color:var(--muted);font-size:12px">Suche …</span>';
+  let j; try{ j=await(await fetch("/api/ldap/search",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(b)})).json(); }catch(e){ box.innerHTML=""; umsg("Netzwerkfehler."); return; }
+  if(j.error){ box.innerHTML=""; umsg(j.error); return; }
+  umsg("");
+  const rs=j.results||[];
+  if(!rs.length){ box.innerHTML='<span style="color:var(--muted);font-size:12px">Keine Treffer.</span>'; return; }
+  box.innerHTML="";
+  rs.forEach(r=>{
+    const row=document.createElement("div");
+    row.style.cssText="display:flex;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid var(--grid);font-size:13px";
+    if(kind==="group"){
+      row.innerHTML=`<span style="flex:1;min-width:0">${_esc(r.name)}<span style="color:var(--muted);font-size:11px"> ${_esc(r.dn||"")}</span></span>`;
+      const bA=document.createElement("button"); bA.className="cbtn"; bA.title="Als Admin-Gruppe übernehmen"; bA.textContent="→ Admin";
+      bA.onclick=()=>{ document.getElementById("ld-gadmin").value=r.name; umsg("Admin-Gruppe gesetzt: "+r.name+" (noch 'LDAP speichern')",true); };
+      const bR=document.createElement("button"); bR.className="cbtn"; bR.title="Als Read-only-Gruppe übernehmen"; bR.textContent="→ RO";
+      bR.onclick=()=>{ document.getElementById("ld-gro").value=r.name; umsg("Read-only-Gruppe gesetzt: "+r.name+" (noch 'LDAP speichern')",true); };
+      row.appendChild(bA); row.appendChild(bR);
+    } else {
+      row.innerHTML=`<span style="flex:1;min-width:0">${_esc(r.display||r.name)}<span style="color:var(--muted);font-size:11px"> ${_esc(r.name)}</span></span>`;
+      const bU=document.createElement("button"); bU.className="cbtn"; bU.title="In AD-Freigabe übernehmen"; bU.textContent="→ Freigabe";
+      bU.onclick=()=>{ document.getElementById("na-name").value=r.name; umsg("Übernommen: "+r.name+" – Rolle wählen und 'Freigeben'.",true); };
+      row.appendChild(bU);
+    }
+    box.appendChild(row);
+  });
+}
+document.getElementById("ds-go").onclick=doDirSearch;
+document.getElementById("ds-q").addEventListener("keydown",e=>{if(e.key==="Enter")doDirSearch();});
+
+// ---- Alarm-Schwellwerte (nur Admins) ----
+function openThresh(){
+  const th=(lastConfig&&lastConfig.thresholds)||{};
+  document.getElementById("th-temp").value=th.temp!=null?th.temp:85;
+  document.getElementById("th-kv").value=th.kv!=null?th.kv:90;
+  document.getElementById("th-err").value=th.err!=null?th.err:0;
+  document.getElementById("th-offline").value=th.offline_min!=null?th.offline_min:1;
+  document.getElementById("th-msg").textContent="";
+  document.getElementById("threshmodal").style.display="flex";
+}
+document.getElementById("threshbtn").onclick=openThresh;
+document.getElementById("th-close").onclick=()=>document.getElementById("threshmodal").style.display="none";
+document.getElementById("threshmodal").onclick=e=>{ if(e.target===e.currentTarget) e.currentTarget.style.display="none"; };
+document.getElementById("th-save").onclick=async()=>{
+  const body={temp:parseFloat(document.getElementById("th-temp").value),
+    kv:parseFloat(document.getElementById("th-kv").value),
+    err:parseFloat(document.getElementById("th-err").value),
+    offline_min:parseFloat(document.getElementById("th-offline").value)};
+  const msg=document.getElementById("th-msg");
+  for(const k in body){ if(isNaN(body[k])){ msg.style.color="var(--bad)"; msg.textContent="Bitte alle Felder gültig ausfüllen."; return; } }
+  let j; try{ j=await(await fetch("/api/thresholds",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)})).json(); }catch(e){ msg.style.color="var(--bad)"; msg.textContent="Netzwerkfehler."; return; }
+  if(j.error){ msg.style.color="var(--bad)"; msg.textContent=j.error; return; }
+  msg.style.color="var(--good)"; msg.textContent="Gespeichert – greift beim nächsten Scrape (≤ 15 s).";
+  if(lastConfig) lastConfig.thresholds=j.thresholds;
+  fetchConfig();
+};
+
+authInit();
 
 // --- Verbindungssicherheit & Zertifikat ---
 (function(){
@@ -2573,13 +3788,16 @@ def main():
     print("vLLM-Dashboard %s läuft:  %s://%s:%d  (Bind %s)" % (__version__, scheme, shown, port, bind))
     if scheme == "https":
         print("  [i] Self-signed? Der Browser zeigt einmalig eine Warnung – Ausnahme bestätigen.")
-    if AUTH_ENABLED:
-        print("  [i] LDAP-Authentifizierung aktiv: DC %s, Domäne %s%s"
-              % (LDAP_HOST, LDAP_DOMAIN or "?", (" (Allow-Liste: %d)" % len(LDAP_ALLOW)) if LDAP_ALLOW else ""))
-        if scheme != "https":
-            print("  [!] ACHTUNG: Auth ohne HTTPS – Zugangsdaten gehen im Klartext übers Netz. TLS aktivieren!")
-    elif bind in ("0.0.0.0", ""):
-        print("  [!] Ohne Auth im Netzwerk erreichbar – ggf. per Firewall einschränken oder VLLM_LDAP_HOST setzen.")
+    au = load_auth()
+    n_local = len(au.get("users", []))
+    default_admin = any(u.get("username") == "admin" and u.get("must_change") for u in au.get("users", []))
+    ldap_on = bool(au.get("ldap", {}).get("enabled"))
+    print("  [i] Authentifizierung aktiv: %d lokale(r) Nutzer, LDAP %s"
+          % (n_local, "an (DC %s)" % au["ldap"].get("host", "?") if ldap_on else "aus"))
+    if default_admin:
+        print("  [!] Standard-Login admin/admin ist noch aktiv – bei der ersten Anmeldung im Browser ändern!")
+    if scheme != "https":
+        print("  [!] ACHTUNG: Login ohne HTTPS – Zugangsdaten gehen im Klartext übers Netz. TLS aktivieren!")
     print("DB: %s   (Strg+C zum Beenden)" % DB_PATH)
     try:
         srv.serve_forever()

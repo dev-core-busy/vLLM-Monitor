@@ -149,11 +149,9 @@ do_install() {
     local D_AI_URL="${VLLM_AI_URL:-}"
     local D_AI_MODEL="${VLLM_AI_MODEL:-}"
     local D_REPORT="${VLLM_REPORT:-}"
-    local D_LDAP_HOST="${VLLM_LDAP_HOST:-}"
-    local D_LDAP_DOMAIN="${VLLM_LDAP_DOMAIN:-}"
 
     echo
-    local ip targets bind port https="n" ans ollama stt dcgm ai_url ai_model report_when ldap_host ldap_domain
+    local ip targets bind port https="n" ans ollama stt dcgm ai_url ai_model report_when
     while true; do
         ip="$(ask "Ziel-IP des vLLM-Hosts" "$D_IP")"
         if valid_ip "$ip"; then break; fi
@@ -168,9 +166,6 @@ do_install() {
     [ -n "$ai_url" ] && ai_model="$(ask "KI-Modell (Name lt. /v1/models)" "$D_AI_MODEL")"
     report_when=""
     [ -n "$ai_url" ] && report_when="$(ask "Geplanter KI-Schicht-Report? systemd OnCalendar (z.B. '*-*-* 06,14,22:00', leer=aus)" "$D_REPORT")"
-    ldap_host="$(ask "LDAP/AD-Authentifizierung: Domain-Controller (Host/IP, leer=keine Auth)" "$D_LDAP_HOST")"
-    ldap_domain=""
-    [ -n "$ldap_host" ] && ldap_domain="$(ask "AD-Domäne (UPN-Suffix, z.B. nexus.int)" "$D_LDAP_DOMAIN")"
     bind="$(ask "Dashboard-Bind (0.0.0.0=Netz, 127.0.0.1=nur lokal)" "$D_BIND")"
     port="$(ask "Dashboard-Port" "$D_PORT")"
     # Zertifikat muss auf die Adresse lauten, die der BROWSER aufruft (Dashboard-Host)
@@ -199,8 +194,6 @@ VLLM_DCGM=$dcgm
 VLLM_AI_URL=$ai_url
 VLLM_AI_MODEL=$ai_model
 VLLM_REPORT=$report_when
-VLLM_LDAP_HOST=$ldap_host
-VLLM_LDAP_DOMAIN=$ldap_domain
 VLLM_BIND=$bind
 VLLM_PORT=$port
 VLLM_HTTPS=$https
@@ -243,8 +236,6 @@ EOF
     [ "$https" = "j" ] && tls_env="Environment=VLLM_TLS_CERT=$CERT"$'\n'"Environment=VLLM_TLS_KEY=$KEY"
     local ai_env=""
     [ -n "$ai_url" ] && ai_env="Environment=VLLM_AI_URL=$ai_url"$'\n'"Environment=VLLM_AI_MODEL=$ai_model"$'\n'"Environment=VLLM_AI_NO_THINK=1"
-    local ldap_env=""
-    [ -n "$ldap_host" ] && ldap_env="Environment=VLLM_LDAP_HOST=$ldap_host"$'\n'"Environment=VLLM_LDAP_DOMAIN=$ldap_domain"
 
     cat > "$UNIT_DIR/vllm-dashboard.service" <<EOF
 [Unit]
@@ -257,7 +248,6 @@ WorkingDirectory=$DIR
 Environment=VLLM_LABEL=$ip
 ${tls_env}
 ${ai_env}
-${ldap_env}
 ExecStart=$PY $DIR/vllm_dashboard.sh $port $bind
 Restart=always
 RestartSec=10
@@ -325,7 +315,9 @@ EOF
     echo "${G}${B}Fertig.${N}  Ziel: $ip   Instanzen: $targets"
     echo "Dashboard:  ${B}${scheme}://${shown:-127.0.0.1}:$port${N}"
     [ "$https" = "j" ] && warn "Self-signed: der Browser zeigt einmalig eine Zertifikatswarnung – Ausnahme bestätigen."
-    [ "$bind" = "0.0.0.0" ] && warn "Ohne Auth im Netz erreichbar – ggf. per Firewall einschränken."
+    ok "Erstanmeldung im Browser mit ${B}admin / admin${N} – das Passwort wird sofort abgefragt und muss geändert werden."
+    echo "   Weitere Benutzer und die LDAP-/AD-Anbindung werden danach im Dashboard unter ⚙ → 👥 Benutzer & Zugriff gepflegt."
+    [ "$bind" = "0.0.0.0" ] && [ "$https" != "j" ] && warn "Login ohne HTTPS im Netz – Zugangsdaten gehen im Klartext übers Netz. HTTPS empfohlen."
 }
 
 # ---------------------------------------------------------------------------
@@ -355,6 +347,14 @@ do_uninstall() {
 
     read -rp "Gemerkte Einstellungen ($CONF) löschen? [j/N]: " a || true
     if [[ "${a,,}" == "j" ]]; then rm -f "$CONF"; ok "Einstellungen gelöscht."; fi
+
+    if [ -f "$DIR/auth.json" ] || [ -f "$DIR/settings.json" ] || [ -f "$DIR/targets.json" ]; then
+        read -rp "Benutzer/LDAP, Schwellwerte und Zusatz-Instanzen (auth.json, settings.json, targets.json) löschen? [j/N]: " a || true
+        if [[ "${a,,}" == "j" ]]; then
+            rm -f "$DIR/auth.json" "$DIR/settings.json" "$DIR/targets.json" "$DIR/.auth_secret"
+            ok "Lokale Konfiguration (Benutzer/Schwellwerte/Instanzen) gelöscht."
+        fi
+    fi
 
     if [ -f "$CERT" ] || [ -f "$KEY" ]; then
         read -rp "TLS-Zertifikat ($CERT / Key) löschen? [j/N]: " a || true

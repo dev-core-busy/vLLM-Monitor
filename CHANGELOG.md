@@ -4,6 +4,45 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.17.0] – 2026-07-16
+
+### Neu
+- **Benutzerverwaltung & Rollen (Login immer aktiv):** Alle Konten, Rollen und die
+  LDAP-Konfiguration liegen in **`auth.json`** (`VLLM_AUTH_FILE`, `0600`, nicht ins
+  Git). Erststart mit **admin/admin**, Passwortwechsel beim ersten Login erzwungen.
+  Zwei Rollen – **Admin** (Vollzugriff + Verwaltung) und **Read-only** (Ansicht +
+  KI-Auswertung, alle Schreib-/Verwaltungsaktionen serverseitig 403). Lokale
+  Passwörter **PBKDF2-HMAC-SHA256** (`VLLM_PBKDF2_ITER`). Anmeldung über ein
+  **HTML-Login-Formular** (`/api/login`, `/api/logout`, `/api/password`, `/api/me`);
+  Session-Cookie trägt Benutzer+Rolle. Basic-Auth bleibt für Scraper (Prometheus)
+  gültig. Verwaltung im UI unter ⚙ → 👥 *Benutzer & Zugriff*
+  (`GET/POST/DELETE /api/users`).
+- **LDAP/AD im UI konfigurierbar:** Host, Domäne, TLS, Basis-DN, Admin-/Read-only-
+  **Gruppe** (via LDAP **`memberOf`-Suche**) und Standardrolle; zusätzlich
+  **Verzeichnissuche** nach AD-Benutzern/-Gruppen und ein Verbindungstest
+  (`POST /api/ldap`, `/api/ldap/test`, `/api/ldap/search`). Rolle: expliziter
+  AD-Nutzer > Gruppen-Mapping > Standardrolle. Die `VLLM_LDAP_*`-Env dienen nur noch
+  als **Erst-Seed**; **`setup.sh` fragt LDAP nicht mehr ab**.
+- **vLLM-Instanzen im UI verwaltbar:** die per Unit definierten Instanzen werden
+  beim ersten Start in `targets.json` übernommen und sind dann bearbeit-, pausier-
+  und löschbar (✎); die **letzte** vLLM-Instanz bleibt geschützt.
+- **Unerreichbare Instanzen sichtbar:** eingetragene Ziele erscheinen jetzt auch
+  offline in der Instanzen-Tabelle („nicht erreichbar"), statt zu fehlen.
+- **Alarm-Schwellwerte im UI editierbar** (⚙ → 🔔 Schwellwerte, nur Admins):
+  GPU-Temperatur, KV-Cache-%, Fehler/Scrape, Offline-Minuten – persistent in
+  `settings.json`, vom Collector bei jedem Scrape neu gelesen (ohne Neustart).
+  `POST /api/thresholds`.
+- **Freier Zeitraum (Von/Bis mit Datum & Uhrzeit):** neue Option
+  „benutzerdefiniert…" im Zeitraum-Pulldown; `/api/series`/`/api/annotations`
+  akzeptieren zusätzlich `from`/`to`.
+
+### Geändert
+- **UI heißt jetzt „KI Monitor"** (Titelzeile, Browser-Tab, Login). Die
+  Host-Auswahl sitzt direkt hinter dem Titel (Default „Alle Hosts", im Cookie
+  gespeichert); die feste Host-IP in der Titelzeile entfällt.
+- **Icons vereinheitlicht** (Outline-SVG, hell/dunkel via `currentColor`):
+  Zahnrad, Abmelden und Hell-/Dunkel-Umschalter (Mond/Sonne); „Neu laden" größer.
+
 ## [0.16.1] – 2026-07-13
 
 ### Behoben
