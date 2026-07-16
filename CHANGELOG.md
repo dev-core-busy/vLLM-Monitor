@@ -4,6 +4,13 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.18.1] – 2026-07-16
+
+### Geändert
+- Die beiden Token-Diagramme in „Effizienz & Kapazität" sitzen jetzt in einem
+  **Rahmen** (wie die Karten); die Überschrift steht darüber und das Diagramm
+  **füllt den Rahmen** in fester Höhe aus.
+
 ## [0.18.0] – 2026-07-16
 
 ### Neu

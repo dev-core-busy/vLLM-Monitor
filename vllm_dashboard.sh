@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.18.0"
+__version__ = "0.18.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -1958,6 +1958,8 @@ PAGE = r"""<!DOCTYPE html>
   .metric.warn b{color:var(--warn);} .metric.bad b{color:var(--bad);}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(var(--tile-min),1fr));gap:14px;padding:14px 16px;}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;position:relative;}
+  .tokbox{border:1px solid var(--border);border-radius:10px;padding:12px 14px;height:277px;}
+  .tokbox>div{position:relative;height:100%;}
   .card h2{font-size:12px;margin:0 0 6px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;}
   .cardbtns{position:absolute;top:5px;right:7px;display:flex;gap:3px;z-index:6;}
   .cbtn{background:var(--panel);border:1px solid var(--border);color:var(--muted);border-radius:5px;
@@ -2211,14 +2213,14 @@ PAGE = r"""<!DOCTYPE html>
   <div class="cardbtns"><button class="cbtn" id="efftoggle" title="Ein-/Ausklappen">▸</button></div>
   <h2><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Effizienz & Kapazität <span style="color:var(--muted);font-weight:400;font-size:11px">(Ø über Zeitfenster, hochgerechnet)</span></h2>
   <div id="effbody" style="display:flex;flex-wrap:wrap;gap:18px;padding-top:4px"></div>
-  <div id="efftok" style="padding-top:14px;display:flex;flex-direction:column;gap:22px">
+  <div id="efftok" style="padding-top:14px;display:flex;flex-direction:column;gap:16px">
     <div>
       <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Generierte Tokens im gewählten Zeitraum (je Modell)</div>
-      <div style="position:relative;height:230px"><canvas id="rangetokchart"></canvas></div>
+      <div class="tokbox"><div><canvas id="rangetokchart"></canvas></div></div>
     </div>
     <div>
       <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Generierte Tokens pro Tag – seit Aufzeichnungsbeginn (je Modell gestapelt)</div>
-      <div style="position:relative;height:230px"><canvas id="tokchart"></canvas></div>
+      <div class="tokbox"><div><canvas id="tokchart"></canvas></div></div>
     </div>
   </div>
 </div>
