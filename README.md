@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.18.6-blue)
+![Version](https://img.shields.io/badge/version-0.19.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -89,10 +89,14 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
   oder per **AD-Gruppe**) sowie die **LDAP-Anbindung** werden im UI unter
   ⚙ → 👥 *Benutzer & Zugriff* gepflegt (persistent in `auth.json`, Passwörter
   PBKDF2-gehasht; LDAP Simple Bind + `memberOf`-Gruppensuche, nur stdlib).
-- 🖧 **Instanzen im UI verwalten** – zusätzliche vLLM-/Ollama-/STT-/GPU-Ziele
-  über das ⚙-Menü hinzufügen, pausieren oder entfernen (persistent in
+- 🖧 **Instanzen im UI verwalten** – zusätzliche vLLM-/Ollama-/**LM-Studio**-/STT-/
+  GPU-Ziele über das ⚙-Menü hinzufügen, pausieren oder entfernen (persistent in
   `targets.json`; der Collector lädt sie zur Laufzeit) – ohne systemd-Unit zu
   editieren. Schreibzugriff nur mit aktiver Authentifizierung sinnvoll.
+- 🎛️ **LM Studio** (OpenAI-kompatibel, kein `/metrics`) wird über die REST-API
+  `/api/v0/models` überwacht (geladenes Modell + Kontextlänge + Online-Status);
+  optional misst eine kleine Probe **nur gegen geladene Modelle** Token-Durchsatz
+  und TTFT (`VLLM_LMSTUDIO_TARGETS`, Standardport 1234).
 - 📐 **Latenz-Perzentile P50/P95/P99** (TTFT/E2E/ITL) aus den Histogramm-Buckets.
 - ⚡ **Live-Push (SSE)**, Zoom/Pan, synchrones Fadenkreuz, Counter-Reset-Marker,
   CSV-/JSON-Export, Hell/Dunkel, frei wählbare Kachelfarben & -dichte,

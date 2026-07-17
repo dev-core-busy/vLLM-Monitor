@@ -34,7 +34,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.18.6"
+__version__ = "0.19.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -171,7 +171,7 @@ def _file_has_vllm():
 
 def load_extra_targets():
     """Liest targets.json (vom Dashboard gepflegt). Nur aktivierte Einträge."""
-    out = {"vllm": [], "ollama": [], "stt": [], "dcgm": []}
+    out = {"vllm": [], "ollama": [], "stt": [], "dcgm": [], "lmstudio": []}
     try:
         with open(TARGETS_FILE) as f:
             data = json.load(f)
@@ -191,7 +191,7 @@ def load_extra_targets():
             out["dcgm"].append((host, port))
         elif kind == "vllm":
             out["vllm"].append({"host": host, "port": port})
-        else:  # ollama / stt
+        else:  # ollama / stt / lmstudio
             out[kind].append({"host": host, "port": port, "label": t.get("label") or kind})
     return out
 
@@ -230,6 +230,12 @@ _oll_acc = {}   # (host,port,model) -> laufende Summen/Buckets der Probes
 
 # STT-Server (z.B. faster-whisper) – nur /health (Status + aktive Sessions)
 STT_TARGETS = _parse_ollama(os.environ.get("VLLM_STT_TARGETS", ""))
+
+# LM Studio (OpenAI-kompatibel, kein Prometheus /metrics – REST-API /api/v0)
+LMSTUDIO_TARGETS = _parse_ollama(os.environ.get("VLLM_LMSTUDIO_TARGETS", ""))
+LMSTUDIO_PROBE = os.environ.get("VLLM_LMSTUDIO_PROBE", "1").lower() not in ("0", "false", "no", "off")
+LMSTUDIO_PROMPT = os.environ.get("VLLM_LMSTUDIO_PROMPT", "Antworte knapp in einem Satz: Hallo.")
+LMSTUDIO_MAX_TOKENS = int(os.environ.get("VLLM_LMSTUDIO_MAX_TOKENS", "24"))
 
 
 def _parse_hostports(spec):
@@ -716,6 +722,97 @@ def scrape_ollama(conn, ts, tgt, verbose=True):
     return 1
 
 
+# ---------------------------------------------------------------------------
+# LM Studio (OpenAI-kompatibel; REST-API /api/v0 liefert Lade-Status + Stats)
+# ---------------------------------------------------------------------------
+
+def lmstudio_probe(host, port, model):
+    """Kleiner /api/v0/chat/completions-Aufruf -> Token-/Latenz-Kennzahlen.
+    LM Studio liefert ein 'stats'-Objekt (tokens_per_second, time_to_first_token,
+    generation_time in Sekunden) und 'usage' (prompt/completion_tokens)."""
+    body = json.dumps({"model": model,
+                       "messages": [{"role": "user", "content": LMSTUDIO_PROMPT}],
+                       "max_tokens": LMSTUDIO_MAX_TOKENS, "stream": False}).encode("utf-8")
+    req = request.Request("http://%s:%d/api/v0/chat/completions" % (host, port), data=body,
+                          headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        resp = request.urlopen(req, timeout=OLLAMA_PROBE_TIMEOUT)
+        d = json.loads(resp.read().decode("utf-8", "replace"))
+    except (error.URLError, OSError, ValueError):
+        return None
+    st = d.get("stats") or {}
+    us = d.get("usage") or {}
+    cc = us.get("completion_tokens") or 0
+    pc = us.get("prompt_tokens") or 0
+    ttft = float(st.get("time_to_first_token") or 0.0)
+    gt = float(st.get("generation_time") or 0.0)
+    return {"gen": cc, "prompt": pc, "ttft": ttft, "e2e": ttft + gt,
+            "itl": (gt / cc) if cc else 0.0}
+
+
+def scrape_lmstudio(conn, ts, tgt, verbose=True):
+    host, port = tgt["host"], tgt["port"]
+    data = get_json(host, port, "/api/v0/models", timeout=OLLAMA_TIMEOUT)
+    api_v0 = data is not None
+    if data is None:                                # Fallback: OpenAI-kompatibel
+        data = get_json(host, port, "/v1/models", timeout=OLLAMA_TIMEOUT)
+    if data is None:
+        mark_down(conn, host, port)
+        if verbose:
+            print("  [!] LM Studio %s:%d nicht erreichbar." % (host, port))
+        return 0
+    _down_since.pop((host, port), None)             # wieder erreichbar -> Entprellung zurücksetzen
+    models = data.get("data") or []
+    loaded = [m for m in models if m.get("state") == "loaded"]
+    model, ctx = None, None
+    if loaded:
+        m0 = loaded[0]
+        model = m0.get("id") or m0.get("model")
+        ctx = m0.get("loaded_context_length") or m0.get("max_context_length")
+    elif models:
+        model = models[0].get("id") or models[0].get("model")
+    if not model:
+        model = tgt["label"]
+
+    values = {c: None for c in (NUM_COLUMNS + JSON_COLUMNS)}
+    cfg = {"up": 1, "version": ("api/v0" if api_v0 else "v1"), "kind": "lmstudio"}
+    if ctx is not None:
+        try:
+            cfg["max_model_len"] = int(ctx)
+        except (ValueError, TypeError):
+            pass
+
+    # Probe nur gegen ein tatsächlich GELADENES Modell (kein Kalt-Load auslösen);
+    # der Lade-Status ist nur über die /api/v0-API bekannt.
+    if LMSTUDIO_PROBE and loaded and api_v0:
+        pr = lmstudio_probe(host, port, model)
+        if pr:
+            acc = _oll_acc.setdefault((host, port, model), _oll_new())
+            acc["gen"] += pr["gen"]
+            acc["prompt"] += pr["prompt"]
+            acc["req_ok"] += 1
+            _oll_bump(acc, "ttft", pr["ttft"])
+            _oll_bump(acc, "e2e", pr["e2e"])
+            if pr["itl"] > 0:
+                _oll_bump(acc, "itl", pr["itl"])
+            values["generation_tokens_total"] = acc["gen"]
+            values["prompt_tokens_total"] = acc["prompt"]
+            values["requests_success_total"] = acc["req_ok"]
+            values["req_stop"] = acc["req_ok"]
+            values["ttft_sum"], values["ttft_count"] = acc["ttft_sum"], acc["ttft_n"]
+            values["e2e_sum"], values["e2e_count"] = acc["e2e_sum"], acc["e2e_n"]
+            values["itl_sum"], values["itl_count"] = acc["itl_sum"], acc["itl_n"]
+            values["ttft_buckets"] = json.dumps(acc["ttft_h"])
+            values["e2e_buckets"] = json.dumps(acc["e2e_h"])
+            values["itl_buckets"] = json.dumps(acc["itl_h"])
+
+    store_sample(conn, ts, host, port, model, values)
+    store_config(conn, host, port, model, cfg)
+    if verbose:
+        print("  [+] (lmstudio) %-30s gen=%s" % (model, _fmt(values.get("generation_tokens_total"))))
+    return 1
+
+
 def scrape_stt(conn, ts, tgt, verbose=True):
     """STT-Server (faster-whisper o.ä.): /health -> Status + aktive Sessions."""
     host, port = tgt["host"], tgt["port"]
@@ -899,6 +996,13 @@ def scrape_once(conn, verbose=True):
             total += scrape_stt(conn, ts, tgt, verbose)
         except Exception as e:
             print("  [!] STT-Fehler %s:%d: %s" % (tgt["host"], tgt["port"], e))
+
+    # LM Studio (OpenAI-kompatibel, REST-API /api/v0)
+    for tgt in LMSTUDIO_TARGETS + extra["lmstudio"]:
+        try:
+            total += scrape_lmstudio(conn, ts, tgt, verbose)
+        except Exception as e:
+            print("  [!] LM-Studio-Fehler %s:%d: %s" % (tgt["host"], tgt["port"], e))
 
     # NVIDIA DCGM-Exporter (GPU-Hardware)
     for host, port in DCGM_TARGETS + extra["dcgm"]:

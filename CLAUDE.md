@@ -59,12 +59,17 @@ exposes a **Prometheus exporter** at `GET /metrics` (`build_prometheus()`,
 prefix `vllm_monitor_`, labels host/port/model; cumulative values as counters)
 for scraping by an existing Prometheus/Grafana — additive to the SQLite pipeline.
 
-**UI-managed instances:** extra vLLM/Ollama/STT/DCGM targets can be added,
-paused or removed from the ⚙ menu; they persist in `targets.json`
+**UI-managed instances:** extra vLLM/Ollama/**LM-Studio**/STT/DCGM targets can be
+added, paused or removed from the ⚙ menu; they persist in `targets.json`
 (`VLLM_TARGETS_FILE`) which the collector re-reads every scrape
-(`load_extra_targets()` → `scrape_vllm_target()`/`scrape_ollama`/… ) on top of
-the env-defined targets. Dashboard write endpoints: `GET/POST/DELETE
-/api/targets` (auth-guarded).
+(`load_extra_targets()` → `scrape_vllm_target()`/`scrape_ollama`/`scrape_lmstudio`/…)
+on top of the env-defined targets. Dashboard write endpoints: `GET/POST/DELETE
+/api/targets` (auth-guarded). **LM Studio** has no Prometheus `/metrics`; it is
+scraped like Ollama via its REST API (`/api/v0/models` for the loaded model +
+context length, and an optional generation probe on `/api/v0/chat/completions`
+that runs **only against already-loaded models** to avoid cold-load stalls).
+Config: `VLLM_LMSTUDIO_TARGETS` (`host:port:label`), `VLLM_LMSTUDIO_PROBE`,
+`VLLM_LMSTUDIO_PROMPT`, `VLLM_LMSTUDIO_MAX_TOKENS`.
 
 **Authentication & user management (always on):** the dashboard now *always*
 requires a login. All accounts, roles and the LDAP config live in **`auth.json`**

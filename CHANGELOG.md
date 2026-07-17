@@ -4,6 +4,20 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.19.0] – 2026-07-17
+
+### Hinzugefügt
+- **LM-Studio-Unterstützung:** LM Studio kann jetzt als Instanz überwacht werden
+  (⚙ → 🖧 *Instanzen verwalten* → Typ **„LM Studio"**, Standardport **1234**;
+  im `setup.sh` eigener Prompt). Der Collector (`scrape_lmstudio`) liest
+  `/api/v0/models` für das geladene Modell, die Kontextlänge und den
+  Online-Status (Fallback auf `/v1/models`). Eine optionale **Durchsatz-Probe**
+  (`/api/v0/chat/completions`) liefert Tokens/s, TTFT und kumulierte Tokens für
+  KPI-Karten und Diagramme – wie bei Ollama läuft sie **nur gegen bereits
+  geladene Modelle** (kein Kalt-Load, kein Flackern) und mit begrenztem Timeout.
+  Konfiguration: `VLLM_LMSTUDIO_TARGETS` (`host:port:label`),
+  `VLLM_LMSTUDIO_PROBE`, `VLLM_LMSTUDIO_PROMPT`, `VLLM_LMSTUDIO_MAX_TOKENS`.
+
 ## [0.18.6] – 2026-07-16
 
 ### Behoben

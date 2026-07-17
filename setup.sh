@@ -145,13 +145,14 @@ do_install() {
     D_HTTPS="${VLLM_HTTPS:-$D_HTTPS}"
     D_OLLAMA="${VLLM_OLLAMA:-$D_OLLAMA}"
     local D_STT="${VLLM_STT:-}"
+    local D_LMSTUDIO="${VLLM_LMSTUDIO:-}"
     local D_DCGM="${VLLM_DCGM:-}"
     local D_AI_URL="${VLLM_AI_URL:-}"
     local D_AI_MODEL="${VLLM_AI_MODEL:-}"
     local D_REPORT="${VLLM_REPORT:-}"
 
     echo
-    local ip targets bind port https="n" ans ollama stt dcgm ai_url ai_model report_when
+    local ip targets bind port https="n" ans ollama stt lmstudio dcgm ai_url ai_model report_when
     while true; do
         ip="$(ask "Ziel-IP des vLLM-Hosts" "$D_IP")"
         if valid_ip "$ip"; then break; fi
@@ -160,6 +161,7 @@ do_install() {
     targets="$(ask "vLLM-Instanzen ([host:]port[:label], mehrere per Komma; Host-Präfix = anderer Host)" "$D_TARGETS")"
     ollama="$(ask "Ollama-Instanz(en)? host:port:label (leer=keine, Autoscan bleibt aktiv)" "$D_OLLAMA")"
     stt="$(ask "STT-Server (faster-whisper)? host:port:label (leer=keiner)" "$D_STT")"
+    lmstudio="$(ask "LM-Studio-Instanz(en)? host:port:label (Standardport 1234, leer=keine)" "$D_LMSTUDIO")"
     dcgm="$(ask "NVIDIA DCGM-Exporter (GPU)? host:port (leer=keiner)" "$D_DCGM")"
     ai_url="$(ask "KI-Auswertung: Chat-Endpunkt (host:port o. .../v1/chat/completions, leer=aus)" "$D_AI_URL")"
     ai_model=""
@@ -190,6 +192,7 @@ VLLM_HOST=$ip
 VLLM_TARGETS=$targets
 VLLM_OLLAMA=$ollama
 VLLM_STT=$stt
+VLLM_LMSTUDIO=$lmstudio
 VLLM_DCGM=$dcgm
 VLLM_AI_URL=$ai_url
 VLLM_AI_MODEL=$ai_model
@@ -205,6 +208,8 @@ EOF
     [ -n "$ollama" ] && ollama_env="Environment=VLLM_OLLAMA_TARGETS=$ollama"$'\n'"Environment=VLLM_OLLAMA_PROBE=1"
     local stt_env=""
     [ -n "$stt" ] && stt_env="Environment=VLLM_STT_TARGETS=$stt"
+    local lmstudio_env=""
+    [ -n "$lmstudio" ] && lmstudio_env="Environment=VLLM_LMSTUDIO_TARGETS=$lmstudio"
     local dcgm_env=""
     [ -n "$dcgm" ] && dcgm_env="Environment=VLLM_DCGM_TARGETS=$dcgm"
 
@@ -221,6 +226,7 @@ Environment=VLLM_HOST=$ip
 Environment=VLLM_TARGETS=$targets
 ${ollama_env}
 ${stt_env}
+${lmstudio_env}
 ${dcgm_env}
 ExecStart=$PY $DIR/vllm_collector.sh loop
 Restart=always

@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.18.6"
+__version__ = "0.19.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -523,7 +523,7 @@ def del_annotation(aid):
 TARGETS_FILE = os.environ.get("VLLM_TARGETS_FILE") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "targets.json")
 _targets_lock = threading.Lock()
-_TARGET_KINDS = ("vllm", "ollama", "stt", "dcgm")
+_TARGET_KINDS = ("vllm", "ollama", "stt", "dcgm", "lmstudio")
 
 
 def _load_targets():
@@ -2300,6 +2300,7 @@ PAGE = r"""<!DOCTYPE html>
     <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
       <select id="tgt-kind" style="background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
         <option value="vllm">vLLM</option><option value="ollama">Ollama</option>
+        <option value="lmstudio">LM Studio</option>
         <option value="stt">STT</option><option value="dcgm">DCGM/GPU</option>
       </select>
       <input id="tgt-host" placeholder="Host/IP" style="flex:1;min-width:140px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
