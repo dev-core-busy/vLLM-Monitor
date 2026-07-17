@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.18.4"
+__version__ = "0.18.5"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -2006,7 +2006,8 @@ PAGE = r"""<!DOCTYPE html>
   .hidden-card{display:none !important;}
   #kpicard.collapsed #kpis{display:none;}
   #chartcard.collapsed #charts,#chartcard.collapsed #legend{display:none;}
-  .chart-h2{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+  .chart-h2{display:flex;align-items:center;flex-wrap:wrap;}
+  #densslot{margin-left:14px;display:inline-flex;align-items:center;}
   #chartcard .grid{padding:8px 0 2px;}
   #chartcard #legend{padding:8px 0 0;}
   #instcard.collapsed #insttable{display:none;}
@@ -2858,7 +2859,7 @@ function renderInstances(){
     const statusTxt = i.online ? "online" : (i.configured && i.age==null ? "nicht erreichbar" : "offline");
     const hid=hiddenModels.has(i.model);
     const delBtn = i.managed
-      ? `<button class="cbtn idel adminonly" title="Instanz aus der Überwachung entfernen">🗑</button>` : "";
+      ? `<button class="cbtn idel adminonly" title="Instanz aus der Überwachung entfernen">✕</button>` : "";
     tr.innerHTML=`<td><span class="dot ${i.online?"on":"off"}"></span> ${statusTxt}</td>
       <td>${i.kind||"vllm"}</td>
       <td>${i.host}:${i.port}</td><td>${shortModel(i.model)}</td><td>${i.version||"–"}</td>
@@ -3031,7 +3032,7 @@ function buildGrid(){
   const saved=JSON.parse(store.get("vllm_chart_order")||"null");
   const btns=`<div class="cardbtns"><button class="cbtn analyze" title="Analyse & KI-Auswertung">🔍</button>`+
              `<button class="cbtn max" title="Maximieren (Esc schließt)">⛶</button>`+
-             `<button class="cbtn close" title="Kachel ausblenden">×</button></div>`;
+             `<button class="cbtn close" title="Kachel ausblenden">✕</button></div>`;
   orderBy(CHARTS,saved,s=>s.id).forEach(spec=>{
     const d=document.createElement("div");d.className="card";d.dataset.id=spec.id;
     d.innerHTML=btns+`<h2 title="${spec.desc||""}"><span class="grip" title="Ziehen zum Verschieben">⠿</span>${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;

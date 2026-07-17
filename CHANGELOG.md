@@ -4,6 +4,15 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.18.5] – 2026-07-16
+
+### Geändert
+- **Einheitliche Symbole:** Der Löschen-Button in der Instanzen-Tabelle und das
+  Schließen-Symbol der Diagramm-Karten sind jetzt ein **`✕`** – konsistent zur
+  Alarm-Historie (vorher 🗑 bzw. das dünnere `×`).
+- **Überschrift „Diagramme"** bündig wie die übrigen Container (der zusätzliche
+  Flex-Abstand vor dem Titel wurde entfernt).
+
 ## [0.18.4] – 2026-07-16
 
 ### Neu
