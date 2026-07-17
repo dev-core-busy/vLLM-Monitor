@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.18.3"
+__version__ = "0.18.4"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -258,6 +258,8 @@ def build_series(range_s, offset_s=0, start=None, end=None):
             p = {
                 "t": (r["ts"] + offset_s) * 1000,   # bei Vergleich aufs aktuelle Fenster projiziert
                 "kv": (_clean(r["kv_cache_usage"]) or 0.0) * 100.0,
+                "gen_total": r["generation_tokens_total"],   # kumulierte Tokens (für KPI-Gesamtwert)
+                "prompt_total": r["prompt_tokens_total"],
             }
             for col, field in GAUGES.items():
                 p[field] = r[col]
@@ -2073,6 +2075,7 @@ PAGE = r"""<!DOCTYPE html>
   body[data-theme="light"] #theme .ic-moon{display:none;}
   body[data-theme="light"] #theme .ic-sun{display:block;}
   #reload{font-size:20px;line-height:1;padding:2px 8px;}
+  #resetzoom:disabled{opacity:.4;cursor:not-allowed;}
   .userchip{font-size:12px;color:var(--muted);display:inline-flex;align-items:center;gap:6px;}
   .rolebadge{font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:1px 6px;border-radius:8px;
     border:1px solid var(--border);color:var(--muted);}
@@ -2139,7 +2142,7 @@ PAGE = r"""<!DOCTYPE html>
     <button class="dbtn" data-d="kompakt" title="Mittel (4×3)"><svg class="dg" viewBox="0 0 26 20"><circle cx="5.2" cy="5.0" r="1.7"/><circle cx="10.4" cy="5.0" r="1.7"/><circle cx="15.6" cy="5.0" r="1.7"/><circle cx="20.8" cy="5.0" r="1.7"/><circle cx="5.2" cy="10.0" r="1.7"/><circle cx="10.4" cy="10.0" r="1.7"/><circle cx="15.6" cy="10.0" r="1.7"/><circle cx="20.8" cy="10.0" r="1.7"/><circle cx="5.2" cy="15.0" r="1.7"/><circle cx="10.4" cy="15.0" r="1.7"/><circle cx="15.6" cy="15.0" r="1.7"/><circle cx="20.8" cy="15.0" r="1.7"/></svg></button>
     <button class="dbtn" data-d="normal" title="Große Kacheln (3×2)"><svg class="dg" viewBox="0 0 26 20"><circle cx="6.5" cy="6.7" r="2.2"/><circle cx="13.0" cy="6.7" r="2.2"/><circle cx="19.5" cy="6.7" r="2.2"/><circle cx="6.5" cy="13.3" r="2.2"/><circle cx="13.0" cy="13.3" r="2.2"/><circle cx="19.5" cy="13.3" r="2.2"/></svg></button>
   </span>
-  <button id="resetzoom" title="Zoom/Verschieben in allen Diagrammen zurücksetzen (Mausrad = Zoom, Ziehen = Verschieben)">Zoom ⟲</button>
+  <button id="resetzoom" disabled title="Zoom nur in maximierten Karten – eine Karte per ⤢ maximieren, dann per Mausrad zoomen">Zoom ⟲</button>
   <button id="anombtn" title="Ausreißer (robuste MAD-Anomalie-Erkennung) in allen Diagrammen als rote Punkte markieren">⚠ Anomalien</button>
   <button id="reportbtn" title="KI-Gesamt-Report über alle Diagramme (Kennzahlen, Ausreißer, Prognosen)">📋 KI-Report</button>
   <button id="theme" title="Zwischen hellem und dunklem Design umschalten (wird gespeichert)">
@@ -2657,7 +2660,7 @@ function mkChart(spec){
       },
       plugins:{
         legend:{display:false},
-        zoom:{pan:{enabled:true,mode:"x"},zoom:{wheel:{enabled:true},drag:{enabled:false},pinch:{enabled:true},mode:"x"}},
+        zoom:{pan:{enabled:false,mode:"x"},zoom:{wheel:{enabled:false},drag:{enabled:false},pinch:{enabled:false},mode:"x"}},
         annotation:false
       }}});
 }
@@ -2793,6 +2796,7 @@ function renderKPIs(){
       row=`<div class="metric"><b>${num(last.running,0)}</b>aktiv${wait?` / ${num(wait,0)} wartend`:""}</div>
         <div class="metric ${kvBad?"bad":""}"><b>${kv.toFixed(0)}%</b>KV-Cache</div>
         <div class="metric"><b>${num(last.gen_tps)}</b>gen tok/s</div>
+        <div class="metric"><b>${fmtBig(last.gen_total)}</b>generiert</div>
         <div class="metric"><b>${num(last["ttft_"+pct])}</b>TTFT ${pct} (ms)</div>
         <div class="metric ${errBad?"bad":""}"><b>${num(err,2)}</b>Fehler/s</div>`;
     }
@@ -3065,7 +3069,23 @@ function toggleMax(card,id){
     const avail=card.clientHeight - pad - h2h - 6;          // 6px Puffer
     if(cv) cv.style.maxHeight=Math.max(140,avail)+"px";
   } else { card.style.top=""; if(cv) cv.style.maxHeight=""; }
-  const c=charts[id]; if(c) setTimeout(()=>{try{c.resize();}catch(e){}},60);
+  const c=charts[id];
+  if(c){
+    // Mausrad-/Pinch-Zoom + Verschieben nur bei maximierter Karte (sonst zu leicht versehentlich)
+    const z=c.options.plugins.zoom;
+    z.zoom.wheel.enabled=on; z.zoom.pinch.enabled=on; z.pan.enabled=on;
+    if(!on){ try{c.resetZoom();}catch(e){} }
+    setTimeout(()=>{try{c.resize();}catch(e){}},60);
+  }
+  updateZoomBtn();
+}
+function updateZoomBtn(){
+  const b=document.getElementById("resetzoom"); if(!b)return;
+  const anyMax=!!document.querySelector(".card.maximized");
+  b.disabled=!anyMax;
+  b.title=anyMax
+    ? "Zoom/Verschieben der maximierten Karte zurücksetzen (Mausrad = Zoom, Ziehen = Verschieben)"
+    : "Zoom nur in maximierten Karten – eine Karte per ⤢ maximieren, dann per Mausrad zoomen";
 }
 function wireCardButtons(container){
   if(container._btnwired)return; container._btnwired=true;

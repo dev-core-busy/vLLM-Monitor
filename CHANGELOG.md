@@ -4,6 +4,20 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.18.4] – 2026-07-16
+
+### Neu
+- **KPI-Karten zeigen „generiert"** – die kumulierten Gesamt-Tokens je Instanz
+  (aus dem rohen Counter), sodass auch bei Idle (gen tok/s = 0) sichtbar ist,
+  wie viel die Instanz bereits erzeugt hat.
+
+### Geändert
+- **Mausrad-Zoom nur noch bei maximierten Karten.** In der normalen
+  Diagramm-Übersicht sind Zoom und Verschieben deaktiviert (kein versehentliches
+  Zoomen mehr); erst beim Maximieren (⤢) werden Mausrad-Zoom/Pinch/Verschieben
+  aktiv. Der Button „Zoom ⟲" ist entsprechend nur bei einer maximierten Karte
+  klickbar; beim Verkleinern wird der Zoom zurückgesetzt.
+
 ## [0.18.3] – 2026-07-16
 
 ### Neu
