@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.18.5"
+__version__ = "0.18.6"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -586,6 +586,17 @@ def del_target(tid):
         if victim.get("kind") == "vllm" and sum(1 for t in targets if t.get("kind") == "vllm") <= 1:
             return {"error": "Die letzte vLLM-Instanz kann nicht gelöscht werden."}
         _save_targets([t for t in targets if _target_id(t) != tid])
+    # DB-Reste entfernen, sonst zeigt build_config die Instanz weiter (als offline) an
+    host, port = victim.get("host"), victim.get("port")
+    if host is not None and port is not None and os.path.exists(DB_PATH):
+        try:
+            conn = _connect()
+            conn.execute("DELETE FROM config WHERE host=? AND port=?", (host, port))
+            conn.execute("DELETE FROM samples WHERE host=? AND port=?", (host, port))
+            conn.commit()
+            conn.close()
+        except sqlite3.OperationalError:
+            pass
     return {"ok": True}
 
 
@@ -2884,7 +2895,7 @@ async function delInstance(i){
   try{ const r=await(await fetch("/api/targets?id="+encodeURIComponent(i.kind+":"+i.host+":"+i.port),{method:"DELETE"})).json();
     if(r&&r.error){ alert(r.error); return; } }catch(e){ return; }
   hiddenModels.delete(i.model); saveHiddenModels();
-  fetchConfig();
+  fetchConfig(); fetchOnce();   // Instanzen-Tabelle + KPIs/Diagramme sofort aktualisieren
 }
 document.querySelectorAll("#insttable th[data-col]").forEach(th=>th.onclick=()=>{
   const col=th.getAttribute("data-col");

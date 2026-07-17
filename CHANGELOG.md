@@ -4,6 +4,15 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.18.6] – 2026-07-16
+
+### Behoben
+- **Gelöschte Instanz blieb sichtbar:** Beim Löschen einer Instanz (aus der
+  Instanzen-Tabelle bzw. `targets.json`) werden jetzt auch die zugehörigen
+  **DB-Reste** (config- und sample-Zeilen für den Host:Port) entfernt – vorher
+  blieb die Instanz aus der `config`-Tabelle als „offline" stehen. Das Frontend
+  aktualisiert nach dem Löschen Instanzen **und** KPIs/Diagramme sofort.
+
 ## [0.18.5] – 2026-07-16
 
 ### Geändert
