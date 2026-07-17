@@ -4,6 +4,16 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.18.3] – 2026-07-16
+
+### Neu
+- **Instanzen-Tabelle: Aktionsspalte** je Instanz – **👁 Ein-/Ausblenden**
+  (blendet das Modell in „Modelle & GPU", Diagrammen und Legende aus/ein;
+  Anzeige-Einstellung im Cookie) und **🗑 Löschen** (entfernt die Instanz aus der
+  Überwachung, `targets.json`). Das Löschsymbol erscheint nur bei über die
+  Oberfläche verwaltbaren Instanzen (`build_config` liefert dazu `managed`) und
+  ist Admins vorbehalten (Löschschutz der letzten vLLM-Instanz bleibt).
+
 ## [0.18.2] – 2026-07-16
 
 ### Neu

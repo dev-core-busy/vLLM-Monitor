@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.18.2"
+__version__ = "0.18.3"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -336,6 +336,11 @@ def build_config():
             "version": None, "vram_bytes": None, "configured": True,
         })
     inst.sort(key=lambda i: (i["host"] or "", i["port"] or 0))
+
+    # Markieren, welche Instanzen über targets.json verwaltbar (löschbar) sind.
+    managed = {(t.get("kind"), t.get("host"), str(t.get("port"))) for t in _load_targets()}
+    for i in inst:
+        i["managed"] = (i.get("kind"), i.get("host"), str(i.get("port"))) in managed
 
     # Self-Monitoring: Herzschlag des Collectors
     collector = None
@@ -2197,7 +2202,7 @@ PAGE = r"""<!DOCTYPE html>
   <h2><span class="sgrip" title="Ziehen zum Umordnen der Bereiche">⠿</span>Instanzen</h2>
   <table id="insttable"><thead><tr>
     <th data-col="status">Status</th><th data-col="kind">Typ</th><th data-col="inst">Instanz</th><th data-col="model">Modell</th><th data-col="version">Version</th>
-    <th data-col="cap">KV-Kap. / VRAM</th><th data-col="maxlen">max_model_len</th><th data-col="gpumem">gpu_mem</th><th data-col="prefix">Prefix-Cache</th>
+    <th data-col="cap">KV-Kap. / VRAM</th><th data-col="maxlen">max_model_len</th><th data-col="gpumem">gpu_mem</th><th data-col="prefix">Prefix-Cache</th><th></th>
   </tr></thead><tbody></tbody></table>
 </div>
 
@@ -2765,6 +2770,7 @@ function renderKPIs(){
   const pct=document.getElementById("pct").value;
   orderBy(Object.keys(lastData.models).sort(),saved,m=>m).forEach(model=>{
     if(!passHost(model))return;
+    if(hiddenModels.has(model))return;   // in der Instanzen-Tabelle ausgeblendet
     const s=lastData.models[model];const last=s.length?s[s.length-1]:{};
     const inst=lastConfig?lastConfig.instances.find(x=>x.model===model):null;
     const online=inst?inst.online:true;
@@ -2846,15 +2852,34 @@ function renderInstances(){
       +(i.kv_cache_dtype?` <span style="color:var(--muted)">(${i.kv_cache_dtype})</span>`:"");}
     else if(i.vram_bytes){capcell=(i.vram_bytes/1e9).toFixed(2)+" GB VRAM";}
     const statusTxt = i.online ? "online" : (i.configured && i.age==null ? "nicht erreichbar" : "offline");
+    const hid=hiddenModels.has(i.model);
+    const delBtn = i.managed
+      ? `<button class="cbtn idel adminonly" title="Instanz aus der Überwachung entfernen">🗑</button>` : "";
     tr.innerHTML=`<td><span class="dot ${i.online?"on":"off"}"></span> ${statusTxt}</td>
       <td>${i.kind||"vllm"}</td>
       <td>${i.host}:${i.port}</td><td>${shortModel(i.model)}</td><td>${i.version||"–"}</td>
       <td>${capcell}</td>
       <td>${i.max_model_len?Number(i.max_model_len).toLocaleString("de-DE"):"–"}</td>
       <td>${i.gpu_memory_utilization!=null?i.gpu_memory_utilization:"–"}</td>
-      <td>${i.enable_prefix_caching==="True"?"an":"aus"}</td>`;
+      <td>${i.enable_prefix_caching==="True"?"an":"aus"}</td>
+      <td style="white-space:nowrap;text-align:right">
+        <button class="cbtn ihide" title="${hid?"In „Modelle & GPU“ einblenden":"In „Modelle & GPU“ ausblenden"}">${hid?"🙈":"👁"}</button>
+        ${delBtn}</td>`;
+    tr.querySelector(".ihide").onclick=()=>{
+      hiddenModels.has(i.model)?hiddenModels.delete(i.model):hiddenModels.add(i.model);
+      saveHiddenModels(); renderInstances(); if(lastData)applySeries(lastData);
+    };
+    const db=tr.querySelector(".idel");
+    if(db) db.onclick=()=>delInstance(i);
     tb.appendChild(tr);
   });
+}
+async function delInstance(i){
+  if(!confirm(`Instanz ${i.host}:${i.port} (${shortModel(i.model)}) aus der Überwachung entfernen?`))return;
+  try{ const r=await(await fetch("/api/targets?id="+encodeURIComponent(i.kind+":"+i.host+":"+i.port),{method:"DELETE"})).json();
+    if(r&&r.error){ alert(r.error); return; } }catch(e){ return; }
+  hiddenModels.delete(i.model); saveHiddenModels();
+  fetchConfig();
 }
 document.querySelectorAll("#insttable th[data-col]").forEach(th=>th.onclick=()=>{
   const col=th.getAttribute("data-col");
