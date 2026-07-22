@@ -4,6 +4,21 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.19.1] – 2026-07-22
+
+### Behoben
+- **Zertifikat-Download ohne Login:** `GET /api/cert` ist jetzt eine öffentliche
+  Route (wie `/` und `/api/me`). Vorher war der Download auth-geschützt – ein
+  Henne-Ei-Problem, da man das self-signed Zertifikat installieren muss, *um*
+  die HTTPS-Warnung loszuwerden, aber zum Login schon eine vertraute Verbindung
+  bräuchte. Das ausgelieferte Server-Zertifikat ist ohnehin öffentlich.
+- **„Nicht sicher" trotz importiertem Zertifikat:** `setup.sh` (`gen_cert`)
+  nimmt jetzt **alle lokalen IPv4-Adressen des Hosts** und den Hostnamen in den
+  **SAN** auf (nicht mehr nur den CN + `127.0.0.1`). Moderne Browser
+  (Chrome/Edge) prüfen ausschließlich den SAN; fehlte die tatsächlich
+  aufgerufene IP dort, blieb die Verbindung trotz Import als „nicht sicher"
+  markiert (`ERR_CERT_COMMON_NAME_INVALID`).
+
 ## [0.19.0] – 2026-07-17
 
 ### Hinzugefügt

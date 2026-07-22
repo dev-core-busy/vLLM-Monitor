@@ -109,15 +109,42 @@ ask() {  # $1=Prompt  $2=Default  -> echo Antwort
 # ---------------------------------------------------------------------------
 # TLS-Zertifikat (self-signed) erzeugen
 # ---------------------------------------------------------------------------
-gen_cert() {  # $1 = IP/Hostname für den Common Name / SAN
-    local ip="$1"
+gen_cert() {  # $1 = IP/Hostname für den Common Name
+    local cn="$1"
     if ! command -v openssl >/dev/null 2>&1; then
         bad "openssl nicht gefunden – kann kein Zertifikat erzeugen."; return 1
     fi
-    local san="IP:127.0.0.1,DNS:localhost"
-    if valid_ip "$ip"; then san="IP:$ip,$san"; else san="DNS:$ip,$san"; fi
+    # SAN um ALLE lokalen IPv4-Adressen + Hostname ergänzen, damit das
+    # Zertifikat unabhängig davon passt, über welche Adresse das Dashboard
+    # aufgerufen wird (sonst: Browser meldet "nicht sicher" trotz Import).
+    local local_ips=""
+    if command -v ip >/dev/null 2>&1; then
+        local_ips="$(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+    elif command -v hostname >/dev/null 2>&1; then
+        local_ips="$(hostname -I 2>/dev/null)"
+    fi
+    local hn; hn="$(hostname 2>/dev/null)"
+    local cand_ips="127.0.0.1 $local_ips" names="localhost"
+    [ -n "$hn" ] && [ "$hn" != "localhost" ] && names="$names $hn"
+    if valid_ip "$cn"; then cand_ips="$cn $cand_ips"; elif [ -n "$cn" ]; then names="$cn $names"; fi
+    # IPs deduplizieren
+    local san="" seen=" " x
+    for x in $cand_ips; do
+        valid_ip "$x" || continue
+        case "$seen" in *" $x "*) continue;; esac
+        seen="$seen$x "; san="${san:+$san,}IP:$x"
+    done
+    # Namen deduplizieren
+    local nseen=" "
+    for x in $names; do
+        [ -n "$x" ] || continue
+        case "$nseen" in *" $x "*) continue;; esac
+        nseen="$nseen$x "; san="${san:+$san,}DNS:$x"
+    done
     if openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEY" -out "$CERT" -days 3650 \
-        -subj "/CN=$ip" -addext "subjectAltName=$san" 2>/dev/null; then
+        -subj "/CN=${cn:-llm-monitor}" \
+        -addext "subjectAltName=$san" \
+        -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null; then
         chmod 600 "$KEY"; chmod 644 "$CERT"
         ok "Self-signed Zertifikat erzeugt (SAN: $san), 10 Jahre gültig."
     else

@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.19.0"
+__version__ = "0.19.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -1686,6 +1686,12 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/me":
             self._json(self._auth_state())
             return
+        if parsed.path == "/api/cert":
+            # Öffentliches Server-Zertifikat – ohne Login abrufbar, damit es
+            # vor dem ersten HTTPS-Login als vertrauenswürdig installiert
+            # werden kann (Henne-Ei-Problem).
+            self._send_cert()
+            return
         if not self._require_auth():
             return
         if parsed.path == "/api/users":
@@ -1728,8 +1734,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/plain; version=0.0.4; charset=utf-8", build_prometheus())
         elif parsed.path == "/api/stream":
             self._stream(_range_from(qs))
-        elif parsed.path == "/api/cert":
-            self._send_cert()
         else:
             self._send(404, "text/plain", b"not found")
 
