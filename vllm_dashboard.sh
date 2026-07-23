@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.20.0"
+__version__ = "0.20.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -2648,6 +2648,36 @@ function applyLoadedPrefs(){
     const cs=document.getElementById("compare"),sc=store.get("vllm_compare");
     if(sc&&cs&&[...cs.options].some(o=>o.value===sc))cs.value=sc;
   }catch(e){}
+  // Reihenfolgen (Diagramme, Bereiche) und Einklapp-Zustände werden sonst nur
+  // beim Parsen gesetzt (leere Cookies) -> hier nach dem Laden erneut anwenden.
+  try{reorderDom("charts",JSON.parse(store.get("vllm_chart_order")||"null"));}catch(e){}
+  try{reorderDom("sections",JSON.parse(store.get("vllm_section_order")||"null"));}catch(e){}
+  applyCollapse("kpicard","kpitoggle","vllm_kpi_collapsed",true);
+  applyCollapse("chartcard","charttoggle","vllm_chart_collapsed",true);
+  applyCollapse("instcard","insttoggle","vllm_inst_collapsed",true);
+  applyCollapse("alertcard","alerttoggle","vllm_alert_collapsed",false);
+  applyCollapse("effcard","efftoggle","vllm_eff_collapsed",false);
+}
+// Vorhandene DOM-Karten (mit data-id) in die gespeicherte Reihenfolge bringen,
+// ohne sie neu zu erzeugen (buildGrid/renderKPIs laufen sonst nur einmal).
+function reorderDom(id,saved){
+  const cont=document.getElementById(id);
+  if(!cont||!Array.isArray(saved)||!saved.length)return;
+  const map=new Map([...cont.children].filter(c=>c.dataset&&c.dataset.id).map(c=>[c.dataset.id,c]));
+  const out=[];
+  saved.forEach(x=>{ if(map.has(x)){out.push(map.get(x));map.delete(x);} });
+  map.forEach(c=>out.push(c));            // neue/unbekannte Karten hinten anhängen
+  out.forEach(c=>cont.appendChild(c));    // in Zielreihenfolge neu einhängen
+}
+// Einklapp-Zustand aus dem Cookie erneut anwenden (Pfeil-Symbol mitführen).
+// defOpen=true: Standard aufgeklappt (collapse nur bei "1"); sonst Standard zu.
+function applyCollapse(cardId,tglId,key,defOpen){
+  const c=document.getElementById(cardId),t=document.getElementById(tglId);
+  if(!c)return;
+  const v=store.get(key);
+  const collapsed = defOpen ? (v==="1") : (v!=="0");
+  c.classList.toggle("collapsed",collapsed);
+  if(t)t.textContent = collapsed ? "▸" : "▾";
 }
 
 // --- Stabile Modell-Farben + gemeinsame Legende (statt Legende je Diagramm) ---

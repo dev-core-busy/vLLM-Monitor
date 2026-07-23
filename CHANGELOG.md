@@ -4,6 +4,19 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.20.1] – 2026-07-23
+
+### Behoben
+- **Diagramm-/Bereichs-Reihenfolge und Einklapp-Zustände wurden auf einem
+  anderen Rechner nicht geladen:** Diese Einstellungen werden nur einmalig beim
+  Seitenaufbau gesetzt (`buildGrid`, Sektions-Sortierung, Collapse-IIFEs) –
+  zu diesem Zeitpunkt sind die Cookies auf einem frischen Rechner noch leer.
+  `applyLoadedPrefs()` ordnet die vorhandenen DOM-Karten jetzt nach dem Laden
+  der Server-Prefs erneut um (`reorderDom` für `#charts` und `#sections`) und
+  wendet die Einklapp-Zustände neu an (`applyCollapse` für KPI/Diagramme/
+  Instanzen/Alarm/Effizienz). Die KPI-Reihenfolge war bereits korrekt, da
+  `renderKPIs` bei jedem Refresh neu rendert.
+
 ## [0.20.0] – 2026-07-23
 
 ### Hinzugefügt
