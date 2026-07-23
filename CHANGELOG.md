@@ -4,6 +4,22 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.20.0] – 2026-07-23
+
+### Hinzugefügt
+- **Ansichts-Einstellungen serverseitig pro Benutzer:** Theme, Dichte, Layout
+  (Kachel-Reihenfolge, ein-/ausgeklappte Bereiche), ausgeblendete Modelle,
+  Modell-Farben, gewählter Zeitraum/Vergleich, Host-Filter und der
+  Benachrichtigungs-Schalter werden jetzt **pro Benutzer auf dem Server**
+  gespeichert (`prefs.json`, `VLLM_PREFS_FILE`, 0600, gitignored). Ein
+  Rechnerwechsel zeigt damit dieselbe Ansicht wie zuvor. Endpunkte:
+  `GET/POST /api/prefs` (für jeden angemeldeten Nutzer, auch read-only – es sind
+  persönliche Einstellungen). Das Frontend spiegelt die bisher nur als Cookie
+  gehaltenen `vllm_*`-Werte transparent an den Server (gebündelt, entprellt) und
+  lädt sie beim Anmelden zurück; die Cookies bleiben als lokaler Cache. Beim
+  ersten Anmelden mit noch leerem Server-Profil wird die vorhandene lokale
+  Ansicht **einmalig übernommen**.
+
 ## [0.19.1] – 2026-07-22
 
 ### Behoben

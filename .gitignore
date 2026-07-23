@@ -24,3 +24,5 @@ targets.json
 .auth_secret
 auth.json
 settings.json
+prefs.json
+prefs.json.tmp

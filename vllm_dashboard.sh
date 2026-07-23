@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.19.1"
+__version__ = "0.20.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -648,6 +648,64 @@ def save_thresholds(body):
             json.dump(data, f, indent=2)
         os.replace(tmp, SETTINGS_FILE)
     return {"ok": True, "thresholds": cur}
+
+
+# ---------------------------------------------------------------------------
+# Persönliche Ansichts-Einstellungen je Benutzer (serverseitig, gerätesynchron)
+# ---------------------------------------------------------------------------
+# Speichert die im Frontend sonst nur als Cookie gehaltenen Ansichts-Prefs
+# (Theme, Layout, ausgeblendete Modelle, Zeitraum …) pro Benutzername, damit
+# ein Rechnerwechsel dieselbe Ansicht zeigt. Schlüssel sind auf den Präfix
+# "vllm_" beschränkt, Werte sind Strings.
+PREFS_FILE = os.environ.get("VLLM_PREFS_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "prefs.json")
+_prefs_lock = threading.Lock()
+PREFS_MAX_KEYS = 200
+
+
+def _load_prefs_all():
+    try:
+        with open(PREFS_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_user_prefs(user):
+    if not user:
+        return {}
+    d = _load_prefs_all().get(user)
+    return d if isinstance(d, dict) else {}
+
+
+def save_user_prefs(user, updates):
+    """updates: dict Schlüssel->Wert; Wert None löscht den Schlüssel."""
+    if not user or not isinstance(updates, dict):
+        return {"error": "ungültige Anfrage"}
+    with _prefs_lock:
+        data = _load_prefs_all()
+        cur = data.get(user)
+        if not isinstance(cur, dict):
+            cur = {}
+        for k, v in updates.items():
+            k = str(k)
+            if not k.startswith("vllm_") or len(k) > 64:
+                continue
+            if v is None:
+                cur.pop(k, None)
+            elif len(cur) < PREFS_MAX_KEYS or k in cur:
+                cur[k] = str(v)[:8192]
+        data[user] = cur
+        tmp = PREFS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, PREFS_FILE)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1730,6 +1788,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(build_annotations(rng))
         elif parsed.path == "/api/targets":
             self._json(build_targets())
+        elif parsed.path == "/api/prefs":
+            self._json({"prefs": load_user_prefs(
+                self._user.get("username") if self._user else None)})
         elif parsed.path == "/metrics":
             self._send(200, "text/plain; version=0.0.4; charset=utf-8", build_prometheus())
         elif parsed.path == "/api/stream":
@@ -1772,6 +1833,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "ungültige Anfrage"})
                 return
             self._json(ai_analyze(body))
+            return
+        if parsed.path == "/api/prefs":            # persönliche Ansicht (auch read-only)
+            body = self._read_body()
+            if body is None:
+                self._json({"error": "ungültige Anfrage"})
+                return
+            updates = body.get("prefs") if isinstance(body.get("prefs"), dict) else None
+            if updates is None and "key" in body:
+                updates = {body["key"]: body.get("value")}
+            self._json(save_user_prefs(
+                self._user.get("username") if self._user else None, updates or {}))
             return
         # ab hier: nur Admins (schreibende/verwaltende Endpunkte)
         if not self._is_admin():
@@ -2517,7 +2589,66 @@ function getCookie(name){
   const m=document.cookie.match(new RegExp("(?:^|; )"+name.replace(/([.*+?^${}()|[\]\\])/g,"\\$1")+"=([^;]*)"));
   return m?decodeURIComponent(m[1]):null;
 }
-const store={ get:k=>getCookie(k), set:(k,v)=>setCookie(k,v,365), del:k=>setCookie(k,"",-1) };
+// Ansichts-Prefs liegen serverseitig pro Benutzer (gerätesynchron) und werden
+// zusätzlich als Cookie zwischengespeichert, damit alle synchronen store.get()
+// weiter funktionieren. Schreibzugriffe spiegeln "vllm_"-Schlüssel gebündelt
+// an /api/prefs. Während des initialen Ladens (loadServerPrefs) ist _prefsReady
+// false, damit die geladenen Werte nicht sofort zurückgeschrieben werden.
+let _prefsReady=false, _prefsTimer=null; const _prefsQueue={};
+function _pushPref(k,v){
+  if(!_prefsReady||!String(k).startsWith("vllm_"))return;
+  _prefsQueue[k]=(v===undefined?null:v);
+  clearTimeout(_prefsTimer); _prefsTimer=setTimeout(flushPrefs,400);
+}
+function flushPrefs(){
+  const batch=Object.assign({},_prefsQueue);
+  for(const k in _prefsQueue)delete _prefsQueue[k];
+  if(!Object.keys(batch).length)return;
+  fetch("/api/prefs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({prefs:batch})}).catch(()=>{});
+}
+const store={ get:k=>getCookie(k),
+  set:(k,v)=>{setCookie(k,v,365); _pushPref(k,v);},
+  del:k=>{setCookie(k,"",-1); _pushPref(k,null);} };
+async function loadServerPrefs(){
+  let srv={};
+  try{ const r=await fetch("/api/prefs"); if(r.ok) srv=(await r.json()).prefs||{}; }catch(e){}
+  const hasServer=Object.keys(srv).length>0;
+  if(hasServer) Object.entries(srv).forEach(([k,v])=>{ if(v!=null)setCookie(k,String(v),365); });
+  applyLoadedPrefs();     // _prefsReady noch false -> kein Rückschreiben
+  _prefsReady=true;       // ab jetzt werden Änderungen zum Server gespiegelt
+  if(!hasServer){
+    // Erststart für diesen Nutzer: vorhandene lokale Ansicht einmalig übernehmen.
+    const up={};
+    document.cookie.split(";").forEach(c=>{ const i=c.indexOf("="); if(i<0)return;
+      const n=c.slice(0,i).trim();
+      if(n.startsWith("vllm_")&&n!=="vllm_auth") up[n]=decodeURIComponent(c.slice(i+1)); });
+    if(Object.keys(up).length){ Object.assign(_prefsQueue,up); flushPrefs(); }
+  }
+}
+// Die beim Parsen bereits in JS-Variablen eingelesenen Prefs erneut anwenden,
+// nachdem die Server-Werte in die Cookies übernommen wurden.
+function applyLoadedPrefs(){
+  try{customColors=JSON.parse(store.get("vllm_colors")||"{}");}catch(e){customColors={};}
+  hiddenModels.clear();
+  try{JSON.parse(store.get("vllm_hidden_models")||"[]").forEach(m=>hiddenModels.add(m));}catch(e){}
+  try{applyTheme(store.get("vllm_theme")||"dark");}catch(e){}
+  try{applyDensity(store.get("vllm_density")||"normal");}catch(e){}
+  window._anomOn=store.get("vllm_anom")==="1";
+  try{document.getElementById("anombtn").classList.toggle("activebtn",window._anomOn);}catch(e){}
+  window._notifOn=store.get("vllm_notif")==="1"; try{syncNotifBtn();}catch(e){}
+  hostFilter=store.get("vllm_host")||"";
+  try{
+    const sel=document.getElementById("range"),sv=store.get("vllm_range");
+    if(sv&&sel&&[...sel.options].some(o=>o.value===sv)){sel.value=sv;
+      document.getElementById("absrange").style.display=isAbs()?"":"none";}
+    const af=store.get("vllm_absfrom"),at=store.get("vllm_absto");
+    if(af)document.getElementById("absfrom").value=af;
+    if(at)document.getElementById("absto").value=at;
+    const cs=document.getElementById("compare"),sc=store.get("vllm_compare");
+    if(sc&&cs&&[...cs.options].some(o=>o.value===sc))cs.value=sc;
+  }catch(e){}
+}
 
 // --- Stabile Modell-Farben + gemeinsame Legende (statt Legende je Diagramm) ---
 let modelColors={};
@@ -3701,8 +3832,9 @@ syncNotifBtn();
 })();
 // --- Dashboard erst nach erfolgreicher Anmeldung starten ---
 let _booted=false;
-function bootDashboard(){
+async function bootDashboard(){
   if(_booted)return; _booted=true;
+  await loadServerPrefs();   // serverseitige Ansicht laden, bevor gerendert wird
   fetchConfig(); startRefresh(); fetchAlerts(); fetchCompare(); fetchAnnotations();
   setInterval(fetchConfig,30000); setInterval(fetchAlerts,30000); setInterval(fetchAnnotations,30000);
 }

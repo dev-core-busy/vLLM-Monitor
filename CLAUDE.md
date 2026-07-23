@@ -95,6 +95,19 @@ map AD groups → role. Role resolution (`resolve_ad_role`): explicit AD-user en
 `GET/POST/DELETE /api/users`, `POST /api/ldap`, `POST /api/ldap/test`. Only
 meaningful with HTTPS. `setup.sh` no longer prompts for LDAP.
 
+**Per-user view settings (server-side):** the frontend prefs that used to live only
+in cookies (theme, density, tile order / collapse state, hidden models, model
+colors, selected range/compare, host filter, notification toggle — all `vllm_*`
+keys) are now mirrored **per user** into **`prefs.json`** (`VLLM_PREFS_FILE`, next
+to the DB, 0600, gitignored) so switching machines shows the same view.
+`GET/POST /api/prefs` (`load_user_prefs`/`save_user_prefs`) are allowed for **any**
+logged-in user (they are personal, not management). The client `store` object
+keeps cookies as a synchronous cache and batches (debounced) writes of `vllm_*`
+keys to the server; `loadServerPrefs()` runs in `bootDashboard()` before the first
+render, seeds the cookies from the server and re-applies them (`applyLoadedPrefs`).
+On first login with an empty server profile, the existing local prefs are uploaded
+once (seamless migration).
+
 Both files are named `*.sh` but are **Python 3** (shebang `#!/usr/bin/env
 python3`) and use **only the standard library** — no `pip install` needed.
 
