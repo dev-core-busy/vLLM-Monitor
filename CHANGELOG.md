@@ -4,6 +4,18 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.20.2] – 2026-07-23
+
+### Behoben
+- **Speichern der Ansicht robuster:** Konnte `applyLoadedPrefs()` beim Anmelden
+  eine Exception werfen, wurde `_prefsReady=true` nie erreicht – der Client
+  spiegelte danach **gar keine** Änderungen mehr zum Server (Reihenfolge etc.
+  ging auf anderen Rechnern verloren). `_prefsReady` wird jetzt garantiert
+  gesetzt (`applyLoadedPrefs` in try/catch). Zusätzlich wird bei jeder Änderung
+  praktisch **sofort** gespeichert (Entprellung 400 → 120 ms), und ausstehende
+  Änderungen werden bei `pagehide`/`visibilitychange`/Abmelden per
+  `navigator.sendBeacon`/`keepalive` zuverlässig nachgesichert.
+
 ## [0.20.1] – 2026-07-23
 
 ### Behoben

@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.20.1"
+__version__ = "0.20.2"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -2598,15 +2598,26 @@ let _prefsReady=false, _prefsTimer=null; const _prefsQueue={};
 function _pushPref(k,v){
   if(!_prefsReady||!String(k).startsWith("vllm_"))return;
   _prefsQueue[k]=(v===undefined?null:v);
-  clearTimeout(_prefsTimer); _prefsTimer=setTimeout(flushPrefs,400);
+  // kurze Entprellung nur, um mehrere Keys einer Aktion zu bündeln – praktisch sofort
+  clearTimeout(_prefsTimer); _prefsTimer=setTimeout(flushPrefs,120);
 }
-function flushPrefs(){
+function flushPrefs(useBeacon){
+  clearTimeout(_prefsTimer);
   const batch=Object.assign({},_prefsQueue);
   for(const k in _prefsQueue)delete _prefsQueue[k];
   if(!Object.keys(batch).length)return;
+  const body=JSON.stringify({prefs:batch});
+  // Beim Verlassen der Seite (Abmelden, Tab schließen, Rechnerwechsel) muss die
+  // letzte Änderung zuverlässig raus – sendBeacon/keepalive überleben das Entladen.
+  if(useBeacon && navigator.sendBeacon){
+    try{ navigator.sendBeacon("/api/prefs", new Blob([body],{type:"application/json"})); return; }catch(e){}
+  }
   fetch("/api/prefs",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({prefs:batch})}).catch(()=>{});
+    body:body, keepalive:true}).catch(()=>{});
 }
+// Ausstehende Änderungen beim Entladen/Verstecken der Seite sofort sichern.
+window.addEventListener("pagehide",()=>flushPrefs(true));
+document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="hidden")flushPrefs(true); });
 const store={ get:k=>getCookie(k),
   set:(k,v)=>{setCookie(k,v,365); _pushPref(k,v);},
   del:k=>{setCookie(k,"",-1); _pushPref(k,null);} };
@@ -2615,8 +2626,8 @@ async function loadServerPrefs(){
   try{ const r=await fetch("/api/prefs"); if(r.ok) srv=(await r.json()).prefs||{}; }catch(e){}
   const hasServer=Object.keys(srv).length>0;
   if(hasServer) Object.entries(srv).forEach(([k,v])=>{ if(v!=null)setCookie(k,String(v),365); });
-  applyLoadedPrefs();     // _prefsReady noch false -> kein Rückschreiben
-  _prefsReady=true;       // ab jetzt werden Änderungen zum Server gespiegelt
+  try{ applyLoadedPrefs(); }catch(e){ console.warn("applyLoadedPrefs:",e); }
+  _prefsReady=true;       // MUSS gesetzt werden, sonst speichert der Client nichts mehr
   if(!hasServer){
     // Erststart für diesen Nutzer: vorhandene lokale Ansicht einmalig übernehmen.
     const up={};
@@ -3930,7 +3941,7 @@ async function doPassword(){
   document.getElementById("pw-old").value=document.getElementById("pw-new").value=document.getElementById("pw-new2").value="";
   authInit();
 }
-async function doLogout(){ try{ await fetch("/api/logout",{method:"POST"}); }catch(e){} location.reload(); }
+async function doLogout(){ flushPrefs(); try{ await fetch("/api/logout",{method:"POST"}); }catch(e){} location.reload(); }
 document.getElementById("li-submit").onclick=doLogin;
 document.getElementById("li-pass").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin();});
 document.getElementById("li-user").addEventListener("keydown",e=>{if(e.key==="Enter")document.getElementById("li-pass").focus();});
