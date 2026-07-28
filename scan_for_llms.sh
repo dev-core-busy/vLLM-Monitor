@@ -14,7 +14,14 @@ Bedienung:
       1) Standard-Port-Scan   (bekannte LLM-/Dienst-Ports)
       2) Voller Port-Scan      (Bereich frei waehlbar) + LLM-Probe bei Treffern
       3) IP wechseln
+      4) API-Key eingeben/loeschen
       0) Beenden
+
+Geschuetzte Server (API-Key, z.B. vLLM mit --api-key):
+  --key=<KEY>        – Key fuer diesen Aufruf (Authorization: Bearer ...)
+  VLLM_API_KEY=<KEY> – Key per Umgebungsvariable
+  Menuepunkt 4       – Key interaktiv eingeben/loeschen (gemerkt in
+                       ~/.scan_for_llms_api_key, nur fuer den Benutzer lesbar)
 
 Nur Python-Standardbibliothek – keine externen Abhaengigkeiten.
 Aufruf:  python3 _scan_for_llms.sh   (oder ausfuehrbar: ./_scan_for_llms.sh)
@@ -26,16 +33,21 @@ import json
 import os
 import sys
 import ipaddress
+from getpass import getpass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib import request, error
 
-__version__ = "0.10.1"
+__version__ = "0.21.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
 
 LAST_IP_FILE = os.path.join(os.path.expanduser("~"), ".scan_for_llms_last_ip")
+# API-Key fuer geschuetzte LLM-Server (z.B. vLLM mit --api-key). Reihenfolge:
+# --key=... > VLLM_API_KEY > gemerkter Key in dieser Datei (Modus 0600).
+API_KEY_FILE = os.path.join(os.path.expanduser("~"), ".scan_for_llms_api_key")
+API_KEY = ""
 
 # Standard-Ports gaengiger LLM-Server und benachbarter Dienste
 STANDARD_PORTS = [
@@ -90,6 +102,42 @@ def save_last_ip(ip):
         pass
 
 
+def load_api_key():
+    """API-Key ermitteln: Umgebungsvariable schlaegt gemerkten Key aus der Datei."""
+    env = os.environ.get("VLLM_API_KEY", "").strip()
+    if env:
+        return env
+    try:
+        with open(API_KEY_FILE, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def save_api_key(key):
+    """Key merken (leer = Datei loeschen). Datei nur fuer den Benutzer lesbar."""
+    try:
+        if not key:
+            if os.path.exists(API_KEY_FILE):
+                os.remove(API_KEY_FILE)
+            return
+        with open(API_KEY_FILE, "w", encoding="utf-8") as fh:
+            fh.write(key.strip())
+        os.chmod(API_KEY_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def auth_header():
+    """Authorization-Header fuer den aktuellen API-Key (leer = keiner).
+    Ein Key mit eigenem Schema ("Bearer ...", "Basic ...") bleibt unveraendert."""
+    key = (API_KEY or "").strip()
+    if not key:
+        return {}
+    scheme = key.split(" ", 1)[0].lower()
+    return {"Authorization": key if scheme in ("bearer", "basic", "token") else "Bearer " + key}
+
+
 def valid_ip(text):
     try:
         ipaddress.ip_address(text.strip())
@@ -128,7 +176,9 @@ def http_request(scheme, ip, port, path, timeout=HTTP_TIMEOUT):
     Behandelt auch Fehlerstatus (400/404/407) als verwertbares Ergebnis.
     """
     url = "%s://%s:%d%s" % (scheme, ip, port, path)
-    req = request.Request(url, headers={"User-Agent": "scan_for_llms/1.0"})
+    headers = {"User-Agent": "scan_for_llms/1.0"}
+    headers.update(auth_header())        # API-Key, falls gesetzt
+    req = request.Request(url, headers=headers)
     try:
         if scheme == "https":
             resp = request.urlopen(req, timeout=timeout, context=SSL_CTX)
@@ -277,6 +327,18 @@ def identify_service(ip, port):
         result["extra"] = "Server: " + (server_hdr or "ollama")
         return result
 
+    # 5b) Geschuetzte LLM-API? 401/403 auf /v1/models heisst: API-Key fehlt oder
+    #     wird abgelehnt (ohne Key liefern alle Proben leere Ergebnisse).
+    code_v1, _, _ = http_request(scheme, ip, port, "/v1/models")
+    if code_v1 in (401, 403):
+        result["type"] = "LLM-API (API-Key erforderlich)"
+        result["api_base"] = base + "/v1"
+        result["endpoints"] = [base + "/v1/models", base + "/v1/chat/completions"]
+        result["extra"] = "HTTP %d - %s" % (
+            code_v1, "gesetzter Key abgelehnt" if API_KEY
+            else "Key eintragen (Menuepunkt 4 oder VLLM_API_KEY)")
+        return result
+
     # 6) Generischer Webserver / unklar
     result["type"] = "HTTP-Dienst"
     result["extra"] = "Server: " + (server_hdr or "?") + " (keine LLM-API erkannt)"
@@ -414,6 +476,34 @@ def ask_ip():
         print(" Bitte eine gueltige IP-Adresse eingeben.")
 
 
+def ask_api_key():
+    """API-Key interaktiv setzen, aendern oder loeschen (gemerkt in API_KEY_FILE)."""
+    global API_KEY
+    env = os.environ.get("VLLM_API_KEY", "").strip()
+    print()
+    print(" Aktueller API-Key: %s%s" % ("gesetzt" if API_KEY else "keiner",
+                                        " (aus VLLM_API_KEY)" if env and API_KEY == env else ""))
+    if env:
+        print(" [i] VLLM_API_KEY ist gesetzt und hat Vorrang vor dem gemerkten Key.")
+    print(" Eingabe bleibt verborgen. Leer = unveraendert, '-' = gemerkten Key loeschen.")
+    try:
+        raw = getpass(" API-Key: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not raw:
+        return
+    if raw == "-":
+        save_api_key("")
+        API_KEY = env
+        print(" Gemerkter API-Key geloescht." + (" VLLM_API_KEY bleibt aktiv." if env else ""))
+        return
+    save_api_key(raw)
+    API_KEY = env or raw
+    print(" API-Key gespeichert: %s (nur fuer dich lesbar).%s"
+          % (API_KEY_FILE, "  Achtung: VLLM_API_KEY hat weiterhin Vorrang." if env else ""))
+
+
 # ---------------------------------------------------------------------------
 # Hauptmenue
 # ---------------------------------------------------------------------------
@@ -428,11 +518,12 @@ def menu():
 
     while True:
         print()
-        print(" Aktuelle Ziel-IP: %s" % ip)
+        print(" Aktuelle Ziel-IP: %s    API-Key: %s" % (ip, "gesetzt" if API_KEY else "-"))
         print(" -------------------------------------------")
         print("  1) Standard-Port-Scan (bekannte LLM-Ports)")
         print("  2) Voller Port-Scan (Bereich) + LLM-Probe")
         print("  3) IP wechseln")
+        print("  4) API-Key eingeben/loeschen")
         print("  0) Beenden")
         choice = input(" Auswahl: ").strip()
 
@@ -444,6 +535,8 @@ def menu():
             full_scan(ip)
         elif choice == "3":
             ip = ask_ip()
+        elif choice == "4":
+            ask_api_key()
         elif choice == "0":
             print(" Beendet.")
             return
@@ -452,6 +545,13 @@ def menu():
 
 
 def main():
+    global API_KEY
+    # --key=... hat Vorrang vor VLLM_API_KEY / gemerktem Key
+    cli_key = None
+    for a in sys.argv[1:]:
+        if a.startswith("--key="):
+            cli_key = a.split("=", 1)[1].strip()
+    API_KEY = cli_key if cli_key is not None else load_api_key()
     try:
         menu()
     except (KeyboardInterrupt, EOFError):

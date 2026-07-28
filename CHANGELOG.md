@@ -4,6 +4,32 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.21.0] – 2026-07-28
+
+### Hinzugefügt
+- **API-Keys für geschützte LLM-Server** – überall dort, wo das Toolkit LLMs
+  anspricht, kann jetzt ein Key mitgegeben werden (`Authorization: Bearer …`;
+  Keys mit eigenem Schema – `Bearer …`/`Basic …`/`Token …` – werden unverändert
+  übernommen):
+  - **Dashboard:** neues Passwortfeld **API-Key** je Instanz im ⚙-Dialog
+    *Instanzen verwalten*, dazu die Spalte „Key" (🔑/–) in der Übersicht. Beim
+    Bearbeiten bedeutet ein leeres Feld *unverändert*, das Häkchen *Key
+    entfernen* löscht ihn; bei geänderter Host/Port-Kombination wandert der Key
+    mit (`prev_id`). `GET /api/targets` liefert **nie** den Key, nur
+    `key_set: true`. `targets.json` wird jetzt mit **0600** geschrieben (eine
+    bestehende Datei wird beim Start einmalig abgesichert).
+  - **Collector:** neues `auth_headers()`; der Key wird an alle Abrufe und
+    Probes durchgereicht (vLLM `/metrics`, `/v1/models`, `/version`, Ollama,
+    LM Studio, STT, DCGM). Reihenfolge: Instanz-Key aus `targets.json` >
+    globaler `VLLM_API_KEY`.
+  - **`monitor.sh` / `scan_for_llms.sh`:** Key per `--key=…`, `VLLM_API_KEY`
+    oder interaktiv im Menü (`monitor.sh` → *8*, `scan_for_llms.sh` → *4*;
+    Eingabe verborgen via `getpass`, `-` löscht), gemerkt in
+    `~/.monitor_api_key` bzw. `~/.scan_for_llms_api_key` (0600).
+    Bei `401`/`403` weisen beide Tools ausdrücklich auf den fehlenden bzw.
+    abgelehnten Key hin; `scan_for_llms.sh` meldet solche Ports als
+    *„LLM-API (API-Key erforderlich)"* statt als anonymen HTTP-Dienst.
+
 ## [0.20.2] – 2026-07-23
 
 ### Behoben

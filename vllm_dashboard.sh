@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.20.2"
+__version__ = "0.21.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -525,6 +525,14 @@ TARGETS_FILE = os.environ.get("VLLM_TARGETS_FILE") or os.path.join(
 _targets_lock = threading.Lock()
 _TARGET_KINDS = ("vllm", "ollama", "stt", "dcgm", "lmstudio")
 
+# Seit der Einführung der Instanz-API-Keys enthält targets.json Geheimnisse –
+# bestehende Dateien einmalig absichern (Collector läuft als derselbe Benutzer).
+if os.path.exists(TARGETS_FILE):
+    try:
+        os.chmod(TARGETS_FILE, 0o600)
+    except OSError:
+        pass
+
 
 def _load_targets():
     try:
@@ -536,9 +544,14 @@ def _load_targets():
 
 
 def _save_targets(targets):
+    # Die Datei enthält API-Keys der Instanzen -> nur für den Dienst-Benutzer lesbar.
     tmp = TARGETS_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump({"targets": targets}, f, indent=2)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
     os.replace(tmp, TARGETS_FILE)
 
 
@@ -547,7 +560,13 @@ def _target_id(t):
 
 
 def build_targets():
-    return {"targets": _load_targets(), "file": TARGETS_FILE}
+    """Zielliste für das UI – der API-Key wird NIE ausgeliefert, nur ob einer gesetzt ist."""
+    out = []
+    for t in _load_targets():
+        c = {k: v for k, v in t.items() if k != "api_key"}
+        c["key_set"] = bool((t.get("api_key") or "").strip())
+        out.append(c)
+    return {"targets": out, "file": TARGETS_FILE}
 
 
 def add_target(body):
@@ -565,13 +584,27 @@ def add_target(body):
     newt = {"kind": kind, "host": host, "port": port, "label": label,
             "enabled": bool(body.get("enabled", True))}
     nid = _target_id(newt)
+    # API-Key: fehlt das Feld (z. B. beim Aktiv-Häkchen), bleibt der gespeicherte
+    # Key erhalten; ein leerer String löscht ihn ausdrücklich.
+    new_key = body.get("api_key")
+    # Beim Bearbeiten mit geänderter Host/Port-Kombination entsteht ein neuer
+    # Eintrag – dann den Key des Vorgängers (prev_id) übernehmen.
+    prev_id = body.get("prev_id") or None
     with _targets_lock:
         targets = _load_targets()
         for i, t in enumerate(targets):
             if _target_id(t) == nid:
+                key = (t.get("api_key") or "") if new_key is None else str(new_key)
+                if key.strip():
+                    newt["api_key"] = key.strip()
                 targets[i] = newt
                 break
         else:
+            if new_key is None and prev_id:
+                old = next((t for t in targets if _target_id(t) == prev_id), None)
+                new_key = (old or {}).get("api_key")
+            if new_key is not None and str(new_key).strip():
+                newt["api_key"] = str(new_key).strip()
             targets.append(newt)
         _save_targets(targets)
     return {"ok": True, "id": nid}
@@ -2369,8 +2402,12 @@ PAGE = r"""<!DOCTYPE html>
        definierten vLLM-Instanzen werden beim ersten Start automatisch hier übernommen und sind
        dann bearbeit-, pausier- und löschbar (✎ bearbeiten, Häkchen = aktiv, × löschen; die letzte
        vLLM-Instanz bleibt geschützt).</p>
+    <p>Verlangt ein Server einen <b>API-Key</b> (z. B. vLLM mit <code>--api-key</code>), kann er je
+       Instanz eingetragen werden; er wird als <code>Authorization: Bearer …</code> mitgesendet und
+       nur serverseitig gespeichert (nie an den Browser zurückgegeben). Ohne Eintrag greift der
+       globale Key aus <code>VLLM_API_KEY</code>.</p>
     <table id="tgttable"><thead><tr>
-      <th>Typ</th><th>Host</th><th>Port</th><th>Label</th><th>Aktiv</th><th></th>
+      <th>Typ</th><th>Host</th><th>Port</th><th>Label</th><th>Key</th><th>Aktiv</th><th></th>
     </tr></thead><tbody></tbody></table>
     <h4 style="margin:14px 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">Neu hinzufügen</h4>
     <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
@@ -2382,6 +2419,9 @@ PAGE = r"""<!DOCTYPE html>
       <input id="tgt-host" placeholder="Host/IP" style="flex:1;min-width:140px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
       <input id="tgt-port" placeholder="Port" style="width:80px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
       <input id="tgt-label" placeholder="Label (optional)" style="width:150px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
+      <input id="tgt-key" type="password" autocomplete="off" placeholder="API-Key (optional)" style="width:170px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
+      <label id="tgt-keydel-lbl" style="display:none;align-items:center;gap:4px;font-size:12px;color:var(--muted)">
+        <input type="checkbox" id="tgt-keydel"> Key entfernen</label>
       <button class="abtn" id="tgt-add">Hinzufügen</button>
     </div>
     <div id="tgt-msg" style="color:var(--muted);font-size:12px;margin-top:8px;min-height:16px"></div>
@@ -3526,6 +3566,9 @@ function tgtResetForm(){
   _editId=null;
   document.getElementById("tgt-add").textContent="Hinzufügen";
   document.getElementById("tgt-host").value=""; document.getElementById("tgt-port").value=""; document.getElementById("tgt-label").value="";
+  const k=document.getElementById("tgt-key"), kd=document.getElementById("tgt-keydel");
+  k.value=""; k.placeholder="API-Key (optional)";
+  kd.checked=false; document.getElementById("tgt-keydel-lbl").style.display="none";
 }
 async function loadTargets(){
   const tb=document.querySelector("#tgttable tbody"); if(!tb)return;
@@ -3534,10 +3577,11 @@ async function loadTargets(){
     const j=await(await fetch("/api/targets")).json();
     tb.innerHTML="";
     const ts=j.targets||[];
-    if(!ts.length){ tb.innerHTML='<tr><td colspan="6" class="placeholder">Noch keine Instanzen.</td></tr>'; return; }
+    if(!ts.length){ tb.innerHTML='<tr><td colspan="7" class="placeholder">Noch keine Instanzen.</td></tr>'; return; }
     ts.forEach(t=>{
       const tr=document.createElement("tr");
       tr.innerHTML='<td>'+t.kind+'</td><td>'+t.host+'</td><td>'+t.port+'</td><td>'+(t.label||"")+'</td>'+
+        '<td style="text-align:center" title="'+(t.key_set?"API-Key gesetzt":"kein API-Key")+'">'+(t.key_set?"🔑":"–")+'</td>'+
         '<td style="text-align:center"><input type="checkbox" '+(t.enabled!==false?"checked":"")+'></td>'+
         '<td style="white-space:nowrap;text-align:right"><button class="cbtn edit" title="Bearbeiten">✎</button> '+
         '<button class="cbtn close" title="Entfernen">×</button></td>';
@@ -3553,9 +3597,14 @@ function editTarget(t){
   document.getElementById("tgt-host").value=t.host;
   document.getElementById("tgt-port").value=t.port;
   document.getElementById("tgt-label").value=t.label||"";
+  const k=document.getElementById("tgt-key"), kd=document.getElementById("tgt-keydel");
+  k.value=""; kd.checked=false;
+  k.placeholder=t.key_set?"API-Key (leer = unverändert)":"API-Key (optional)";
+  document.getElementById("tgt-keydel-lbl").style.display=t.key_set?"flex":"none";
   _editId=t.kind+":"+t.host+":"+t.port;
   document.getElementById("tgt-add").textContent="Speichern";
-  document.getElementById("tgt-msg").textContent="Bearbeiten – Werte anpassen und 'Speichern'.";
+  document.getElementById("tgt-msg").textContent="Bearbeiten – Werte anpassen und 'Speichern'."
+    +(t.key_set?" API-Key bleibt erhalten, sofern kein neuer eingegeben wird.":"");
   document.getElementById("tgt-host").focus();
 }
 async function saveTarget(t){
@@ -3575,12 +3624,19 @@ document.getElementById("tgt-add").onclick=async()=>{
   const host=document.getElementById("tgt-host").value.trim();
   const port=document.getElementById("tgt-port").value.trim();
   const label=document.getElementById("tgt-label").value.trim();
+  const key=document.getElementById("tgt-key").value.trim();
+  const keydel=document.getElementById("tgt-keydel").checked;
   const msg=document.getElementById("tgt-msg");
   if(!host||!port){ msg.textContent="Host und Port sind erforderlich."; return; }
   const editing=_editId, newId=kind+":"+host+":"+port;
+  // api_key nur senden, wenn ein neuer Key eingegeben wurde ("" löscht ihn);
+  // ohne Feld bleibt der gespeicherte Key unverändert.
+  const payload={kind,host,port,label,enabled:true};
+  if(keydel) payload.api_key=""; else if(key) payload.api_key=key;
+  if(editing && editing!==newId) payload.prev_id=editing;   // Key wandert mit
   try{
     const r=await(await fetch("/api/targets",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({kind,host,port,label,enabled:true})})).json();
+      body:JSON.stringify(payload)})).json();
     if(r.error){ msg.textContent="⚠️ "+r.error; return; }
     // Bei geänderter Host/Port-Kombination den alten Eintrag entfernen
     if(editing && editing!==newId){

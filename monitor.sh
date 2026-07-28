@@ -29,9 +29,16 @@ Bedienung:
   python3 monitor.sh <IP> [PORT] metrics  – Roh-Metriken (Prometheus)
   python3 monitor.sh <IP> [PORT] prompt   – Interaktiver Test-Prompt
 
+Geschützte Server (API-Key):
+  --key=<KEY>        – Key für diesen Aufruf (als Authorization: Bearer …)
+  VLLM_API_KEY=<KEY> – Key per Umgebungsvariable
+  Menüpunkt 8        – Key interaktiv eingeben/löschen (gemerkt in
+                       ~/.monitor_api_key, nur für den Benutzer lesbar)
+
 Beispiel:
   python3 monitor.sh 192.168.1.100 8000
   python3 monitor.sh 10.0.0.5 11434 health
+  python3 monitor.sh 192.168.1.100 8000 all --key=sk-geheim
 """
 
 import socket
@@ -41,17 +48,22 @@ import os
 import sys
 import time
 import ipaddress
+from getpass import getpass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib import request, error
 from datetime import datetime, timezone
 
-__version__ = "0.10.1"
+__version__ = "0.21.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
 
 LAST_IP_FILE = os.path.join(os.path.expanduser("~"), ".monitor_last_ip")
+# API-Key für geschützte LLM-Server (z. B. vLLM mit --api-key). Quellen in dieser
+# Reihenfolge: --key=… > VLLM_API_KEY > gemerkter Key in dieser Datei (0600).
+API_KEY_FILE = os.path.join(os.path.expanduser("~"), ".monitor_api_key")
+API_KEY = ""
 
 CONNECT_TIMEOUT = 3.0
 HTTP_TIMEOUT = 10.0
@@ -88,6 +100,42 @@ def save_last_ip(ip):
             fh.write(ip.strip())
     except OSError:
         pass
+
+
+def load_api_key():
+    """API-Key ermitteln: Umgebungsvariable schlägt gemerkten Key aus der Datei."""
+    env = os.environ.get("VLLM_API_KEY", "").strip()
+    if env:
+        return env
+    try:
+        with open(API_KEY_FILE, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def save_api_key(key):
+    """Key merken (leer = Datei löschen). Datei nur für den Benutzer lesbar."""
+    try:
+        if not key:
+            if os.path.exists(API_KEY_FILE):
+                os.remove(API_KEY_FILE)
+            return
+        with open(API_KEY_FILE, "w", encoding="utf-8") as fh:
+            fh.write(key.strip())
+        os.chmod(API_KEY_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def auth_header():
+    """`Authorization`-Header für den aktuellen API-Key (leer = keiner).
+    Bringt der Key bereits ein Schema mit („Bearer …"), bleibt es erhalten."""
+    key = (API_KEY or "").strip()
+    if not key:
+        return {}
+    scheme = key.split(" ", 1)[0].lower()
+    return {"Authorization": key if scheme in ("bearer", "basic", "token") else "Bearer " + key}
 
 
 def valid_ip(text):
@@ -132,6 +180,7 @@ def http_request(scheme, ip, port, path, method="GET", timeout=HTTP_TIMEOUT, bod
     """HTTP(S)-Request. Gibt (code, headers_dict, body_text, elapsed_ms) zurück."""
     url = f"{scheme}://{ip}:{port}{path}"
     req_headers = {"User-Agent": "monitor_llm/1.0"}
+    req_headers.update(auth_header())      # API-Key, falls gesetzt
     if headers:
         req_headers.update(headers)
     data = body.encode("utf-8") if body else None
@@ -1048,6 +1097,17 @@ def full_monitor(ip, port, mode="all"):
         server_info = detect_server(schemes, ip, port)
         server_type = server_info.get("type", "unbekannt")
         print(f"  Server-Typ: {server_type}")
+        if API_KEY:
+            print("  API-Key: gesetzt (wird als Bearer-Token gesendet)")
+
+        # Verlangt der Server Authentifizierung? (dann liefern alle Probes leere Daten)
+        auth_code, _, _, _ = http_request(schemes[0], ip, port, "/v1/models")
+        if auth_code in (401, 403):
+            if API_KEY:
+                print(f"  [!] HTTP {auth_code} – der gesetzte API-Key wird abgelehnt.")
+            else:
+                print(f"  [!] HTTP {auth_code} – Server verlangt einen API-Key "
+                      "(Menüpunkt 8, --key=… oder VLLM_API_KEY).")
 
         if mode == "health":
             collected = collect_vllm_info(schemes, ip, port)
@@ -1115,6 +1175,34 @@ def ask_ip():
         print("  Bitte eine gültige IP-Adresse eingeben.")
 
 
+def ask_api_key():
+    """API-Key interaktiv setzen, ändern oder löschen (gemerkt in API_KEY_FILE)."""
+    global API_KEY
+    env = os.environ.get("VLLM_API_KEY", "").strip()
+    print()
+    print(f"  Aktueller API-Key: {'gesetzt' if API_KEY else 'keiner'}"
+          f"{' (aus VLLM_API_KEY)' if env and API_KEY == env else ''}")
+    if env:
+        print("  [i] VLLM_API_KEY ist gesetzt und hat Vorrang vor dem gemerkten Key.")
+    print("  Eingabe bleibt verborgen. Leer = unverändert, '-' = gemerkten Key löschen.")
+    try:
+        raw = getpass("  API-Key: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not raw:
+        return
+    if raw == "-":
+        save_api_key("")
+        API_KEY = env
+        print("  Gemerkter API-Key gelöscht." + (" VLLM_API_KEY bleibt aktiv." if env else ""))
+        return
+    save_api_key(raw)
+    API_KEY = env or raw
+    print(f"  API-Key gespeichert: {API_KEY_FILE} (nur für dich lesbar)."
+          + ("  Achtung: VLLM_API_KEY hat weiterhin Vorrang." if env else ""))
+
+
 # ---------------------------------------------------------------------------
 # Ausgabe-Formatierung (JSON-Export)
 # ---------------------------------------------------------------------------
@@ -1169,7 +1257,7 @@ def menu():
 
     while True:
         print()
-        print(f"  Ziel: {ip}")
+        print(f"  Ziel: {ip}    API-Key: {'gesetzt' if API_KEY else '–'}")
         print("  ─────────────────────────────────────────")
         print("  1) Voll-Scan – alle Infos (Health, Modelle, GPU, Metriken)")
         print("  2) Health-Check")
@@ -1178,6 +1266,7 @@ def menu():
         print("  5) Prompt-Test (Chat/Generate)")
         print("  6) JSON-Export (für externe Tools)")
         print("  7) IP wechseln")
+        print("  8) API-Key eingeben/löschen")
         print("  0) Beenden")
         choice = input("  Auswahl: ").strip()
 
@@ -1195,6 +1284,8 @@ def menu():
             full_monitor(ip, None, mode="json")
         elif choice == "7":
             ip = ask_ip()
+        elif choice == "8":
+            ask_api_key()
         elif choice == "0":
             print("  Beendet.")
             return
@@ -1207,11 +1298,21 @@ def menu():
 # ---------------------------------------------------------------------------
 
 def main():
+    global API_KEY
+    # --key=… (an beliebiger Stelle) hat Vorrang vor VLLM_API_KEY / gemerktem Key
+    args = []
+    cli_key = None
+    for a in sys.argv[1:]:
+        if a.startswith("--key="):
+            cli_key = a.split("=", 1)[1].strip()
+        else:
+            args.append(a)
+    API_KEY = cli_key if cli_key is not None else load_api_key()
     try:
-        if len(sys.argv) >= 2:
-            ip = sys.argv[1]
-            port = int(sys.argv[2]) if len(sys.argv) > 2 else None
-            mode = sys.argv[3] if len(sys.argv) > 3 else "all"
+        if args:
+            ip = args[0]
+            port = int(args[1]) if len(args) > 1 else None
+            mode = args[2] if len(args) > 2 else "all"
             full_monitor(ip, port, mode=mode)
         else:
             menu()

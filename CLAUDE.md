@@ -71,6 +71,22 @@ that runs **only against already-loaded models** to avoid cold-load stalls).
 Config: `VLLM_LMSTUDIO_TARGETS` (`host:port:label`), `VLLM_LMSTUDIO_PROBE`,
 `VLLM_LMSTUDIO_PROMPT`, `VLLM_LMSTUDIO_MAX_TOKENS`.
 
+**API-Keys der überwachten Server:** jedes Ziel in `targets.json` kann ein Feld
+`api_key` tragen (im ⚙-Dialog *Instanzen verwalten* als Passwortfeld gepflegt).
+Der Collector baut daraus in `auth_headers(key, extra)` den Header
+`Authorization: Bearer …` und gibt den Key durch alle Abrufe/Probes weiter
+(`fetch_text`/`http_get`/`get_json`/`ollama_probe`/`lmstudio_probe`, jeweils
+Parameter `key`); ohne Instanz-Key greift der globale `VLLM_API_KEY`. Keys mit
+eigenem Schema (`Bearer …`/`Basic …`/`Token …`) werden unverändert übernommen.
+Dashboard-Seite: `build_targets()` liefert nur `key_set` (Key **nie** an den
+Browser), `add_target()` behandelt ein fehlendes `api_key`-Feld als *unverändert*,
+`""` als *löschen* und übernimmt bei geänderter Host/Port-Kombination den Key des
+Vorgängers (`prev_id`); `_save_targets()` schreibt 0600. Die CLI-Tools haben
+denselben Mechanismus (`auth_header()` in `monitor.sh`/`scan_for_llms.sh`,
+Quellen `--key=…` > `VLLM_API_KEY` > `~/.monitor_api_key` bzw.
+`~/.scan_for_llms_api_key`, Eingabe via Menüpunkt mit `getpass`); bei `401/403`
+weisen beide auf den fehlenden Key hin.
+
 **Authentication & user management (always on):** the dashboard now *always*
 requires a login. All accounts, roles and the LDAP config live in **`auth.json`**
 (`VLLM_AUTH_FILE`, next to the DB, 0600, gitignored) — created on first start
@@ -122,6 +138,8 @@ python3 monitor.sh <IP>                 # full scan, auto-detects port
 python3 monitor.sh <IP> <PORT>          # full scan on a specific port
 python3 monitor.sh <IP> <PORT> health   # modes: health | models | metrics | prompt | json | all
 python3 monitor.sh <IP> 8000 json       # machine-readable JSON export
+python3 monitor.sh <IP> 8000 all --key=sk-…   # geschützter Server (auch VLLM_API_KEY)
+python3 scan_for_llms.sh --key=sk-…           # dito (Menüpunkt 4 = Key eingeben)
 
 # Continuous monitoring (two long-running processes):
 python3 vllm_collector.sh               # permanent 15 s pull -> vllm_metrics.db
@@ -155,7 +173,8 @@ Claude Code session (`claude --resume <uuid>`).
   `monitor.sh` uses them freely.)
 - **Standard library only.** Do not introduce third-party dependencies.
 - Last-used IP is persisted per-tool: `~/.scan_for_llms_last_ip` and
-  `~/.monitor_last_ip`.
+  `~/.monitor_last_ip`; the optional API key likewise in
+  `~/.scan_for_llms_api_key` / `~/.monitor_api_key` (0600).
 - TLS verification is intentionally disabled (`SSL_CTX` with `CERT_NONE`) so the
   tools can probe self-signed HTTPS endpoints.
 - Both tools share the same known-LLM-port list (kept in sync manually):

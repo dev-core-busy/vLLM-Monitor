@@ -19,7 +19,9 @@ Bedienung:
 
 Konfiguration per Umgebungsvariablen:
   VLLM_HOST, VLLM_TARGETS="port:label,...", VLLM_INTERVAL,
-  VLLM_RETENTION_DAYS, VLLM_HTTP_TIMEOUT
+  VLLM_RETENTION_DAYS, VLLM_HTTP_TIMEOUT,
+  VLLM_API_KEY (globaler API-Key für geschützte Server; pro Instanz im
+  Dashboard überschreibbar -> targets.json "api_key")
 
 Nur Python-Standardbibliothek – keine externen Abhängigkeiten.
 """
@@ -34,7 +36,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.20.2"
+__version__ = "0.21.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -82,6 +84,11 @@ OLLAMA_TIMEOUT = float(os.environ.get("VLLM_OLLAMA_TIMEOUT", "3"))
 # großen Modells den ganzen Scrape-Loop blockiert und alle Instanzen „flackern".
 OLLAMA_PROBE_TIMEOUT = float(os.environ.get("VLLM_OLLAMA_PROBE_TIMEOUT", "15"))
 PURGE_EVERY = 240
+
+# Globaler API-Key für geschützte LLM-Server (Default für alle Ziele ohne eigenen
+# Key). Pro Instanz wird der Key im Dashboard gepflegt und in targets.json unter
+# "api_key" abgelegt – der dortige Wert hat Vorrang vor dieser Env-Variable.
+API_KEY = os.environ.get("VLLM_API_KEY", "").strip()
 
 # --- Schwellwerte für Alarme (Env = Default; im Dashboard editierbar -> settings.json) ---
 ALERT_KV = float(os.environ.get("VLLM_ALERT_KV", "90"))                    # KV-Cache % (>)
@@ -187,12 +194,15 @@ def load_extra_targets():
             port = int(port)
         except (ValueError, TypeError):
             continue
+        # Instanz-eigener API-Key (leer -> globaler VLLM_API_KEY greift)
+        key = (t.get("api_key") or "").strip()
         if kind == "dcgm":
-            out["dcgm"].append((host, port))
+            out["dcgm"].append((host, port, key))
         elif kind == "vllm":
-            out["vllm"].append({"host": host, "port": port})
+            out["vllm"].append({"host": host, "port": port, "api_key": key})
         else:  # ollama / stt / lmstudio
-            out[kind].append({"host": host, "port": port, "label": t.get("label") or kind})
+            out[kind].append({"host": host, "port": port, "api_key": key,
+                              "label": t.get("label") or kind})
     return out
 
 
@@ -501,9 +511,25 @@ def parse_prometheus(text):
     return out
 
 
-def fetch_text(host, port, path):
+def auth_headers(key=None, extra=None):
+    """Standard-Header inkl. optionalem API-Key (`Authorization: Bearer …`).
+    `key` ist der Instanz-Key aus targets.json; ohne ihn greift VLLM_API_KEY.
+    Ein Key, der bereits ein Schema mitbringt („Bearer …"), wird unverändert
+    übernommen (erlaubt z. B. „Basic …")."""
+    h = {"User-Agent": "vllm_collector/%s" % __version__}
+    if extra:
+        h.update(extra)
+    k = (key if key else API_KEY) or ""
+    k = k.strip()
+    if k:
+        scheme = k.split(" ", 1)[0].lower()
+        h["Authorization"] = k if scheme in ("bearer", "basic", "token") else "Bearer " + k
+    return h
+
+
+def fetch_text(host, port, path, key=None):
     url = "http://%s:%d%s" % (host, port, path)
-    req = request.Request(url, headers={"User-Agent": "vllm_collector/%s" % __version__})
+    req = request.Request(url, headers=auth_headers(key))
     try:
         resp = request.urlopen(req, timeout=HTTP_TIMEOUT)
         return resp.read().decode("utf-8", "replace")
@@ -596,9 +622,9 @@ def extract_config(samples):
 # Ollama
 # ---------------------------------------------------------------------------
 
-def http_get(host, port, path, timeout=None):
+def http_get(host, port, path, timeout=None, key=None):
     url = "http://%s:%d%s" % (host, port, path)
-    req = request.Request(url, headers={"User-Agent": "vllm_collector/%s" % __version__})
+    req = request.Request(url, headers=auth_headers(key))
     try:
         resp = request.urlopen(req, timeout=timeout or HTTP_TIMEOUT)
         return resp.read().decode("utf-8", "replace")
@@ -606,8 +632,8 @@ def http_get(host, port, path, timeout=None):
         return None
 
 
-def get_json(host, port, path, timeout=None):
-    t = http_get(host, port, path, timeout)
+def get_json(host, port, path, timeout=None, key=None):
+    t = http_get(host, port, path, timeout, key)
     if not t:
         return None
     try:
@@ -637,12 +663,13 @@ def _oll_bump(acc, k, x):
     h["+Inf"] += 1
 
 
-def ollama_probe(host, port, model):
+def ollama_probe(host, port, model, key=None):
     """Kleiner /api/generate-Aufruf -> Latenz/Token-Kennzahlen (Ollama liefert ns)."""
     body = json.dumps({"model": model, "prompt": OLLAMA_PROMPT, "stream": False,
                        "options": {"num_predict": OLLAMA_NUM_PREDICT}}).encode("utf-8")
     req = request.Request("http://%s:%d/api/generate" % (host, port), data=body,
-                          headers={"Content-Type": "application/json"}, method="POST")
+                          headers=auth_headers(key, {"Content-Type": "application/json"}),
+                          method="POST")
     try:
         resp = request.urlopen(req, timeout=OLLAMA_PROBE_TIMEOUT)
         d = json.loads(resp.read().decode("utf-8", "replace"))
@@ -661,10 +688,10 @@ def ollama_probe(host, port, model):
 
 
 def scrape_ollama(conn, ts, tgt, verbose=True):
-    host, port = tgt["host"], tgt["port"]
+    host, port, key = tgt["host"], tgt["port"], tgt.get("api_key")
     # Kurzer Timeout für die Erreichbarkeits-/Metadaten-Aufrufe, damit ein toter
     # Host (z. B. Laptop im Standby) den Sammler nicht je Scrape blockiert.
-    ver = get_json(host, port, "/api/version", timeout=OLLAMA_TIMEOUT)
+    ver = get_json(host, port, "/api/version", timeout=OLLAMA_TIMEOUT, key=key)
     if ver is None:
         mark_down(conn, host, port)
         if verbose:
@@ -672,8 +699,8 @@ def scrape_ollama(conn, ts, tgt, verbose=True):
         return 0
     _down_since.pop((host, port), None)   # wieder erreichbar -> Entprellung zurücksetzen
     version = ver.get("version")
-    ps = get_json(host, port, "/api/ps", timeout=OLLAMA_TIMEOUT) or {}
-    tags = get_json(host, port, "/api/tags", timeout=OLLAMA_TIMEOUT) or {}
+    ps = get_json(host, port, "/api/ps", timeout=OLLAMA_TIMEOUT, key=key) or {}
+    tags = get_json(host, port, "/api/tags", timeout=OLLAMA_TIMEOUT, key=key) or {}
     loaded = ps.get("models") or []
     model, vram = None, None
     if loaded:
@@ -693,7 +720,7 @@ def scrape_ollama(conn, ts, tgt, verbose=True):
     # Generierung ein großes Modell erst laden (Sekunden bis Minute) und den
     # gesamten Scrape-Loop blockieren (alle Instanzen „flackern" rot/grün).
     if OLLAMA_PROBE and loaded:
-        pr = ollama_probe(host, port, model)
+        pr = ollama_probe(host, port, model, key)
         if pr:
             acc = _oll_acc.setdefault((host, port, model), _oll_new())
             acc["gen"] += pr["eval_count"]
@@ -726,7 +753,7 @@ def scrape_ollama(conn, ts, tgt, verbose=True):
 # LM Studio (OpenAI-kompatibel; REST-API /api/v0 liefert Lade-Status + Stats)
 # ---------------------------------------------------------------------------
 
-def lmstudio_probe(host, port, model):
+def lmstudio_probe(host, port, model, key=None):
     """Kleiner /api/v0/chat/completions-Aufruf -> Token-/Latenz-Kennzahlen.
     LM Studio liefert ein 'stats'-Objekt (tokens_per_second, time_to_first_token,
     generation_time in Sekunden) und 'usage' (prompt/completion_tokens)."""
@@ -734,7 +761,8 @@ def lmstudio_probe(host, port, model):
                        "messages": [{"role": "user", "content": LMSTUDIO_PROMPT}],
                        "max_tokens": LMSTUDIO_MAX_TOKENS, "stream": False}).encode("utf-8")
     req = request.Request("http://%s:%d/api/v0/chat/completions" % (host, port), data=body,
-                          headers={"Content-Type": "application/json"}, method="POST")
+                          headers=auth_headers(key, {"Content-Type": "application/json"}),
+                          method="POST")
     try:
         resp = request.urlopen(req, timeout=OLLAMA_PROBE_TIMEOUT)
         d = json.loads(resp.read().decode("utf-8", "replace"))
@@ -751,11 +779,11 @@ def lmstudio_probe(host, port, model):
 
 
 def scrape_lmstudio(conn, ts, tgt, verbose=True):
-    host, port = tgt["host"], tgt["port"]
-    data = get_json(host, port, "/api/v0/models", timeout=OLLAMA_TIMEOUT)
+    host, port, key = tgt["host"], tgt["port"], tgt.get("api_key")
+    data = get_json(host, port, "/api/v0/models", timeout=OLLAMA_TIMEOUT, key=key)
     api_v0 = data is not None
     if data is None:                                # Fallback: OpenAI-kompatibel
-        data = get_json(host, port, "/v1/models", timeout=OLLAMA_TIMEOUT)
+        data = get_json(host, port, "/v1/models", timeout=OLLAMA_TIMEOUT, key=key)
     if data is None:
         mark_down(conn, host, port)
         if verbose:
@@ -785,7 +813,7 @@ def scrape_lmstudio(conn, ts, tgt, verbose=True):
     # Probe nur gegen ein tatsächlich GELADENES Modell (kein Kalt-Load auslösen);
     # der Lade-Status ist nur über die /api/v0-API bekannt.
     if LMSTUDIO_PROBE and loaded and api_v0:
-        pr = lmstudio_probe(host, port, model)
+        pr = lmstudio_probe(host, port, model, key)
         if pr:
             acc = _oll_acc.setdefault((host, port, model), _oll_new())
             acc["gen"] += pr["gen"]
@@ -816,7 +844,7 @@ def scrape_lmstudio(conn, ts, tgt, verbose=True):
 def scrape_stt(conn, ts, tgt, verbose=True):
     """STT-Server (faster-whisper o.ä.): /health -> Status + aktive Sessions."""
     host, port = tgt["host"], tgt["port"]
-    h = get_json(host, port, "/health", timeout=OLLAMA_TIMEOUT)
+    h = get_json(host, port, "/health", timeout=OLLAMA_TIMEOUT, key=tgt.get("api_key"))
     if h is None:
         mark_down(conn, host, port)
         if verbose:
@@ -847,9 +875,9 @@ def discover_ollama():
     return found
 
 
-def scrape_dcgm(conn, ts, host, port, verbose=True):
+def scrape_dcgm(conn, ts, host, port, verbose=True, key=None):
     """NVIDIA DCGM-Exporter (/metrics, Prometheus) -> GPU-Hardware je GPU."""
-    text = http_get(host, port, "/metrics")
+    text = http_get(host, port, "/metrics", key=key)
     if text is None:
         mark_down(conn, host, port)
         if verbose:
@@ -901,9 +929,9 @@ def scrape_dcgm(conn, ts, host, port, verbose=True):
 # Scrape-Zyklus
 # ---------------------------------------------------------------------------
 
-def scrape_vllm_target(conn, ts, host, port, verbose=True):
+def scrape_vllm_target(conn, ts, host, port, verbose=True, key=None):
     """Ein vLLM-Ziel scrapen (Metriken + Config + Alarme). Rückgabe: gespeicherte Modelle."""
-    text = fetch_text(host, port, "/metrics")
+    text = fetch_text(host, port, "/metrics", key)
     if text is None:
         mark_down(conn, host, port)
         _down_since.setdefault((host, port), ts)
@@ -917,7 +945,7 @@ def scrape_vllm_target(conn, ts, host, port, verbose=True):
     per_model = extract(samples)
     cfg = extract_config(samples)
 
-    models_doc = fetch_text(host, port, "/v1/models")
+    models_doc = fetch_text(host, port, "/v1/models", key)
     maxlen = {}
     if models_doc:
         try:
@@ -925,7 +953,7 @@ def scrape_vllm_target(conn, ts, host, port, verbose=True):
                 maxlen[m.get("id")] = _num(m.get("max_model_len"))
         except ValueError:
             pass
-    ver_doc = fetch_text(host, port, "/version")
+    ver_doc = fetch_text(host, port, "/version", key)
     version = None
     if ver_doc:
         try:
@@ -977,11 +1005,11 @@ def scrape_once(conn, verbose=True):
     # (Env/Unit dient dann nur noch als Erst-Seed). So gibt es kein Doppel-Scrape,
     # und im UI gelöschte/pausierte Instanzen verschwinden wirklich.
     if _file_has_vllm():
-        vllm_list = [(t["host"], t["port"]) for t in extra["vllm"]]
+        vllm_list = [(t["host"], t["port"], t.get("api_key")) for t in extra["vllm"]]
     else:
-        vllm_list = [(tgt.get("host", HOST), tgt["port"]) for tgt in TARGETS]
-    for host, port in vllm_list:
-        total += scrape_vllm_target(conn, ts, host, port, verbose)
+        vllm_list = [(tgt.get("host", HOST), tgt["port"], None) for tgt in TARGETS]
+    for host, port, key in vllm_list:
+        total += scrape_vllm_target(conn, ts, host, port, verbose, key)
 
     # Ollama-Instanzen (konfiguriert + automatisch entdeckt + Datei)
     for tgt in OLLAMA_TARGETS + discover_ollama() + extra["ollama"]:
@@ -1004,10 +1032,11 @@ def scrape_once(conn, verbose=True):
         except Exception as e:
             print("  [!] LM-Studio-Fehler %s:%d: %s" % (tgt["host"], tgt["port"], e))
 
-    # NVIDIA DCGM-Exporter (GPU-Hardware)
-    for host, port in DCGM_TARGETS + extra["dcgm"]:
+    # NVIDIA DCGM-Exporter (GPU-Hardware); Env-Ziele ohne eigenen Key (2er-Tupel)
+    for item in DCGM_TARGETS + extra["dcgm"]:
+        host, port, key = (tuple(item) + (None,))[:3]
         try:
-            total += scrape_dcgm(conn, ts, host, port, verbose)
+            total += scrape_dcgm(conn, ts, host, port, verbose, key)
         except Exception as e:
             print("  [!] DCGM-Fehler %s:%d: %s" % (host, port, e))
 

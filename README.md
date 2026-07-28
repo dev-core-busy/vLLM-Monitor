@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-![Version](https://img.shields.io/badge/version-0.20.2-blue)
+![Version](https://img.shields.io/badge/version-0.21.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Lizenz](https://img.shields.io/badge/license-MIT-green)
 ![Abhängigkeiten](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)
@@ -93,6 +93,14 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
   GPU-Ziele über das ⚙-Menü hinzufügen, pausieren oder entfernen (persistent in
   `targets.json`; der Collector lädt sie zur Laufzeit) – ohne systemd-Unit zu
   editieren. Schreibzugriff nur mit aktiver Authentifizierung sinnvoll.
+- 🔑 **API-Keys je Instanz** – geschützte Server (z. B. vLLM mit `--api-key`,
+  LM Studio hinter einem Proxy) erhalten im ⚙-Dialog *Instanzen verwalten* einen
+  eigenen Key. Er wird als `Authorization: Bearer …` bei allen Scrapes und Probes
+  mitgesendet, liegt nur serverseitig in `targets.json` (0600) und wird **nie** an
+  den Browser zurückgegeben (die API meldet lediglich `key_set`). Ohne Eintrag
+  greift der globale Key aus `VLLM_API_KEY`. Auch `monitor.sh` und
+  `scan_for_llms.sh` können einen Key mitschicken (`--key=…`, Menüpunkt oder
+  `VLLM_API_KEY`).
 - 🎛️ **LM Studio** (OpenAI-kompatibel, kein `/metrics`) wird über die REST-API
   `/api/v0/models` überwacht (geladenes Modell + Kontextlänge + Online-Status);
   optional misst eine kleine Probe **nur gegen geladene Modelle** Token-Durchsatz
@@ -189,6 +197,7 @@ Der Collector wird vollständig über **Umgebungsvariablen** gesteuert:
 | `VLLM_HTTP_TIMEOUT` | `15` | Timeout pro `/metrics`-Abruf (Sekunden) |
 | `VLLM_DB` | *(Projektordner)* | Alternativer Pfad zur SQLite-Datei |
 | `VLLM_TARGETS_FILE` | *(Projektordner)*`/targets.json` | Über das Dashboard verwaltete Zusatz-Instanzen; der Collector lädt die Datei bei jedem Scrape neu. Ergänzt `VLLM_TARGETS` & Co. |
+| `VLLM_API_KEY` | *(leer)* | Globaler API-Key für geschützte LLM-Server (`Authorization: Bearer …`), gilt für alle Ziele ohne eigenen Key. Pro Instanz im Dashboard überschreibbar (`targets.json` → `api_key`). Keys mit eigenem Schema (`Bearer …`, `Basic …`) werden unverändert gesendet. |
 | `VLLM_OLLAMA_TARGETS` | *(leer)* | Ollama-Instanzen `host:port:label,…` (Health/VRAM + Probe) |
 | `VLLM_OLLAMA_PROBE` | `1` | Synthetischen Ollama-Probe (`/api/generate`) an/aus |
 | `VLLM_OLLAMA_AUTOSCAN` | `<host>:11434,127.0.0.1:11434` | Endpunkte, die auf ein Ollama geprüft und automatisch eingebunden werden (`""` = aus) |
@@ -337,7 +346,18 @@ python3 scan_for_llms.sh
 python3 monitor.sh <IP>                 # Voll-Scan, Port-Autoerkennung
 python3 monitor.sh <IP> <PORT> health   # health | models | metrics | prompt | json | all
 python3 monitor.sh <IP> <PORT> json     # maschinenlesbarer Export
+
+# Geschützte Server (API-Key) – gilt für beide Tools:
+python3 monitor.sh <IP> <PORT> all --key=sk-geheim
+VLLM_API_KEY=sk-geheim python3 scan_for_llms.sh
 ```
+
+Beide Tools nehmen den Key auch interaktiv im Menü an (`monitor.sh` → *8) API-Key
+eingeben/löschen*, `scan_for_llms.sh` → *4)*) und merken ihn in
+`~/.monitor_api_key` bzw. `~/.scan_for_llms_api_key` (Modus 0600).
+Reihenfolge: `--key=…` > `VLLM_API_KEY` > gemerkter Key. Antwortet ein Server mit
+`401`/`403`, weisen beide Tools ausdrücklich auf den fehlenden Key hin
+(`scan_for_llms.sh` meldet den Port als *LLM-API (API-Key erforderlich)*).
 
 `monitor.sh` läuft eine **collect → parse → display**-Pipeline: es sammelt breit
 alle verfügbaren Endpunkte (`/v1/models`, `/health`, `/version`, `/metrics`,
@@ -367,6 +387,10 @@ CORS/OPTIONS, Embeddings/Rerank …) und stellt sie je nach erkanntem Servertyp
   Active-Directory-Nutzer (einzeln oder per **AD-Gruppe** → Rolle, via LDAP
   Simple Bind + `memberOf`-Suche) werden unter ⚙ → 👥 *Benutzer & Zugriff*
   gepflegt und in `auth.json` (0600, nicht ins Git) gespeichert.
+- **API-Keys der überwachten Server** liegen in `targets.json` (0600, nicht ins
+  Git) und werden von der API nie ausgeliefert – das UI erfährt nur, *ob* ein Key
+  gesetzt ist. Die CLI-Tools merken ihre Keys in `~/.monitor_api_key` bzw.
+  `~/.scan_for_llms_api_key` (ebenfalls 0600); die Eingabe im Menü bleibt verborgen.
 - **Scraper/Automation:** Prometheus u. Ä. können sich per **HTTP Basic Auth**
   mit einem (lokalen oder AD-)Konto an `/metrics` anmelden – parallel zum Cookie.
 - **Nur mit HTTPS betreiben** – sonst gehen Zugangsdaten im Klartext übers Netz.
