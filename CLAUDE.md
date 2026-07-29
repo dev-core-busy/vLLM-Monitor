@@ -44,6 +44,37 @@ one or more vLLM instances (host via `VLLM_HOST`, ports/labels via
   /api/annotations` + `vllm_dashboard.sh annotate "label" [ts]`; they render as
   vertical lines in every chart.
 
+The range selector additionally offers **„seit Beginn"** (`range=all`): every
+`range=…` endpoint funnels through `_range_from()`, which resolves `all` via
+`db_span()` (now − `MIN(ts)`, still capped at the 30-day retention) and returns
+the effective span in the response, so the client learns the real window
+(`windowSpan()`). Long windows switch the x-axis labels to date+time
+(`tickLabel()`). **`GET /api/energy`** (`build_energy()`) integrates the DCGM
+power readings over time (trapezoid, on the raw rows — not the downsampled chart
+points) into **kWh per calendar day**; measurement gaps larger than 4× the median
+scrape interval are skipped instead of extrapolated and reported as `coverage`.
+The result renders in its own tile "GPU-Verbrauch" as a Chart.js
+**bar** chart (`fetchEnergy()`/`renderEnergy()`, own instance `energyChart`, not
+part of `charts{}`; the `barvals` plugin draws the value above each bar, inside
+it when the bar reaches the top). That tile is a CHARTS entry carrying a `custom`
+HTML string (head line + own canvas) instead of the standard canvas — such
+entries get no time-series chart and no 🔍 analysis button, so every Chart.js
+time-series iteration runs over `PLOTS = CHARTS.filter(s => !s.custom)` while
+grid order, hide and maximize keep using the full `CHARTS` list. Days with a
+measurement gap are drawn translucent (their kWh is a lower bound). The tile
+preview shows **only** the daily average as a large figure (`.ebig`); the bar
+chart, its labels and the Ø line appear when the tile is maximized. Note when
+writing such rules: the surrounding "Diagramme" section is itself a `.card`, so
+`.card:not(.maximized) …` always matches — use the child combinator
+(`.card.maximized > …`).
+
+Tile layout: every `.card` is a flex column and its canvas lives in a
+`.chartwrap` (`flex:1`, `min-height:var(--card-h)`, canvas absolutely filling
+it). That keeps the x-axes of all tiles in a grid row on one line regardless of
+how many lines the heading wraps to, and makes `toggleMax()` free of manual
+height math — the flex child fills the maximized card exactly, so nothing
+scrolls. **New tiles must wrap their canvas in `.chartwrap`.**
+
 The collector evaluates **configurable alert thresholds** (`VLLM_ALERT_KV/TEMP/
 ERR/OFFLINE_MIN`, also read by the dashboard and exposed in `/api/config`) and
 records state transitions (raised/cleared) into an `events` table — one row per
@@ -106,8 +137,14 @@ enforced on `do_POST`/`do_DELETE`.
 `auth.json.ldap`; the `VLLM_LDAP_*` env vars only **seed** it on first creation.
 `ldap_login()` does a hand-rolled **simple bind** and, if an admin/readonly group
 is configured, an **LDAP search for `memberOf`** (BER `SearchRequest`, stdlib) to
-map AD groups → role. Role resolution (`resolve_ad_role`): explicit AD-user entry
-> group mapping (`group_admin`/`group_readonly`) > `default_role`. Admin endpoints:
+map AD groups → role. Besides the two legacy single fields, **any number of AD
+groups can be released** in the UI (table *Active-Directory-Gruppen (Freigabe)*,
+stored in `auth.json.ad_groups` as `{name, role}`; `name` may be a CN or a full
+DN, matched by `_group_match()` against `memberOf`). Role resolution
+(`resolve_ad_role`): explicit AD-user entry > released groups (admin beats
+readonly) > legacy `group_admin`/`group_readonly` > `default_role`. Managed via
+`POST/DELETE /api/users` with `kind: "adgroup"`; the directory search offers
+"→ Admin"/"→ Read-only" per hit to release a group in one click. Admin endpoints:
 `GET/POST/DELETE /api/users`, `POST /api/ldap`, `POST /api/ldap/test`. Only
 meaningful with HTTPS. `setup.sh` no longer prompts for LDAP.
 

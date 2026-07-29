@@ -4,6 +4,56 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.22.0] – 2026-07-29
+
+### Hinzugefügt
+- **Zeitraum „seit Beginn"** – neue Option im Zeitraum-Menü (`range=all`).
+  `_range_from()` löst sie zentral über `db_span()` auf (jetzt − ältester
+  `ts`, weiter auf die 30-Tage-Aufbewahrung gedeckelt) und liefert die
+  tatsächliche Spanne in der Antwort zurück, sodass Vergleichszeitraum und
+  Beschriftung stimmen. Gilt für `/api/series`, `/api/stream`,
+  `/api/annotations` und `/api/energy`.
+- **Kachel „GPU-Verbrauch"** – neuer Endpunkt `GET /api/energy`
+  (`build_energy()`): integriert die DCGM-Leistungswerte über die Zeit
+  (Trapezregel, auf den **Rohdaten**, nicht auf den verdichteten
+  Diagrammpunkten) zu **kWh je Kalendertag**, an lokalen Tagesgrenzen
+  aufgeteilt (sommerzeitfest) und über alle GPUs summiert. Messlücken über dem
+  4-fachen des Median-Scrape-Intervalls werden übersprungen statt
+  hochgerechnet und als `coverage` ausgewiesen.
+  Die Vorschaukachel zeigt nur den Tagesdurchschnitt im gewählten Zeitraum,
+  die maximierte Ansicht das Balkendiagramm mit Werten über den Balken,
+  gestrichelter Ø-Linie und Gesamtverbrauch/Messdauer.
+- **Beliebig viele AD-Gruppen freigeben** – neue Tabelle *Active-Directory-
+  Gruppen (Freigabe)* im Dialog *Benutzer & Zugriff*, gespeichert in
+  `auth.json.ad_groups` (`{name, role}`, CN oder vollständiger DN, Abgleich
+  gegen `memberOf`). Rangfolge in `resolve_ad_role()`: Einzelfreigabe eines
+  Benutzers > freigegebene Gruppen (Admin schlägt Read-only) > die bisherigen
+  Einzelfelder `group_admin`/`group_readonly` > Standardrolle. Verwaltung über
+  `POST/DELETE /api/users` mit `kind: "adgroup"`; die Verzeichnissuche gibt
+  eine Gruppe per „→ Admin"/„→ Read-only" direkt frei.
+
+### Geändert
+- **Anmeldung als echtes Formular** – Login und Passwortwechsel sind jetzt
+  `<form>`-Elemente mit `name`-Attributen, die per POST abgeschickt werden und
+  serverseitig mit **303** auf `/` zurückleiten (Fehler über
+  `?login=failed|expired` bzw. `?pwerr=…`). Erst durch diese echte Navigation
+  bieten Browser-Passwortmanager das Speichern der Zugangsdaten an und füllen
+  sie später aus; der bisherige JSON-Pfad der Endpunkte bleibt erhalten.
+  `_read_body()` versteht zusätzlich `application/x-www-form-urlencoded`.
+- **Kachel-Layout** – jede Kachel ist eine Flex-Spalte, das Diagramm liegt in
+  `.chartwrap` und füllt sie bis zur Unterkante. Dadurch liegen die X-Achsen
+  aller Kacheln einer Reihe auf einer Linie, unabhängig davon, über wie viele
+  Zeilen die Überschrift läuft; maximierte Kacheln passen ohne Scrollen ins
+  Fenster und nutzen die volle Höhe.
+- **Achsenbeschriftung** – bei Fenstern über 36 h zeigt die X-Achse Datum und
+  Uhrzeit, über 7 Tagen nur noch das Datum (vorher immer nur die Uhrzeit).
+
+### Behoben
+- **Trefferliste der Verzeichnissuche** – die Schaltflächen nutzten `.cbtn`
+  (fest 22 px breit); der Text lief heraus und erzeugte waagerechte und
+  senkrechte Scrollbalken, der Treffer war abgeschnitten. Neue Klasse `.tbtn`
+  für Textschaltflächen, Ergebnisbereich höher, lange Namen werden gekürzt.
+
 ## [0.21.0] – 2026-07-28
 
 ### Hinzugefügt

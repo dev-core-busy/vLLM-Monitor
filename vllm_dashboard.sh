@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -217,6 +217,22 @@ def _connect():
 # Zeitreihen
 # ---------------------------------------------------------------------------
 
+def db_span():
+    """Sekunden von der ältesten gespeicherten Messung bis jetzt.
+    Grundlage für den Zeitraum „seit Beginn"; None, wenn nichts gespeichert ist."""
+    if not os.path.exists(DB_PATH):
+        return None
+    try:
+        conn = _connect()
+        row = conn.execute("SELECT MIN(ts) FROM samples").fetchone()
+        conn.close()
+    except sqlite3.Error:
+        return None
+    if not row or row[0] is None:
+        return None
+    return max(60, int(time.time()) - int(row[0]))
+
+
 def build_series(range_s, offset_s=0, start=None, end=None):
     if not os.path.exists(DB_PATH):
         return {"error": "Keine Datenbank – läuft der Collector?", "models": {}}
@@ -287,6 +303,106 @@ def build_series(range_s, offset_s=0, start=None, end=None):
 
     return {"now": now * 1000, "range": range_s, "bucket": bucket,
             "offset": offset_s, "models": out}
+
+
+# --- Energieverbrauch der GPUs (aus der Leistungsaufnahme integriert) --------
+
+def _day_start(ts):
+    """Beginn des Kalendertags (lokale Zeit) zu einem Zeitstempel."""
+    lt = time.localtime(ts)
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+
+
+def _next_day_start(ts):
+    # +26 h statt +24 h: überspringt auch bei Sommer-/Winterzeitwechsel sicher
+    # genau einen Tag (23- und 25-Stunden-Tage inklusive).
+    return _day_start(ts + 93600)
+
+
+def _day_key(ts):
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def build_energy(range_s=None, start=None, end=None):
+    """Energieverbrauch je Kalendertag aus den GPU-Leistungswerten (DCGM).
+
+    Integriert die gemessene Leistung (W) über die Zeit (Trapezregel) zu kWh –
+    bewusst auf den Rohdaten, nicht auf den fürs Diagramm verdichteten Punkten.
+    Messlücken (Collector/GPU offline) werden übersprungen statt hochgerechnet;
+    'coverage' weist aus, wie viel des Tages tatsächlich abgedeckt ist."""
+    if not os.path.exists(DB_PATH):
+        return {"error": "Keine Datenbank – läuft der Collector?", "days": []}
+
+    now = int(time.time())
+    if start is not None and end is not None:
+        since, until = start, end
+    else:
+        until = now
+        since = until - (range_s or 86400)
+
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT ts, host, port, model, gpu_power FROM samples "
+        "WHERE gpu_power IS NOT NULL AND ts >= ? AND ts < ? "
+        "ORDER BY host, port, model, ts", (since, until)).fetchall()
+    conn.close()
+
+    series = {}
+    for r in rows:
+        series.setdefault((r["host"], r["port"], r["model"]), []).append((r["ts"], r["gpu_power"]))
+
+    days = {}          # Tag -> {"kwh": …, "seconds": …}
+    per_gpu = {}       # GPU  -> {"kwh": …, "seconds": …}
+    for (host, port, model), pts in series.items():
+        if len(pts) < 2:
+            continue
+        # Erwartetes Messintervall aus den Abständen; alles deutlich darüber
+        # gilt als Lücke und wird nicht mitgerechnet.
+        deltas = sorted(pts[i + 1][0] - pts[i][0] for i in range(len(pts) - 1))
+        step = deltas[len(deltas) // 2] or 15
+        max_gap = max(60, step * 4)
+        gpu = per_gpu.setdefault("%s:%s %s" % (host, port, model),
+                                 {"host": host, "port": port, "model": model,
+                                  "kwh": 0.0, "seconds": 0})
+        for (t1, p1), (t2, p2) in zip(pts, pts[1:]):
+            dt = t2 - t1
+            if dt <= 0 or dt > max_gap:
+                continue
+            avg_w = ((p1 or 0.0) + (p2 or 0.0)) / 2.0
+            gpu["kwh"] += avg_w * dt / 3.6e6
+            gpu["seconds"] += dt
+            # Intervall an Tagesgrenzen aufteilen, damit die Tageswerte stimmen
+            a = t1
+            while a < t2:
+                b = min(t2, _next_day_start(a))
+                d = days.setdefault(_day_key(a), {"kwh": 0.0, "seconds": 0})
+                d["kwh"] += avg_w * (b - a) / 3.6e6
+                d["seconds"] += b - a
+                a = b
+
+    out = []
+    for key in sorted(days):
+        d = days[key]
+        # Anteil des Tages, der im Fenster liegt (Rand-Tage sind angeschnitten)
+        d0 = _day_start(int(time.mktime(time.strptime(key, "%Y-%m-%d"))))
+        span = max(1, min(until, _next_day_start(d0)) - max(since, d0))
+        gpus = max(1, len(per_gpu))
+        # d["seconds"] summiert über alle GPUs -> echte Messdauer des Tages
+        measured_day = d["seconds"] / float(gpus)
+        out.append({"day": key, "kwh": round(d["kwh"], 3),
+                    "seconds": int(measured_day),
+                    # mittlere Gesamtleistung aller GPUs während der Messzeit
+                    "avg_w": round(d["kwh"] * 3.6e6 / measured_day, 1) if measured_day else None,
+                    "coverage": round(min(1.0, measured_day / float(span)), 3)})
+
+    total = sum(d["kwh"] for d in out)
+    measured = sum(d["seconds"] for d in out)
+    return {"days": out, "total_kwh": round(total, 3),
+            "avg_kwh_day": round(total / (measured / 86400.0), 3) if measured >= 60 else None,
+            "measured_seconds": int(measured),
+            "gpus": [dict(v, kwh=round(v["kwh"], 3)) for v in
+                     sorted(per_gpu.values(), key=lambda g: (g["host"], g["port"], g["model"]))],
+            "since": since * 1000, "until": until * 1000}
 
 
 def build_config():
@@ -884,7 +1000,8 @@ def _default_auth():
     rec = _hash_pw("admin")
     rec.update({"username": "admin", "role": "admin", "must_change": True,
                 "created": int(time.time())})
-    return {"version": 1, "users": [rec], "ad_users": [], "ldap": _default_ldap_cfg()}
+    return {"version": 1, "users": [rec], "ad_users": [], "ad_groups": [],
+            "ldap": _default_ldap_cfg()}
 
 
 def load_auth():
@@ -904,6 +1021,7 @@ def load_auth():
     # fehlende Felder tolerant ergänzen
     au.setdefault("users", [])
     au.setdefault("ad_users", [])
+    au.setdefault("ad_groups", [])   # freigegebene AD-Gruppen (beliebig viele)
     if "ldap" not in au or not isinstance(au["ldap"], dict):
         au["ldap"] = _default_ldap_cfg()
     else:
@@ -944,6 +1062,14 @@ def _find_ad_user(au, username):
     for rec in au.get("ad_users", []):
         n = rec.get("username", "").strip().lower()
         if n and (n == short or n == full):
+            return rec
+    return None
+
+
+def _find_ad_group(au, name):
+    n = (name or "").strip().lower()
+    for rec in au.get("ad_groups", []):
+        if rec.get("name", "").strip().lower() == n:
             return rec
     return None
 
@@ -1327,6 +1453,16 @@ def resolve_ad_role(au, username, groups):
     ad = _find_ad_user(au, username)
     if ad:
         return ad.get("role", "readonly")
+    # freigegebene AD-Gruppen (Liste) – Admin schlägt Read-only
+    hit = None
+    for rec in au.get("ad_groups", []):
+        if _group_match(rec.get("name", ""), groups):
+            r = rec.get("role", "readonly")
+            if r == "admin":
+                return "admin"
+            hit = hit or r
+    if hit:
+        return hit
     ld = au.get("ldap", {})
     if _group_match(ld.get("group_admin", ""), groups):
         return "admin"
@@ -1394,7 +1530,8 @@ def build_users():
     au = load_auth()
     users = [{"username": u["username"], "role": u.get("role", "admin"),
               "must_change": bool(u.get("must_change"))} for u in au.get("users", [])]
-    return {"users": users, "ad_users": au.get("ad_users", []), "ldap": au.get("ldap", {})}
+    return {"users": users, "ad_users": au.get("ad_users", []),
+            "ad_groups": au.get("ad_groups", []), "ldap": au.get("ldap", {})}
 
 
 def users_upsert(body):
@@ -1408,6 +1545,14 @@ def users_upsert(body):
     if role not in ROLES:
         return {"error": "ungültige Rolle"}
     au = load_auth()
+    if kind == "adgroup":
+        ex = _find_ad_group(au, username)
+        if ex:
+            ex["role"] = role
+        else:
+            au["ad_groups"].append({"name": username, "role": role})
+        save_auth(au)
+        return {"ok": True}
     if kind == "ad":
         short = username.split("@")[0].split("\\")[-1].strip()
         ex = _find_ad_user(au, short)
@@ -1442,6 +1587,12 @@ def users_upsert(body):
 def users_delete(username, kind="local"):
     au = load_auth()
     username = (username or "").strip()
+    if kind == "adgroup":
+        before = len(au["ad_groups"])
+        au["ad_groups"] = [g for g in au["ad_groups"]
+                           if g.get("name", "").strip().lower() != username.lower()]
+        save_auth(au)
+        return {"ok": before != len(au["ad_groups"])}
     if kind == "ad":
         short = username.split("@")[0].split("\\")[-1].lower()
         before = len(au["ad_users"])
@@ -1553,8 +1704,11 @@ def _check_cookie_value(val):
 # ---------------------------------------------------------------------------
 
 def _range_from(qs):
+    raw = (qs.get("range", ["3600"])[0] or "").strip().lower()
+    if raw == "all":                       # „seit Beginn" – bis zur ältesten Messung
+        return min(db_span() or 30 * 86400, 30 * 86400)
     try:
-        r = int(qs.get("range", ["3600"])[0])
+        r = int(raw)
     except ValueError:
         r = 3600
     return max(60, min(r, 30 * 86400))
@@ -1727,41 +1881,68 @@ class Handler(BaseHTTPRequestHandler):
         if ud:
             self._user = {"username": ud["username"], "role": ud["role"], "source": ud["source"]}
             return True
+        if self.command == "POST" and self._is_form_post():
+            self._redirect("/?login=expired")     # abgelaufene Sitzung im Formular
+            return False
         self._send(401, "application/json",
                    json.dumps({"error": "Anmeldung erforderlich"}).encode("utf-8"))
         return False
 
     def _handle_login(self):
         body = self._read_body() or {}
+        form = self._is_form_post()
         ud = resolve_login(body.get("username", ""), body.get("password", ""))
         if not ud:
+            if form:
+                self._redirect("/?login=failed")
+                return
             self._send(401, "application/json",
                        json.dumps({"error": "Anmeldung fehlgeschlagen"}).encode("utf-8"))
             return
         self._set_auth_cookie(ud["username"], ud["role"], ud["source"])
+        if form:
+            # Navigation zurück aufs Dashboard: erst dadurch bietet der Browser
+            # das Speichern der Zugangsdaten an
+            self._redirect("/")
+            return
         self._json({"ok": True, "username": ud["username"], "role": ud["role"],
                     "source": ud["source"], "must_change": ud["must_change"]})
 
     def _handle_password(self):
         u = getattr(self, "_user", None)
+        form = self._is_form_post()
         if not u or u.get("source") != "local":
+            if form:
+                self._redirect("/?pwerr=remote")
+                return
             self._forbidden()
             return
         body = self._read_body() or {}
-        newpw = body.get("new") or ""
+        # Formularfelder heißen wie für Passwortmanager üblich, JSON wie bisher
+        newpw = body.get("new") or body.get("new-password") or ""
+        oldpw = body.get("old") or body.get("current-password") or ""
         if len(newpw) < 6:
-            self._json({"error": "Neues Passwort muss mindestens 6 Zeichen haben."})
+            self._pw_error(form, "short", "Neues Passwort muss mindestens 6 Zeichen haben.")
             return
         au = load_auth()
         lu = _find_local(au, u["username"])
-        if not lu or not _verify_pw(lu, body.get("old") or ""):
-            self._json({"error": "Aktuelles Passwort ist falsch."})
+        if not lu or not _verify_pw(lu, oldpw):
+            self._pw_error(form, "old", "Aktuelles Passwort ist falsch.")
             return
         lu.update(_hash_pw(newpw))
         lu["must_change"] = False
         save_auth(au)
         self._set_auth_cookie(u["username"], lu.get("role", "admin"), "local")
+        if form:
+            self._redirect("/")
+            return
         self._json({"ok": True})
+
+    def _pw_error(self, form, code, text):
+        if form:
+            self._redirect("/?pwerr=" + code)
+        else:
+            self._json({"error": text})
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -1802,6 +1983,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(build_series(to - fr, off, start=fr, end=to))
             else:
                 self._json(build_series(_range_from(qs), off))
+        elif parsed.path == "/api/energy":
+            fr, to = _abs_window(qs)
+            if fr is not None:
+                self._json(build_energy(start=fr, end=to))
+            else:
+                self._json(build_energy(_range_from(qs)))
         elif parsed.path == "/api/config":
             self._json(build_config())
         elif parsed.path == "/api/tokens":
@@ -1831,12 +2018,26 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"not found")
 
+    def _is_form_post(self):
+        """Klassischer Formular-POST (Seiten-Navigation) statt fetch/JSON?"""
+        ct = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        return ct == "application/x-www-form-urlencoded"
+
     def _read_body(self):
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(n) if n > 0 else b"{}"
-            return json.loads(raw.decode("utf-8") or "{}")
+            raw = self.rfile.read(n) if n > 0 else b""
         except (ValueError, OSError):
+            return None
+        if self._is_form_post():
+            try:
+                return {k: v[0] for k, v in
+                        parse_qs(raw.decode("utf-8"), keep_blank_values=True).items()}
+            except (ValueError, UnicodeDecodeError):
+                return None
+        try:
+            return json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
             return None
 
     def do_POST(self):
@@ -2002,8 +2203,16 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
 
-    def _send(self, code, ctype, body):
+    def _redirect(self, location):
+        """303-Weiterleitung – beendet einen klassischen Formular-POST mit einer
+        echten Navigation (Voraussetzung dafür, dass Browser-Passwortmanager
+        die Anmeldung erkennen und zum Speichern anbieten)."""
+        self._send(303, "text/plain", b"", extra=[("Location", location)])
+
+    def _send(self, code, ctype, body, extra=None):
         self.send_response(code)
+        for k, v in (extra or []):
+            self.send_header(k, v)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -2084,7 +2293,13 @@ PAGE = r"""<!DOCTYPE html>
   .metric{font-size:12px;color:var(--muted);} .metric b{display:block;font-size:17px;color:var(--fg);}
   .metric.warn b{color:var(--warn);} .metric.bad b{color:var(--bad);}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(var(--tile-min),1fr));gap:14px;padding:14px 16px;}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;position:relative;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;
+    position:relative;display:flex;flex-direction:column;}
+  /* Diagrammfläche füllt die Kachel bis zur Unterkante – so sitzen die X-Achsen aller
+     Kacheln einer Reihe auf einer Linie, egal ob die Überschrift ein- oder zweizeilig ist */
+  .chartwrap{position:relative;flex:1 1 auto;min-height:var(--card-h);}
+  .chartwrap>canvas{position:absolute;left:0;top:0;width:100%;height:100%;max-height:none;}
+  .card.maximized .chartwrap{min-height:0;}
   .tokbox{border:1px solid var(--border);border-radius:10px;padding:12px 14px;}
   .tokbox>div{position:relative;height:250px;}
   #efftok canvas{max-height:none!important;}   /* globale Kachel-Deckelung hier aufheben */
@@ -2096,7 +2311,6 @@ PAGE = r"""<!DOCTYPE html>
   .cbtn.close:hover{color:var(--bad);border-color:var(--bad);}
   .card.maximized{position:fixed;inset:14px;z-index:2000;margin:0;overflow:auto;
     box-shadow:0 0 0 100vmax rgba(0,0,0,.55);}
-  .card.maximized canvas{max-height:calc(100vh - 90px);}
   .cbtn.analyze:hover{color:var(--accent);border-color:var(--accent);}
   #alerttable th[data-col],#insttable th[data-col]{cursor:pointer;user-select:none;white-space:nowrap;}
   #alerttable th[data-col]:hover,#insttable th[data-col]:hover{color:var(--fg);}
@@ -2119,6 +2333,14 @@ PAGE = r"""<!DOCTYPE html>
     font-size:13px;line-height:1.5;white-space:pre-wrap;min-height:40px;color:var(--fg);}
   .aimeta{font-size:11px;color:var(--muted);margin-top:6px;}
   .anfoot{display:flex;gap:8px;align-items:center;padding:0 16px 16px;}
+  /* schmaler Text-Button für Trefferlisten (.cbtn ist fix 22px breit -> Text lief heraus) */
+  .tbtn{background:var(--panel);border:1px solid var(--border);color:var(--muted);border-radius:5px;
+    padding:2px 8px;font-size:12px;line-height:1.6;cursor:pointer;white-space:nowrap;flex:0 0 auto;}
+  .tbtn:hover{color:var(--fg);border-color:var(--accent);}
+  #ds-results{margin-top:6px;max-height:240px;overflow-y:auto;overflow-x:hidden;}
+  #ds-results .dsrow{display:flex;gap:6px;align-items:center;padding:4px 0;
+    border-bottom:1px solid var(--grid);font-size:13px;}
+  #ds-results .dsname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .abtn{background:var(--accent);color:#fff;border:none;border-radius:7px;padding:7px 14px;
     font-size:13px;cursor:pointer;font-weight:600;}
   .abtn:disabled{opacity:.5;cursor:default;}
@@ -2138,6 +2360,33 @@ PAGE = r"""<!DOCTYPE html>
   .evbadge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;border:1px solid var(--border);}
   .activebtn{border-color:var(--accent)!important;color:var(--accent)!important;}
   canvas{max-height:var(--card-h);}
+  /* Kachel „GPU-Verbrauch": in der Vorschau nur der Tagesdurchschnitt als große
+     Kennzahl, Diagramm und weitere Werte erst in der maximierten Ansicht */
+  .ehead{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin:-2px 0 4px;
+    font-size:11px;color:var(--muted);}
+  .ehead b,.ehead .emeta,.ehead .eavg{display:none;}
+  .card.maximized .ehead{margin-bottom:6px;}
+  .card.maximized .ehead b,.card.maximized .ehead .emeta{display:inline;}
+  .card.maximized .ehead .eavg{display:inline;font-size:17px;font-weight:700;color:var(--accent);
+    border:1px solid var(--accent);border-radius:7px;padding:2px 10px;}
+  .ehead b{font-size:14px;color:var(--fg);}
+  .ehead .emeta{font-size:11px;color:var(--muted);}
+  .ehead .enote{color:var(--muted);}
+  .ebig{flex:1 1 auto;min-height:var(--card-h);display:flex;flex-direction:column;
+    align-items:center;justify-content:center;text-align:center;gap:6px;padding:2px 4px;}
+  .ebig .v{font-size:32px;font-weight:700;color:var(--accent);line-height:1.1;}
+  .ebig .s{font-size:12px;color:var(--muted);}
+  .ebig .hint{font-size:11px;color:var(--muted);opacity:.7;cursor:pointer;}
+  .ebig .hint:hover{opacity:1;color:var(--accent);}
+  [data-density="sehrdicht"] .ebig .hint{font-size:10px;}
+  [data-density="dicht"] .ebig .v{font-size:25px;}
+  [data-density="sehrdicht"] .ebig .v{font-size:20px;}
+  [data-density="sehrdicht"] .ebig .s{font-size:11px;}
+  /* Achtung: der Bereich "Diagramme" ist selbst eine .card – deshalb hier den
+     direkten Kind-Selektor nutzen, sonst greift .card:not(.maximized) immer */
+  .card.maximized > .ebig{display:none;}
+  .energywrap{display:none;}
+  .card.maximized > .energywrap{display:block;}
   /* Dedizierter Zieh-Griff (links) – nur hierüber wird verschoben/umgeordnet */
   .grip,.sgrip{cursor:grab;user-select:none;touch-action:none;flex:0 0 auto;
     color:var(--muted);font-size:13px;line-height:1;padding:2px 5px;border-radius:4px;
@@ -2233,13 +2482,14 @@ PAGE = r"""<!DOCTYPE html>
   <span style="font-size:11px;color:var(--muted)">v__VERSION__</span>
   <span id="collstat" title="Status des Metrik-Collectors (Self-Monitoring)" style="font-size:11px"></span>
   <label class="ctl" title="Zeitfenster, das in allen Diagrammen dargestellt wird. Bei großen Fenstern werden die Daten automatisch verdichtet (Downsampling).">Zeitraum
-    <select id="range" title="Zeitfenster der Diagramme (15 min bis 7 Tage; „heute“ = seit Mitternacht)">
+    <select id="range" title="Zeitfenster der Diagramme (15 min bis 7 Tage; „heute“ = seit Mitternacht, „seit Beginn“ = älteste gespeicherte Messung)">
       <option value="900">15 min</option>
       <option value="3600">1 h</option>
       <option value="21600">6 h</option>
       <option value="86400">24 h</option>
       <option value="today" selected>heute</option>
       <option value="604800">7 Tage</option>
+      <option value="all">seit Beginn</option>
       <option value="custom">benutzerdefiniert…</option>
     </select>
   </label>
@@ -2471,28 +2721,35 @@ sudo update-ca-certificates</pre>
 
 <!-- Login-/Passwortwechsel-Overlay -->
 <div id="authov">
-  <div class="auth-card" id="logincard">
+  <!-- echte <form>-Elemente + name-Attribute: nur so bieten Browser/Passwort-
+       manager Benutzername/Kennwort zum Ausfüllen und Speichern an -->
+  <form class="auth-card" id="logincard" method="post" action="/api/login" autocomplete="on">
     <h2>KI Monitor</h2>
     <p class="sub">Bitte anmelden</p>
     <label for="li-user">Benutzer</label>
-    <input id="li-user" autocomplete="username" placeholder="Benutzername oder user@domäne">
+    <input id="li-user" name="username" type="text" autocomplete="username"
+           autocapitalize="none" autocorrect="off" spellcheck="false"
+           placeholder="Benutzername oder user@domäne" required>
     <label for="li-pass">Passwort</label>
-    <input id="li-pass" type="password" autocomplete="current-password">
-    <button class="primary" id="li-submit">Anmelden</button>
+    <input id="li-pass" name="password" type="password" autocomplete="current-password" required>
+    <button class="primary" id="li-submit" type="submit">Anmelden</button>
     <div class="auth-msg" id="li-msg"></div>
-  </div>
-  <div class="auth-card" id="pwcard" style="display:none">
+  </form>
+  <form class="auth-card" id="pwcard" method="post" action="/api/password" style="display:none" autocomplete="on">
     <h2>Passwort ändern</h2>
     <p class="sub" id="pw-sub">Beim ersten Login muss das Passwort geändert werden.</p>
+    <!-- verstecktes Benutzerfeld: ordnet der Passwortmanager dem richtigen Konto zu -->
+    <input id="pw-user" name="username" type="text" autocomplete="username"
+           style="display:none" tabindex="-1" aria-hidden="true">
     <label for="pw-old">Aktuelles Passwort</label>
-    <input id="pw-old" type="password" autocomplete="current-password">
+    <input id="pw-old" name="current-password" type="password" autocomplete="current-password">
     <label for="pw-new">Neues Passwort (mind. 6 Zeichen)</label>
-    <input id="pw-new" type="password" autocomplete="new-password">
+    <input id="pw-new" name="new-password" type="password" autocomplete="new-password">
     <label for="pw-new2">Neues Passwort wiederholen</label>
-    <input id="pw-new2" type="password" autocomplete="new-password">
-    <button class="primary" id="pw-submit">Speichern</button>
+    <input id="pw-new2" name="confirm-password" type="password" autocomplete="new-password">
+    <button class="primary" id="pw-submit" type="submit">Speichern</button>
     <div class="auth-msg" id="pw-msg"></div>
-  </div>
+  </form>
 </div>
 
 <!-- Benutzer- & Zugriffsverwaltung (nur Admins) -->
@@ -2518,6 +2775,16 @@ sudo update-ca-certificates</pre>
       <select id="na-role" class="uinput"><option value="admin">Admin</option><option value="readonly" selected>Read-only</option></select>
       <button class="abtn" id="na-add">Freigeben</button>
     </div>
+
+    <h4 style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">Active-Directory-Gruppen (Freigabe)</h4>
+    <table class="utable" id="adgtable"><thead><tr><th>Gruppe (CN oder DN)</th><th>Rolle</th><th></th></tr></thead><tbody></tbody></table>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px">
+      <input id="ng-name" class="uinput" placeholder="z. B. vllm-admins" style="flex:1;min-width:120px">
+      <select id="ng-role" class="uinput"><option value="admin">Admin</option><option value="readonly" selected>Read-only</option></select>
+      <button class="abtn" id="ng-add">Freigeben</button>
+    </div>
+    <p style="font-size:11px;margin:4px 0 0">Jedes Mitglied einer freigegebenen Gruppe erhält die gewählte Rolle
+       (Admin schlägt Read-only). Vergleich gegen <code>memberOf</code> – CN oder vollständiger DN.</p>
 
     <h4 style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">LDAP-/AD-Anbindung</h4>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 12px">
@@ -2546,7 +2813,7 @@ sudo update-ca-certificates</pre>
       <button class="abtn" id="ds-go">🔍 Suchen</button>
       <span style="font-size:11px;color:var(--muted)">nutzt die Test-Anmeldedaten oben</span>
     </div>
-    <div id="ds-results" style="margin-top:6px;max-height:190px;overflow:auto"></div>
+    <div id="ds-results"></div>
 
     <div id="usr-msg" style="color:var(--muted);font-size:12px;margin-top:10px;min-height:16px"></div>
   </div>
@@ -2593,6 +2860,12 @@ const CHARTS=[
   desc:"GPU-Kerntemperatur in °C (NVIDIA DCGM).\nSteigt unter Last; Drosselung droht bei Überhitzung.\nNur für GPU-Instanzen."},
  {id:"gpu_power",title:"GPU-Leistung (W)",fields:[{k:"gpu_power"}],
   desc:"Aktuelle Leistungsaufnahme der GPU in Watt (NVIDIA DCGM).\nIndikator für Auslastung/Energieverbrauch.\nNur für GPU-Instanzen."},
+ // eigene Kachel: Balkendiagramm statt Zeitreihe -> eigene Chart-Instanz in renderEnergy()
+ {id:"energy",title:"GPU-Verbrauch",
+  custom:'<div class="ehead" id="energyhead"></div>'+
+         '<div class="ebig" id="energybig"></div>'+
+         '<div class="chartwrap energywrap"><canvas id="c_energy"></canvas></div>',
+  desc:"Energieverbrauch der GPUs je Kalendertag im gewählten Zeitraum.\nBerechnet aus der gemessenen Leistungsaufnahme (DCGM), über die Zeit\naufintegriert – auf den Rohdaten, nicht auf den verdichteten Diagrammpunkten.\nMesslücken werden übersprungen statt hochgerechnet (schraffierter Balken)."},
  {id:"req",title:"Requests aktiv / wartend",fields:[{k:"running",l:"aktiv"},{k:"waiting",l:"wartend",dash:[4,3]}],
   desc:"Anzahl der gerade verarbeiteten (aktiv) und in der Warteschlange\nstehenden (wartend) Anfragen dieses Modells.\nWartend > 0 heißt: die Instanz ist an der Kapazitätsgrenze."},
  {id:"waitreason",title:"Wartend nach Grund",fields:[{k:"waiting_capacity",l:"capacity"},{k:"waiting_deferred",l:"deferred",dash:[4,3]}],
@@ -2614,6 +2887,9 @@ const CHARTS=[
  {id:"hit",title:"Prefix-Cache-Hit-Rate (%)",fields:[{k:"hit_rate"}],max:100,
   desc:"Anteil der Prompt-Tokens, die aus dem Prefix-Cache wiederverwendet\nwurden statt neu berechnet zu werden.\nHoch = effizient bei wiederkehrenden Prompt-Anfängen (System-Prompts, RAG)."},
 ];
+
+// Kacheln mit echtem Chart.js-Diagramm (alles außer den Sonderkacheln wie „Verbrauch pro Tag“)
+const PLOTS=CHARTS.filter(s=>!s.custom);
 
 let charts={}, lastData=null, lastConfig=null, hoverX=null, resets=[], annotations=[];
 const shortModel=m=>m.split("/").pop();
@@ -2872,6 +3148,16 @@ const overlay={id:"overlay",afterDraw(c){
   ctx.restore();
 }};
 
+// Achsenbeschriftung: bei mehrtägigen Fenstern (7 Tage, „seit Beginn“, weite
+// Von/Bis-Bereiche) reicht die Uhrzeit nicht mehr aus
+function tickLabel(v){
+  const d=new Date(v), sp=windowSpan();
+  const day=d.toLocaleDateString("de-DE",{day:"2-digit",month:"2-digit"});
+  if(sp>7*86400) return day;
+  const hm=d.toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit"});
+  return sp>36*3600 ? day+" "+hm : hm;
+}
+
 function mkChart(spec){
   const ctx=document.getElementById("c_"+spec.id);
   const yMax=spec.max?{max:spec.max}:{};
@@ -2884,7 +3170,7 @@ function mkChart(spec){
         annotations.forEach(an=>{const ap=xs.getPixelForValue(an.ts);const d=Math.abs(ap-e.x);if(d<=best){best=d;hit=an;}});
         if(hit&&confirm('Annotation „'+hit.label+'" löschen?')) delAnnotation(hit.id);},
       scales:{
-        x:{type:"linear",ticks:{callback:v=>new Date(v).toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit"}),maxRotation:0,color:css("--muted")},grid:{color:css("--grid")}},
+        x:{type:"linear",ticks:{callback:v=>tickLabel(v),maxRotation:0,color:css("--muted")},grid:{color:css("--grid")}},
         y:{beginAtZero:true,...yMax,ticks:{color:css("--muted")},grid:{color:css("--grid")}}
       },
       plugins:{
@@ -2986,7 +3272,7 @@ function withCompare(dsets,spec){
   return dsets;
 }
 function redrawCharts(models){
-  CHARTS.forEach(spec=>{charts[spec.id].data.datasets=withCompare(datasets(models,spec),spec);charts[spec.id].update();});
+  PLOTS.forEach(spec=>{charts[spec.id].data.datasets=withCompare(datasets(models,spec),spec);charts[spec.id].update();});
 }
 
 function num(v,d){return v==null?"–":(typeof v==="number"?(Number.isInteger(v)?v:v.toFixed(d==null?1:d)):v);}
@@ -3166,6 +3452,8 @@ function absWindow(){ const fr=absSecs("absfrom"), to=absSecs("absto");
 function seriesQuery(){ if(isAbs()){ const w=absWindow();
     if(w)return "from="+w.from+"&to="+w.to; } return "range="+rangeVal(); }
 function windowSpan(){ if(isAbs()){ const w=absWindow(); return w?(w.to-w.from):0; }
+  // "seit Beginn": die tatsächliche Spanne kennt erst der Server (älteste Messung)
+  if(rangeVal()==="all") return (lastData&&lastData.range)||0;
   return parseInt(rangeVal(),10)||0; }
 function pad2(n){return String(n).padStart(2,"0");}
 function toLocalInput(d){ return d.getFullYear()+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate())
@@ -3175,11 +3463,13 @@ function ensureAbsDefaults(){ const f=document.getElementById("absfrom"), t=docu
   if(!f.value){ const d=new Date(); d.setHours(0,0,0,0); f.value=toLocalInput(d); } }
 function applyAbs(){ store.set("vllm_absfrom",document.getElementById("absfrom").value);
   store.set("vllm_absto",document.getElementById("absto").value);
-  startRefresh(); fetchCompare(); fetchAnnotations(); }
+  startRefresh(); fetchCompare(); fetchAnnotations(); fetchEnergy(); }
 function rangeLabel(){ const sel=document.getElementById("range");
   if(sel.value==="custom"){ const w=absWindow();
     return w ? new Date(w.from*1000).toLocaleString()+" – "+new Date(w.to*1000).toLocaleString()
              : "benutzerdefiniert"; }
+  if(sel.value==="all"){ const sp=windowSpan();
+    return sp ? "seit Beginn (ab "+new Date(Date.now()-sp*1000).toLocaleString()+")" : "seit Beginn"; }
   return sel.options[sel.selectedIndex].text; }
 const cd=document.getElementById("countdown");
 function setCd(t,cls){cd.className=cls||"";cd.textContent=t;}
@@ -3252,24 +3542,30 @@ function applyTheme(t){document.body.dataset.theme=t;store.set("vllm_theme",t);
     if(lastTokens) renderTokenChart(lastTokens); else tokChart.update(); }
   if(rangeTokChart){ rangeTokChart.options.scales.x.ticks.color=css("--muted");
     rangeTokChart.options.scales.y.ticks.color=css("--muted"); rangeTokChart.options.scales.y.grid.color=css("--grid");
-    renderRangeTokenChart(); }}
+    renderRangeTokenChart(); }
+  if(energyChart){ const o=energyChart.options.scales;
+    o.x.ticks.color=o.y.ticks.color=o.y.title.color=css("--muted");
+    o.x.border.color=o.y.border.color=css("--border"); o.y.grid.color=css("--grid");
+    energyChart.update(); }}
 
 // --- Init ---
 function buildGrid(){
   const g=document.getElementById("charts");
   const saved=JSON.parse(store.get("vllm_chart_order")||"null");
-  const btns=`<div class="cardbtns"><button class="cbtn analyze" title="Analyse & KI-Auswertung">🔍</button>`+
+  const btns=spec=>`<div class="cardbtns">`+
+             (spec.custom?"":`<button class="cbtn analyze" title="Analyse & KI-Auswertung">🔍</button>`)+
              `<button class="cbtn max" title="Maximieren (Esc schließt)">⛶</button>`+
              `<button class="cbtn close" title="Kachel ausblenden">✕</button></div>`;
   orderBy(CHARTS,saved,s=>s.id).forEach(spec=>{
     const d=document.createElement("div");d.className="card";d.dataset.id=spec.id;
-    d.innerHTML=btns+`<h2 title="${spec.desc||""}"><span class="grip" title="Ziehen zum Verschieben">⠿</span>${spec.title}</h2><canvas id="c_${spec.id}"></canvas>`;
+    d.innerHTML=btns(spec)+`<h2 title="${spec.desc||""}"><span class="grip" title="Ziehen zum Verschieben">⠿</span>${spec.title}</h2>`
+      +(spec.custom||`<div class="chartwrap"><canvas id="c_${spec.id}"></canvas></div>`);
     g.appendChild(d);
   });
   makeSortable(g,()=>saveOrder(g,"vllm_chart_order"),".grip");
   wireCardButtons(g);
   applyHidden();
-  CHARTS.forEach(mkChart);
+  PLOTS.forEach(mkChart);
 }
 
 // --- Maximieren / Ausblenden ---
@@ -3284,27 +3580,20 @@ function applyHidden(){
 function toggleMax(card,id){
   const on=card.classList.toggle("maximized");
   document.body.style.overflow=on?"hidden":"";
-  const cv=card.querySelector("canvas");
   if(on){ window.scrollTo(0,0);
     const hdr=document.querySelector("header");
-    const top=(hdr?hdr.offsetHeight:56)+8;
-    card.style.top=top+"px";                               // unter der Titelleiste beginnen
-    // Canvas exakt an den verbleibenden Platz einpassen (echte Maße messen) ->
-    // Achsenbeschriftung ohne Scrollen. clientHeight enthält Padding, aber nicht Rand/Scrollbar.
-    const ccs=getComputedStyle(card);
-    const pad=parseFloat(ccs.paddingTop)+parseFloat(ccs.paddingBottom);
-    const h2=card.querySelector("h2");
-    let h2h=0; if(h2){ h2h=h2.offsetHeight+(parseFloat(getComputedStyle(h2).marginBottom)||0); }
-    const avail=card.clientHeight - pad - h2h - 6;          // 6px Puffer
-    if(cv) cv.style.maxHeight=Math.max(140,avail)+"px";
-  } else { card.style.top=""; if(cv) cv.style.maxHeight=""; }
-  const c=charts[id];
+    card.style.top=((hdr?hdr.offsetHeight:56)+8)+"px";     // unter der Titelleiste beginnen
+  } else { card.style.top=""; }
+  const c=charts[id]||(id==="energy"?energyChart:null);
   if(c){
     // Mausrad-/Pinch-Zoom + Verschieben nur bei maximierter Karte (sonst zu leicht versehentlich)
-    const z=c.options.plugins.zoom;
-    z.zoom.wheel.enabled=on; z.zoom.pinch.enabled=on; z.pan.enabled=on;
-    if(!on){ try{c.resetZoom();}catch(e){} }
-    setTimeout(()=>{try{c.resize();}catch(e){}},60);
+    const z=c.options.plugins.zoom;                        // fehlt beim Balkendiagramm
+    if(z){
+      z.zoom.wheel.enabled=on; z.zoom.pinch.enabled=on; z.pan.enabled=on;
+      if(!on){ try{c.resetZoom();}catch(e){} }
+    }
+    // update() zusätzlich: Beschriftung/Ø-Linie hängen am Maximierungszustand
+    setTimeout(()=>{try{c.resize();c.update("none");}catch(e){}},60);
   }
   updateZoomBtn();
 }
@@ -3453,7 +3742,7 @@ function aiPrompt(c){
 }
 let anCur=null;
 function openAnalysis(id){
-  const spec=CHARTS.find(c=>c.id===id); if(!spec)return;
+  const spec=CHARTS.find(c=>c.id===id); if(!spec||spec.custom)return;
   const stats=chartStats(spec), unit=unitOf(spec), anoms=chartAnoms(spec), fc=chartForecast(spec);
   anCur={spec,stats,unit,anoms,fc};
   document.getElementById("an_title").textContent=spec.title;
@@ -3470,7 +3759,7 @@ function closeAnalysis(){ document.getElementById("analysis").classList.remove("
 function buildReportPrompt(){
   const rt=rangeLabel();
   const lines=["Gesamt-Report über alle Monitoring-Diagramme.","Zeitfenster: "+rt,""];
-  CHARTS.forEach(spec=>{
+  PLOTS.forEach(spec=>{
     const stats=chartStats(spec); if(!stats.some(s=>s.n))return;
     lines.push("### "+spec.title, statsAsText(stats));
     const an=anomsAsText(chartAnoms(spec)); if(an!=="keine Ausreißer") lines.push("Ausreißer: "+an.replace(/\n/g,"; "));
@@ -3527,6 +3816,7 @@ document.getElementById("an_copy").onclick=()=>{
 };
 
 let tokChart=null, rangeTokChart=null, lastTokens=null, _tokTs=0;   // früh deklariert (applyTheme greift darauf zu)
+let energyChart=null, lastEnergy=null;                              // dito – applyTheme läuft vor renderEnergy
 buildGrid();
 applyTheme(store.get("vllm_theme")||"dark");
 // Anomalie-Marker in allen Diagrammen (Umschalter, Zustand im Cookie)
@@ -3555,7 +3845,7 @@ applyDensity(store.get("vllm_density")||"normal");
 document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeSel());
   document.getElementById("absrange").style.display=isAbs()?"":"none";
   if(isAbs())ensureAbsDefaults();
-  fetchConfig();startRefresh();fetchCompare();fetchAnnotations();};
+  fetchConfig();startRefresh();fetchCompare();fetchAnnotations();fetchEnergy();};
 document.getElementById("absapply").onclick=applyAbs;
 ["absfrom","absto"].forEach(id=>document.getElementById(id).addEventListener("change",()=>{ if(isAbs())applyAbs(); }));
 document.getElementById("annbtn").onclick=addAnnotation;
@@ -3774,6 +4064,112 @@ async function fetchAnnotations(){
     const j=await(await fetch("/api/annotations?"+q)).json();
     annotations=j.annotations||[]; Object.values(charts).forEach(o=>o.draw()); }catch(e){}
 }
+// --- Kachel „GPU-Verbrauch pro Tag" (eigenes Balkendiagramm) ---
+// energyChart/lastEnergy sind oben deklariert (applyTheme greift beim Start darauf zu)
+const deZ=(v,d)=>v==null?"–":v.toLocaleString("de-DE",{minimumFractionDigits:d,maximumFractionDigits:d});
+// Werte über den Balken – nur in der maximierten Kachel, die Vorschau bleibt schlicht
+const barvals={id:"barvals",afterDatasetsDraw(c){
+  const ds=c.data.datasets[0]; if(!ds)return;
+  if(!c.canvas.closest(".card.maximized"))return;
+  const ctx=c.ctx; ctx.save();
+  ctx.font="10px sans-serif"; ctx.textAlign="center"; ctx.textBaseline="bottom";
+  const meta=c.getDatasetMeta(0);
+  const skip=Math.ceil(meta.data.length/14);     // bei vielen Tagen nicht jeden Wert beschriften
+  meta.data.forEach((el,i)=>{ const v=ds.data[i];
+    if(v==null||(skip>1&&i%skip))return;
+    const txt=deZ(v,v<10?2:1), room=el.y-3>=c.chartArea.top+9;
+    // kein Platz über dem Balken (höchster Wert): Beschriftung in den Balken setzen
+    ctx.fillStyle=room?css("--muted"):"#fff";
+    ctx.fillText(txt,el.x,room?el.y-3:el.y+13); });
+  ctx.restore();
+}};
+// Durchschnitt pro Tag als hervorgehobene Linie (ebenfalls nur maximiert)
+const avgline={id:"avgline",afterDatasetsDraw(c){
+  if(!c.canvas.closest(".card.maximized"))return;
+  const v=lastEnergy&&lastEnergy.avg_kwh_day; if(v==null)return;
+  const a=c.chartArea, y=c.scales.y.getPixelForValue(v);
+  if(y<a.top||y>a.bottom)return;
+  const ctx=c.ctx, col=css("--accent"); ctx.save();
+  ctx.strokeStyle=col; ctx.lineWidth=2; ctx.setLineDash([7,4]);
+  ctx.beginPath(); ctx.moveTo(a.left,y); ctx.lineTo(a.right,y); ctx.stroke();
+  ctx.setLineDash([]);
+  const txt="Ø "+deZ(v,2)+" kWh/Tag";
+  ctx.font="600 11px sans-serif"; ctx.textBaseline="middle"; ctx.textAlign="right";
+  const w=ctx.measureText(txt).width+10, h=17, x=a.right-w-4;
+  const ty=(y-h/2-2<a.top)?y+h/2+3:y-h/2-3;     // Label nicht über den Rand schieben
+  ctx.fillStyle=col; ctx.globalAlpha=.15;
+  ctx.fillRect(x,ty-h/2,w,h); ctx.globalAlpha=1;
+  ctx.strokeStyle=col; ctx.lineWidth=1; ctx.strokeRect(x,ty-h/2,w,h);
+  ctx.fillStyle=col; ctx.fillText(txt,a.right-9,ty);
+  ctx.restore();
+}};
+async function fetchEnergy(){
+  if(!document.getElementById("energyhead"))return;
+  try{ const q=isAbs()?(()=>{const w=absWindow();return w?"from="+w.from+"&to="+w.to:"range="+rangeVal();})():"range="+rangeVal();
+    lastEnergy=await(await fetch("/api/energy?"+q)).json(); }catch(e){ lastEnergy=null; }
+  renderEnergy();
+}
+function renderEnergy(){
+  const head=document.getElementById("energyhead"), cv=document.getElementById("c_energy");
+  const big=document.getElementById("energybig");
+  if(!head||!cv||!big)return;
+  const j=lastEnergy, days=(j&&!j.error&&j.days)||[];
+  if(!days.length){
+    head.innerHTML='<span class="enote">Kein GPU-Verbrauch im Zeitraum.</span>';
+    big.innerHTML='<span class="s">Kein GPU-Verbrauch im Zeitraum – dafür wird ein '+
+                  'DCGM-Exporter als Instanz benötigt.</span>';
+    if(energyChart){ energyChart.data.labels=[]; energyChart.data.datasets[0].data=[]; energyChart.update(); }
+    return;
+  }
+  // Vorschau: nur der Tagesdurchschnitt im gewählten Zeitraum
+  big.innerHTML = (j.avg_kwh_day!=null
+      ? '<span class="v">Ø '+deZ(j.avg_kwh_day,2)+' kWh/Tag</span>'
+      : '<span class="s">Zeitraum zu kurz für einen Tagesdurchschnitt.</span>')
+    + '<span class="hint" title="Kachel maximieren">⛶ maximieren für Diagramm</span>';
+  const hint=big.querySelector(".hint");
+  if(hint) hint.onclick=()=>{ const b=big.closest("[data-id]").querySelector(".cbtn.max"); if(b)b.click(); };
+  const gpuTxt=(j.gpus&&j.gpus.length>1)?" · "+j.gpus.length+" GPUs":"";
+  head.innerHTML=(j.avg_kwh_day!=null
+      ? '<span class="eavg">Ø '+deZ(j.avg_kwh_day,2)+' kWh/Tag</span>' : '')
+    +'<b>'+deZ(j.total_kwh,2)+' kWh gesamt</b>'
+    +'<span class="emeta">gemessen '+deZ(j.measured_seconds/3600,1)+' h'+gpuTxt+'</span>';
+
+  const labels=days.map(d=>new Date(d.day+"T12:00:00")
+    .toLocaleDateString("de-DE",{day:"2-digit",month:"2-digit"}));
+  const data=days.map(d=>d.kwh);
+  // Tage mit Messlücke blasser: der Wert ist eine Untergrenze, kein voller Tag
+  const colors=days.map(d=>d.coverage<0.98?"rgba(184,15,46,.45)":"#B80F2E");
+  const tip=i=>{ const d=days[i], dt=new Date(d.day+"T12:00:00");
+    const l=[dt.toLocaleDateString("de-DE",{weekday:"long",day:"2-digit",month:"2-digit",year:"numeric"}),
+             deZ(d.kwh,2)+" kWh"];
+    if(d.avg_w!=null) l.push("Ø "+deZ(d.avg_w,0)+" W");
+    l.push("erfasst "+deZ(d.seconds/3600,1)+" h ("+deZ(d.coverage*100,0)+" %)");
+    if(d.coverage<0.98) l.push("Tag nur teilweise erfasst");
+    return l; };
+  if(!energyChart){
+    energyChart=new Chart(cv,{type:"bar",plugins:[barvals,avgline],
+      data:{labels,datasets:[{data,backgroundColor:colors,borderWidth:0,borderRadius:2}]},
+      options:{animation:false,responsive:true,maintainAspectRatio:false,
+        layout:{padding:{top:14}},                 // Platz für die Werte über den Balken
+        scales:{
+          x:{ticks:{color:css("--muted"),maxRotation:0,autoSkip:true,maxTicksLimit:14},
+             grid:{display:false},border:{color:css("--border")}},
+          y:{beginAtZero:true,title:{display:true,text:"kWh",color:css("--muted"),font:{size:10}},
+             ticks:{color:css("--muted"),callback:v=>Number.isInteger(v)?deZ(v,0):deZ(v,1)},
+             grid:{color:css("--grid")},border:{color:css("--border")}}},
+        plugins:{legend:{display:false},
+          tooltip:{callbacks:{title:c=>tip(c[0].dataIndex)[0],
+                              label:c=>tip(c.dataIndex).slice(1)}}}}});
+  } else {
+    energyChart.data.labels=labels;
+    energyChart.data.datasets[0].data=data;
+    energyChart.data.datasets[0].backgroundColor=colors;
+    const o=energyChart.options;
+    o.plugins.tooltip.callbacks.title=c=>tip(c[0].dataIndex)[0];
+    o.plugins.tooltip.callbacks.label=c=>tip(c.dataIndex).slice(1);
+    energyChart.update();
+  }
+}
 async function addAnnotation(){
   const label=prompt('Annotation für den aktuellen Zeitpunkt (z. B. „Deploy v0.22.2"):');
   if(!label||!label.trim())return;
@@ -3932,8 +4328,9 @@ let _booted=false;
 async function bootDashboard(){
   if(_booted)return; _booted=true;
   await loadServerPrefs();   // serverseitige Ansicht laden, bevor gerendert wird
-  fetchConfig(); startRefresh(); fetchAlerts(); fetchCompare(); fetchAnnotations();
+  fetchConfig(); startRefresh(); fetchAlerts(); fetchCompare(); fetchAnnotations(); fetchEnergy();
   setInterval(fetchConfig,30000); setInterval(fetchAlerts,30000); setInterval(fetchAnnotations,30000);
+  setInterval(fetchEnergy,60000);   // Tagesverbrauch ändert sich langsam
 }
 
 // ===================== Authentifizierung =====================
@@ -3964,45 +4361,55 @@ function showLogin(){
   document.getElementById("logincard").style.display="";
   document.getElementById("pwcard").style.display="none";
   ov.classList.add("show");
-  setTimeout(()=>{try{document.getElementById("li-user").focus();}catch(e){}},50);
+  // Rückmeldung eines fehlgeschlagenen Formular-Logins aus der URL übernehmen
+  const lf=_authQuery("login");
+  if(lf) document.getElementById("li-msg").textContent =
+      lf==="expired" ? "Sitzung abgelaufen – bitte erneut anmelden."
+                     : "Anmeldung fehlgeschlagen – Benutzer/Passwort prüfen.";
+  // nur fokussieren, wenn der Passwortmanager nichts vorausgefüllt hat
+  setTimeout(()=>{try{
+    const u=document.getElementById("li-user");
+    (u.value ? document.getElementById("li-pass") : u).focus();
+  }catch(e){}},50);
 }
-function showPasswordChange(){
+// Statusparameter der Weiterleitung aus der Adresszeile nehmen, damit ein
+// Neuladen die alte Meldung nicht wiederholt
+function _authQuery(name){
+  const q=new URLSearchParams(location.search), v=q.get(name);
+  if(v!==null){ q.delete(name);
+    try{ history.replaceState(null,"",location.pathname+(q.toString()?"?"+q:"")); }catch(e){} }
+  return v;
+}
+const PWERR={short:"Neues Passwort muss mindestens 6 Zeichen haben.",
+             old:"Aktuelles Passwort ist falsch.",
+             mismatch:"Die neuen Passwörter stimmen nicht überein.",
+             remote:"Für dieses Konto (LDAP/AD) kann das Passwort hier nicht geändert werden."};
+function showPasswordChange(user){
   const ov=document.getElementById("authov");
   document.getElementById("logincard").style.display="none";
   document.getElementById("pwcard").style.display="";
+  // Benutzername ins versteckte Feld, damit der Passwortmanager das Konto kennt
+  const un=user||(window._me&&window._me.username)||document.getElementById("li-user").value.trim();
+  if(un) document.getElementById("pw-user").value=un;
   ov.classList.add("show");
+  const pe=_authQuery("pwerr");
+  if(pe) document.getElementById("pw-msg").textContent = PWERR[pe]||"Passwortwechsel fehlgeschlagen.";
   setTimeout(()=>{try{document.getElementById("pw-old").focus();}catch(e){}},50);
 }
-async function doLogin(){
-  const u=document.getElementById("li-user").value.trim();
-  const p=document.getElementById("li-pass").value;
-  const msg=document.getElementById("li-msg"); msg.textContent="";
-  if(!u||!p){ msg.textContent="Benutzer und Passwort eingeben."; return; }
-  let r; try{ r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({username:u,password:p})}); }catch(e){ msg.textContent="Netzwerkfehler."; return; }
-  document.getElementById("li-pass").value="";
-  if(!r.ok){ msg.textContent="Anmeldung fehlgeschlagen – Benutzer/Passwort prüfen."; return; }
-  const j=await r.json();
-  if(j.must_change){ showPasswordChange(); return; }
-  authInit();
-}
-async function doPassword(){
-  const o=document.getElementById("pw-old").value, n=document.getElementById("pw-new").value, n2=document.getElementById("pw-new2").value;
+// Beide Formulare werden ganz normal abgeschickt (POST + 303 zurück auf "/").
+// Kein fetch/preventDefault: Passwortmanager speichern Zugangsdaten nur, wenn
+// auf das Absenden eine echte Navigation folgt.
+document.getElementById("pwcard").addEventListener("submit",e=>{
+  const n=document.getElementById("pw-new").value, n2=document.getElementById("pw-new2").value;
   const msg=document.getElementById("pw-msg"); msg.textContent="";
-  if(n.length<6){ msg.textContent="Neues Passwort muss mindestens 6 Zeichen haben."; return; }
-  if(n!==n2){ msg.textContent="Die neuen Passwörter stimmen nicht überein."; return; }
-  let j; try{ j=await(await fetch("/api/password",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({old:o,new:n})})).json(); }catch(e){ msg.textContent="Netzwerkfehler."; return; }
-  if(j.error){ msg.textContent=j.error; return; }
-  document.getElementById("pw-old").value=document.getElementById("pw-new").value=document.getElementById("pw-new2").value="";
-  authInit();
-}
-async function doLogout(){ flushPrefs(); try{ await fetch("/api/logout",{method:"POST"}); }catch(e){} location.reload(); }
-document.getElementById("li-submit").onclick=doLogin;
-document.getElementById("li-pass").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin();});
-document.getElementById("li-user").addEventListener("keydown",e=>{if(e.key==="Enter")document.getElementById("li-pass").focus();});
-document.getElementById("pw-submit").onclick=doPassword;
-document.getElementById("pw-new2").addEventListener("keydown",e=>{if(e.key==="Enter")doPassword();});
+  if(n.length<6){ e.preventDefault(); msg.textContent=PWERR.short; return; }
+  if(n!==n2){ e.preventDefault(); msg.textContent=PWERR.mismatch; return; }
+  flushPrefs();
+});
+document.getElementById("logincard").addEventListener("submit",()=>{
+  document.getElementById("li-msg").textContent="Anmeldung läuft …";
+});
+async function doLogout(){ flushPrefs(); try{ await fetch("/api/logout",{method:"POST"}); }catch(e){} location.href="/"; }
 document.getElementById("logoutbtn").onclick=doLogout;
 
 // ---- Benutzer- & Zugriffsverwaltung (nur Admins) ----
@@ -4041,6 +4448,17 @@ async function loadUsers(){
     tr.querySelector("button.del").onclick=()=>delUser("ad",u.username);
     at.appendChild(tr);
   });
+  const gt=document.querySelector("#adgtable tbody"); gt.innerHTML="";
+  (j.ad_groups||[]).forEach(g=>{
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${_esc(g.name)}</td>
+      <td><select class="uinput r"><option value="admin"${g.role==="admin"?" selected":""}>Admin</option>
+        <option value="readonly"${g.role==="readonly"?" selected":""}>Read-only</option></select></td>
+      <td style="text-align:right"><button class="cbtn del" title="Freigabe entfernen">🗑</button></td>`;
+    tr.querySelector("select.r").onchange=()=>saveRole("adgroup",g.name,tr.querySelector("select.r").value);
+    tr.querySelector("button.del").onclick=()=>delUser("adgroup",g.name);
+    gt.appendChild(tr);
+  });
   const L=j.ldap||{};
   document.getElementById("ld-enabled").checked=!!L.enabled;
   document.getElementById("ld-host").value=L.host||"";
@@ -4077,6 +4495,17 @@ document.getElementById("na-add").onclick=async()=>{
   const j=await postUsers({kind:"ad",username:name,role:document.getElementById("na-role").value});
   if(!j.error){ document.getElementById("na-name").value=""; loadUsers(); }
 };
+// AD-Gruppe freigeben (aus dem Eingabefeld oder direkt aus der Trefferliste)
+async function addGroup(name,role){
+  name=(name||"").trim(); if(!name){ umsg("Gruppenname angeben."); return; }
+  const j=await postUsers({kind:"adgroup",username:name,role:role});
+  if(!j.error){ document.getElementById("ng-name").value="";
+    umsg("Gruppe freigegeben: "+name+" ("+(role==="admin"?"Admin":"Read-only")+")",true); loadUsers(); }
+}
+document.getElementById("ng-add").onclick=()=>addGroup(document.getElementById("ng-name").value,
+                                                       document.getElementById("ng-role").value);
+document.getElementById("ng-name").addEventListener("keydown",e=>{
+  if(e.key==="Enter")addGroup(e.target.value,document.getElementById("ng-role").value);});
 function ldapFormBody(){ return {
   enabled:document.getElementById("ld-enabled").checked,
   host:document.getElementById("ld-host").value.trim(),
@@ -4119,21 +4548,22 @@ async function doDirSearch(){
   const rs=j.results||[];
   if(!rs.length){ box.innerHTML='<span style="color:var(--muted);font-size:12px">Keine Treffer.</span>'; return; }
   box.innerHTML="";
+  const mkBtn=(txt,title,fn)=>{ const b=document.createElement("button");
+    b.className="tbtn"; b.title=title; b.textContent=txt; b.onclick=fn; return b; };
   rs.forEach(r=>{
-    const row=document.createElement("div");
-    row.style.cssText="display:flex;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid var(--grid);font-size:13px";
+    const row=document.createElement("div"); row.className="dsrow";
     if(kind==="group"){
-      row.innerHTML=`<span style="flex:1;min-width:0">${_esc(r.name)}<span style="color:var(--muted);font-size:11px"> ${_esc(r.dn||"")}</span></span>`;
-      const bA=document.createElement("button"); bA.className="cbtn"; bA.title="Als Admin-Gruppe übernehmen"; bA.textContent="→ Admin";
-      bA.onclick=()=>{ document.getElementById("ld-gadmin").value=r.name; umsg("Admin-Gruppe gesetzt: "+r.name+" (noch 'LDAP speichern')",true); };
-      const bR=document.createElement("button"); bR.className="cbtn"; bR.title="Als Read-only-Gruppe übernehmen"; bR.textContent="→ RO";
-      bR.onclick=()=>{ document.getElementById("ld-gro").value=r.name; umsg("Read-only-Gruppe gesetzt: "+r.name+" (noch 'LDAP speichern')",true); };
-      row.appendChild(bA); row.appendChild(bR);
+      row.innerHTML=`<span class="dsname" title="${_esc(r.dn||r.name)}">${_esc(r.name)}`+
+        `<span style="color:var(--muted);font-size:11px"> ${_esc(r.dn||"")}</span></span>`;
+      // direkt freigeben – landet in der Gruppentabelle, nicht in den Legacy-Einzelfeldern
+      row.appendChild(mkBtn("→ Admin","Gruppe als Admin freigeben",()=>addGroup(r.name,"admin")));
+      row.appendChild(mkBtn("→ Read-only","Gruppe als Read-only freigeben",()=>addGroup(r.name,"readonly")));
     } else {
-      row.innerHTML=`<span style="flex:1;min-width:0">${_esc(r.display||r.name)}<span style="color:var(--muted);font-size:11px"> ${_esc(r.name)}</span></span>`;
-      const bU=document.createElement("button"); bU.className="cbtn"; bU.title="In AD-Freigabe übernehmen"; bU.textContent="→ Freigabe";
-      bU.onclick=()=>{ document.getElementById("na-name").value=r.name; umsg("Übernommen: "+r.name+" – Rolle wählen und 'Freigeben'.",true); };
-      row.appendChild(bU);
+      row.innerHTML=`<span class="dsname" title="${_esc(r.name)}">${_esc(r.display||r.name)}`+
+        `<span style="color:var(--muted);font-size:11px"> ${_esc(r.name)}</span></span>`;
+      row.appendChild(mkBtn("→ Freigabe","In die AD-Einzelfreigabe übernehmen",()=>{
+        document.getElementById("na-name").value=r.name;
+        umsg("Übernommen: "+r.name+" – Rolle wählen und 'Freigeben'.",true); }));
     }
     box.appendChild(row);
   });

@@ -37,7 +37,7 @@ from getpass import getpass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib import request, error
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration
