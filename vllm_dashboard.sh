@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.22.0"
+__version__ = "0.23.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -1081,7 +1081,7 @@ def _pub_user(rec, source):
 
 
 # ---------------------------------------------------------------------------
-# LDAP-/AD-Authentifizierung (Simple Bind + memberOf-Suche, nur Standardbibliothek)
+# LDAP-/AD-Authentifizierung (Simple Bind + Gruppen-Suche, nur Standardbibliothek)
 # ---------------------------------------------------------------------------
 
 def _ber_len(n):
@@ -1182,46 +1182,68 @@ def _ldap_do_bind(sock, dn, password, msgid=1):
     return _ldap_bind_result(body)         # 0 = success, 49 = invalidCredentials, …
 
 
-def _parse_entry_memberof(op):
-    _, _obj, i = _parse_tlv(op, 0)          # objectName
-    _, attrs, _ = _parse_tlv(op, i)         # PartialAttributeList SEQUENCE
-    out, j = [], 0
-    while j < len(attrs):
-        _, attr, j = _parse_tlv(attrs, j)   # attribute SEQUENCE { type, vals SET }
-        _, atype, k = _parse_tlv(attr, 0)
-        if atype.decode("utf-8", "replace").lower() == "memberof":
-            _, vset, _ = _parse_tlv(attr, k)
-            m = 0
-            while m < len(vset):
-                _, vv, m = _parse_tlv(vset, m)
-                out.append(vv.decode("utf-8", "replace"))
-    return out
+def _sid_group(user_sid, rid):
+    """Baut aus dem objectSid des Nutzers und einer RID die SID der Gruppe
+    (gleiche Domänen-SID, letzte Sub-Authority ersetzt)."""
+    if not user_sid or len(user_sid) < 12 or (len(user_sid) - 8) % 4:
+        return None
+    return user_sid[:-4] + int(rid).to_bytes(4, "little")
 
 
-def _ldap_search_memberof(sock, base_dn, upn, msgid=2):
-    """Sucht den Nutzer per (|(sAMAccountName=..)(userPrincipalName=..)) und
-    liefert dessen memberOf-Gruppen (Liste von DNs)."""
+def _ldap_user_groups(sock, base_dn, upn, msgid=2):
+    """Alle Gruppen des Nutzers als DN-Liste.
+
+    Achtung: `memberOf` enthält nur die *direkten* Gruppen und **niemals** die
+    primäre Gruppe (in der Praxis „Domänen-Benutzer“ / „Domain Users“). Daher
+    zusätzlich das konstruierte AD-Attribut `tokenGroups` lesen (SIDs aller
+    Gruppen inkl. verschachtelter und primärer; nur bei Base-Scope-Suche auf dem
+    Benutzerobjekt verfügbar) und die SIDs in einer Suche zu DNs auflösen.
+    Fällt `tokenGroups` aus, wird die primäre Gruppe aus objectSid +
+    primaryGroupID rekonstruiert."""
     short = upn.split("@")[0].split("\\")[-1]
-    f1 = _ber_tlv(0xA3, _ber_tlv(0x04, b"sAMAccountName") + _ber_tlv(0x04, short.encode("utf-8")))
-    f2 = _ber_tlv(0xA3, _ber_tlv(0x04, b"userPrincipalName") + _ber_tlv(0x04, upn.encode("utf-8")))
-    filt = _ber_tlv(0xA1, f1 + f2)          # or [1]
-    req = (_ber_tlv(0x04, base_dn.encode("utf-8")) +
-           _ber_enum(2) + _ber_enum(0) +    # scope=wholeSubtree, deref=never
-           _ber_int(5) + _ber_int(10) + _ber_bool(False) +
-           filt + _ber_tlv(0x30, _ber_tlv(0x04, b"memberOf")))
-    sock.sendall(_ber_tlv(0x30, _ber_int(msgid) + _ber_tlv(0x63, req)))
-    groups = []
-    for _ in range(500):
-        body = _read_ldap_message(sock)
-        if not body:
-            break
-        _, _, i = _parse_tlv(body, 0)       # messageID
-        optag = body[i]
-        _, op, _ = _parse_tlv(body, i)
-        if optag == 0x64:                   # SearchResultEntry
-            groups += _parse_entry_memberof(op)
-        else:                               # SearchResultDone (0x65) o. a. -> Ende
-            break
+    filt = _f_or(_f_eq("sAMAccountName", short), _f_eq("userPrincipalName", upn))
+    ent = _ldap_search(sock, base_dn, filt,
+                       ["memberOf", "distinguishedName", "objectSid", "primaryGroupID"],
+                       sizelimit=5, msgid=msgid, binary=("objectsid",))
+    if not ent:
+        return []
+    e = ent[0]
+    groups = [g for g in (e.get("memberof") or []) if g]
+    user_dn = (e.get("distinguishedname") or e.get("dn") or [""])[0]
+    sids = []
+    if user_dn:
+        try:                                # tokenGroups: nur Base-Scope auf dem Nutzer
+            tg = _ldap_search(sock, user_dn, _ber_tlv(0x87, b"objectClass"),
+                              ["tokenGroups"], sizelimit=1, msgid=msgid + 1,
+                              scope=0, binary=("tokengroups",))
+            if tg:
+                sids = [s for s in (tg[0].get("tokengroups") or []) if isinstance(s, bytes)]
+        except Exception:
+            sids = []
+    if not sids:                            # Rückfall: nur die primäre Gruppe
+        usid = (e.get("objectsid") or [b""])[0]
+        try:
+            rid = int((e.get("primarygroupid") or ["0"])[0])
+        except (TypeError, ValueError):
+            rid = 0
+        g = _sid_group(usid, rid) if (rid and isinstance(usid, bytes)) else None
+        if g:
+            sids = [g]
+    if sids:
+        subs = [_f_eq_raw("objectSid", s) for s in sids[:120]]
+        try:
+            res = _ldap_search(sock, base_dn,
+                               _f_or(*subs) if len(subs) > 1 else subs[0],
+                               ["distinguishedName", "cn"],
+                               sizelimit=len(subs) + 5, msgid=msgid + 2)
+        except Exception:
+            res = []
+        have = set(g.lower() for g in groups)
+        for r in res:
+            dn = (r.get("distinguishedname") or r.get("dn") or [""])[0]
+            if dn and dn.lower() not in have:
+                groups.append(dn)
+                have.add(dn.lower())
     return groups
 
 
@@ -1241,6 +1263,10 @@ def _f_eq(attr, val):
     return _ber_tlv(0xA3, _ber_tlv(0x04, attr.encode("utf-8")) + _ber_tlv(0x04, val.encode("utf-8")))
 
 
+def _f_eq_raw(attr, val):  # Vergleichswert als Rohbytes (z. B. binäres objectSid)
+    return _ber_tlv(0xA3, _ber_tlv(0x04, attr.encode("utf-8")) + _ber_tlv(0x04, val))
+
+
 def _f_sub(attr, val):     # substrings: (attr=*val*)  -> ein 'any'-Element [1]
     return _ber_tlv(0xA4, _ber_tlv(0x04, attr.encode("utf-8")) +
                     _ber_tlv(0x30, _ber_tlv(0x81, val.encode("utf-8"))))
@@ -1254,7 +1280,8 @@ def _f_and(*subs):
     return _ber_tlv(0xA0, b"".join(subs))
 
 
-def _parse_entry_attrs(op):
+def _parse_entry_attrs(op, binary=()):
+    """binary: Attributnamen (klein), deren Werte als Rohbytes bleiben (SIDs)."""
     _, objname, i = _parse_tlv(op, 0)       # objectName (DN)
     d = {"dn": [objname.decode("utf-8", "replace")]}
     _, attrs, _ = _parse_tlv(op, i)
@@ -1267,14 +1294,14 @@ def _parse_entry_attrs(op):
         vals, m = [], 0
         while m < len(vset):
             _, vv, m = _parse_tlv(vset, m)
-            vals.append(vv.decode("utf-8", "replace"))
+            vals.append(vv if name in binary else vv.decode("utf-8", "replace"))
         d[name] = vals
     return d
 
 
-def _ldap_search(sock, base, filt, attrs, sizelimit=25, msgid=2):
+def _ldap_search(sock, base, filt, attrs, sizelimit=25, msgid=2, scope=2, binary=()):
     aseq = _ber_tlv(0x30, b"".join(_ber_tlv(0x04, a.encode("utf-8")) for a in attrs))
-    req = (_ber_tlv(0x04, base.encode("utf-8")) + _ber_enum(2) + _ber_enum(0) +
+    req = (_ber_tlv(0x04, base.encode("utf-8")) + _ber_enum(scope) + _ber_enum(0) +
            _ber_int(sizelimit) + _ber_int(15) + _ber_bool(False) + filt + aseq)
     sock.sendall(_ber_tlv(0x30, _ber_int(msgid) + _ber_tlv(0x63, req)))
     out = []
@@ -1286,7 +1313,7 @@ def _ldap_search(sock, base, filt, attrs, sizelimit=25, msgid=2):
         optag = body[i]
         _, op, _ = _parse_tlv(body, i)
         if optag == 0x64:                   # SearchResultEntry
-            out.append(_parse_entry_attrs(op))
+            out.append(_parse_entry_attrs(op, binary))
         elif optag == 0x65:                 # SearchResultDone
             break
         # 0x73 = SearchResultReference u. a. überspringen
@@ -1384,7 +1411,8 @@ def ldap_search_api(body):
 
 
 def ldap_login(cfg, username, password):
-    """Simple Bind gegen den DC; bei Erfolg optional memberOf-Gruppen holen.
+    """Simple Bind gegen den DC; bei Erfolg die Gruppen des Nutzers holen
+    (memberOf + tokenGroups, s. `_ldap_user_groups`).
     Gibt (ok, groups) zurück. Leeres Passwort wird abgelehnt."""
     username = (username or "").strip()
     if not (cfg.get("enabled") and cfg.get("host")) or not username or not password:
@@ -1405,7 +1433,6 @@ def ldap_login(cfg, username, password):
         attempts = [(False, port)]
     else:                                   # auto: erst LDAPS, dann Klartext
         attempts = [(True, port_tls), (False, port)]
-    need_groups = bool(cfg.get("group_admin") or cfg.get("group_readonly"))
     for use_tls, p in attempts:
         sock = raw = None
         try:
@@ -1416,9 +1443,9 @@ def ldap_login(cfg, username, password):
             if rc != 0:
                 return False, []
             groups = []
-            if need_groups and base:
+            if base:            # immer holen: Freigaben liegen in auth.json.ad_groups
                 try:
-                    groups = _ldap_search_memberof(sock, base, dn)
+                    groups = _ldap_user_groups(sock, base, dn)
                 except Exception:
                     groups = []
             return True, groups
@@ -1472,9 +1499,10 @@ def resolve_ad_role(au, username, groups):
     return dr if dr in ROLES else None
 
 
-def resolve_login(username, password):
+def resolve_login(username, password, info=None):
     """Prüft Anmeldedaten gegen lokale Nutzer, sonst gegen LDAP/AD.
-    Gibt userdict {username, role, source, must_change} oder None zurück."""
+    Gibt userdict {username, role, source, must_change} oder None zurück.
+    `info` (optional dict) nimmt den Grund des Fehlschlags auf ("norole", …)."""
     username = (username or "").strip()
     if not username or not password:
         return None
@@ -1493,6 +1521,12 @@ def resolve_login(username, password):
             if role:
                 short = username.split("@")[0].split("\\")[-1]
                 return {"username": short, "role": role, "source": "ad", "must_change": False}
+            # Bind hat funktioniert, aber keine Freigabe -> eigener Grund
+            if isinstance(info, dict):
+                info["reason"] = "norole"
+                info["groups"] = groups
+            sys.stderr.write("[auth] AD-Anmeldung ok, aber keine Rolle für %s "
+                             "(Gruppen: %s)\n" % (username, ", ".join(groups) or "keine"))
     return None
 
 
@@ -1891,13 +1925,17 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_login(self):
         body = self._read_body() or {}
         form = self._is_form_post()
-        ud = resolve_login(body.get("username", ""), body.get("password", ""))
+        info = {}
+        ud = resolve_login(body.get("username", ""), body.get("password", ""), info)
         if not ud:
+            norole = info.get("reason") == "norole"
             if form:
-                self._redirect("/?login=failed")
+                self._redirect("/?login=norole" if norole else "/?login=failed")
                 return
             self._send(401, "application/json",
-                       json.dumps({"error": "Anmeldung fehlgeschlagen"}).encode("utf-8"))
+                       json.dumps({"error": "Kein Zugriff freigegeben" if norole
+                                   else "Anmeldung fehlgeschlagen",
+                                   "reason": "norole" if norole else "failed"}).encode("utf-8"))
             return
         self._set_auth_cookie(ud["username"], ud["role"], ud["source"])
         if form:
@@ -1950,8 +1988,12 @@ class Handler(BaseHTTPRequestHandler):
         # Öffentliche Routen (ohne Anmeldung erreichbar)
         if parsed.path in ("/", "/index.html"):
             sub = ("– " + html.escape(LABEL)) if LABEL else ""
+            # Login-Overlay serverseitig öffnen, wenn keine Sitzung besteht:
+            # kein Warten auf /api/me und kein Flackern für angemeldete Nutzer.
+            anon = not self._auth_state().get("authenticated")
             page = (PAGE.replace("__SUBTITLE__", sub)
                         .replace("__VERSION__", __version__)
+                        .replace("__AUTHOPEN__", "show" if anon else "")
                         .replace("__TLSAVAIL__", "1" if CERT_PATH else "0"))
             self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
             return
@@ -2280,8 +2322,9 @@ PAGE = r"""<!DOCTYPE html>
   .dbtn:hover .dg{fill:var(--fg);}
   .dbtn.active{border-color:var(--accent);}
   .dbtn.active .dg{fill:var(--accent);}
+  /* Live-Anzeige und Stand stehen zusammen am rechten Rand in EINER Zeile */
   #countdown{margin-left:auto;font-size:12px;font-variant-numeric:tabular-nums;color:var(--accent);
-             min-width:150px;text-align:right;}
+             min-width:150px;text-align:right;white-space:nowrap;}
   #countdown.now{color:var(--ok);} #countdown.paused{color:var(--muted);}
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding:6px 0 2px;}
   .kpi{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;}
@@ -2406,7 +2449,7 @@ PAGE = r"""<!DOCTYPE html>
   th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--grid);}
   th{color:var(--muted);font-weight:600;}
   .placeholder{color:var(--muted);font-size:12px;padding:18px 4px;text-align:center;}
-  #status{font-size:11px;color:var(--muted);}
+  #status{font-size:11px;color:var(--muted);white-space:nowrap;text-align:right;}
   #legend{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;padding:12px 16px 0;}
   .lchip{display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;color:var(--fg);user-select:none;}
   .lchip.off{opacity:.4;text-decoration:line-through;}
@@ -2561,7 +2604,7 @@ PAGE = r"""<!DOCTYPE html>
     <span id="username"></span><span class="rolebadge" id="userrole"></span>
   </span>
   <span id="countdown"></span>
-  <span id="status" style="flex-basis:100%;text-align:right"></span>
+  <span id="status"></span>
 </header>
 
 <div id="sections">
@@ -2669,7 +2712,7 @@ PAGE = r"""<!DOCTYPE html>
       <input id="tgt-host" placeholder="Host/IP" style="flex:1;min-width:140px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
       <input id="tgt-port" placeholder="Port" style="width:80px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
       <input id="tgt-label" placeholder="Label (optional)" style="width:150px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
-      <input id="tgt-key" type="password" autocomplete="off" placeholder="API-Key (optional)" style="width:170px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
+      <input id="tgt-key" type="password" autocomplete="new-password" placeholder="API-Key (optional)" style="width:170px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
       <label id="tgt-keydel-lbl" style="display:none;align-items:center;gap:4px;font-size:12px;color:var(--muted)">
         <input type="checkbox" id="tgt-keydel"> Key entfernen</label>
       <button class="abtn" id="tgt-add">Hinzufügen</button>
@@ -2719,8 +2762,10 @@ sudo update-ca-certificates</pre>
   </div>
 </div>
 
-<!-- Login-/Passwortwechsel-Overlay -->
-<div id="authov">
+<!-- Login-/Passwortwechsel-Overlay. Die Klasse "show" setzt bereits der Server, wenn
+     keine Sitzung besteht – so steht das Login-Formular ab dem ersten Frame und nicht
+     erst nach dem /api/me-Roundtrip. -->
+<div id="authov" class="__AUTHOPEN__">
   <!-- echte <form>-Elemente + name-Attribute: nur so bieten Browser/Passwort-
        manager Benutzername/Kennwort zum Ausfüllen und Speichern an -->
   <form class="auth-card" id="logincard" method="post" action="/api/login" autocomplete="on">
@@ -2761,8 +2806,8 @@ sudo update-ca-certificates</pre>
     <h4 style="margin:6px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">Lokale Benutzer</h4>
     <table class="utable" id="localtable"><thead><tr><th>Benutzer</th><th>Rolle</th><th>Status</th><th></th></tr></thead><tbody></tbody></table>
     <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px">
-      <input id="nu-name" class="uinput" placeholder="Benutzername" style="flex:1;min-width:120px">
-      <input id="nu-pass" class="uinput" type="password" placeholder="Passwort" style="width:150px">
+      <input id="nu-name" class="uinput" autocomplete="off" placeholder="Benutzername" style="flex:1;min-width:120px">
+      <input id="nu-pass" class="uinput" type="password" autocomplete="new-password" placeholder="Passwort" style="width:150px">
       <select id="nu-role" class="uinput"><option value="admin">Admin</option><option value="readonly" selected>Read-only</option></select>
       <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px"><input type="checkbox" id="nu-mc">Wechsel erzwingen</label>
       <button class="abtn" id="nu-add">Anlegen</button>
@@ -2784,7 +2829,8 @@ sudo update-ca-certificates</pre>
       <button class="abtn" id="ng-add">Freigeben</button>
     </div>
     <p style="font-size:11px;margin:4px 0 0">Jedes Mitglied einer freigegebenen Gruppe erhält die gewählte Rolle
-       (Admin schlägt Read-only). Vergleich gegen <code>memberOf</code> – CN oder vollständiger DN.</p>
+       (Admin schlägt Read-only). Angabe als CN oder vollständiger DN; berücksichtigt werden
+       direkte, verschachtelte und die primäre Gruppe (z. B. „Domänen-Benutzer“).</p>
 
     <h4 style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">LDAP-/AD-Anbindung</h4>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 12px">
@@ -4361,14 +4407,18 @@ function showLogin(){
   document.getElementById("logincard").style.display="";
   document.getElementById("pwcard").style.display="none";
   ov.classList.add("show");
-  // Rückmeldung eines fehlgeschlagenen Formular-Logins aus der URL übernehmen
+  // Rückmeldung einer Weiterleitung aus der URL übernehmen (abgelaufene Sitzung,
+  // Passwortwechsel-Formular – der Login selbst läuft per fetch)
   const lf=_authQuery("login");
   if(lf) document.getElementById("li-msg").textContent =
       lf==="expired" ? "Sitzung abgelaufen – bitte erneut anmelden."
+    : lf==="norole" ? LOGINMSG.norole
                      : "Anmeldung fehlgeschlagen – Benutzer/Passwort prüfen.";
-  // nur fokussieren, wenn der Passwortmanager nichts vorausgefüllt hat
+  // Benutzername aus dem letzten Login vorbelegen, falls der Passwortmanager
+  // nichts eingetragen hat (Passwort bleibt Sache des Browsers)
   setTimeout(()=>{try{
     const u=document.getElementById("li-user");
+    if(!u.value){ const last=getCookie("monitor_lastuser"); if(last) u.value=last; }
     (u.value ? document.getElementById("li-pass") : u).focus();
   }catch(e){}},50);
 }
@@ -4380,6 +4430,8 @@ function _authQuery(name){
     try{ history.replaceState(null,"",location.pathname+(q.toString()?"?"+q:"")); }catch(e){} }
   return v;
 }
+const LOGINMSG={norole:"Anmeldung am AD erfolgreich, aber für dieses Konto ist kein "
+                      +"Zugriff freigegeben (Benutzer oder AD-Gruppe freigeben)."};
 const PWERR={short:"Neues Passwort muss mindestens 6 Zeichen haben.",
              old:"Aktuelles Passwort ist falsch.",
              mismatch:"Die neuen Passwörter stimmen nicht überein.",
@@ -4396,9 +4448,7 @@ function showPasswordChange(user){
   if(pe) document.getElementById("pw-msg").textContent = PWERR[pe]||"Passwortwechsel fehlgeschlagen.";
   setTimeout(()=>{try{document.getElementById("pw-old").focus();}catch(e){}},50);
 }
-// Beide Formulare werden ganz normal abgeschickt (POST + 303 zurück auf "/").
-// Kein fetch/preventDefault: Passwortmanager speichern Zugangsdaten nur, wenn
-// auf das Absenden eine echte Navigation folgt.
+// Der Passwortwechsel wird klassisch abgeschickt (POST + 303 zurück auf "/").
 document.getElementById("pwcard").addEventListener("submit",e=>{
   const n=document.getElementById("pw-new").value, n2=document.getElementById("pw-new2").value;
   const msg=document.getElementById("pw-msg"); msg.textContent="";
@@ -4406,10 +4456,52 @@ document.getElementById("pwcard").addEventListener("submit",e=>{
   if(n!==n2){ e.preventDefault(); msg.textContent=PWERR.mismatch; return; }
   flushPrefs();
 });
-document.getElementById("logincard").addEventListener("submit",()=>{
-  document.getElementById("li-msg").textContent="Anmeldung läuft …";
+// Login per fetch + preventDefault (Muster wie im Jarvis-Frontend): Browser bieten
+// das Speichern von Zugangsdaten an, wenn nach einer erfolgreichen Anmeldung das
+// Login-Formular verschwindet. Zusätzlich wird – falls verfügbar – die Credential-
+// Management-API bemüht, die den Speichern-Dialog explizit anfordert.
+document.getElementById("logincard").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const uf=document.getElementById("li-user"), pf=document.getElementById("li-pass");
+  const user=uf.value.trim(), pass=pf.value;
+  const msg=document.getElementById("li-msg"), btn=document.getElementById("li-submit");
+  if(!user||!pass){ msg.textContent="Benutzer und Passwort angeben."; return; }
+  msg.textContent="Anmeldung läuft …"; btn.disabled=true;
+  let j=null, status=0;
+  try{
+    const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
+                                      body:JSON.stringify({username:user,password:pass})});
+    status=r.status; j=await r.json().catch(()=>null);
+  }catch(err){ msg.textContent="Verbindung zum Server fehlgeschlagen."; btn.disabled=false; return; }
+  btn.disabled=false;
+  if(!j||!j.ok){
+    msg.textContent = (j&&j.reason==="norole") ? LOGINMSG.norole
+                    : "Anmeldung fehlgeschlagen – Benutzer/Passwort prüfen.";
+    pf.select();
+    return;
+  }
+  msg.textContent="";
+  setCookie("monitor_lastuser",user,365);   // Benutzername merken (nie das Passwort)
+  // Formular ausblenden, BEVOR gespeichert/gebootet wird: das ist für den
+  // Passwortmanager das Signal "Anmeldung erfolgreich".
+  document.getElementById("authov").classList.remove("show");
+  // Bewusst OHNE await: der Speichern-Dialog des Browsers darf das Booten des
+  // Dashboards nicht blockieren (die Zusage kann beliebig lange offen bleiben).
+  try{
+    if(window.PasswordCredential && navigator.credentials)
+      navigator.credentials.store(new PasswordCredential(
+        {id:user, password:pass, name:user})).catch(()=>{});
+  }catch(err){}
+  // KEINE Navigation nach dem Login: ein Seitenwechsel verwirft den vorgemerkten
+  // Speicherstand des Passwortmanagers ("No provisional save manager") und der
+  // Dialog erscheint nie. Stattdessen bleibt die Seite stehen, das Formular
+  // verschwindet – genau das ist das Signal "Anmeldung erfolgreich".
+  applyAuthState({authenticated:true, username:(j.username||user), role:j.role,
+                  source:j.source, must_change:!!j.must_change});
 });
-async function doLogout(){ flushPrefs(); try{ await fetch("/api/logout",{method:"POST"}); }catch(e){} location.href="/"; }
+// Nach dem Abmelden ein echtes Neuladen (replace: das angemeldete Dashboard bleibt
+// nicht im Verlauf) – der Server liefert die Seite direkt mit Login-Formular.
+async function doLogout(){ flushPrefs(); try{ await fetch("/api/logout",{method:"POST"}); }catch(e){} location.replace("/"); }
 document.getElementById("logoutbtn").onclick=doLogout;
 
 // ---- Benutzer- & Zugriffsverwaltung (nur Admins) ----

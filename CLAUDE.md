@@ -133,14 +133,56 @@ Prometheus → `_basic_login`, short `VLLM_AUTH_TTL` cache). `_require_auth()`
 guards everything except the page shell and `/api/me`; role/`must_change` are
 enforced on `do_POST`/`do_DELETE`.
 
+**Password managers** — the login is deliberately an **XHR login** (same pattern as
+the Jarvis frontend, `frontend/js/chat.js`): the submit handler calls
+`preventDefault()`, POSTs JSON to `/api/login`, and on success **hides the login
+overlay and boots the dashboard in place** (`applyAuthState()`), optionally
+declaring the credential through `navigator.credentials.store(new
+PasswordCredential(...))` — deliberately **not** awaited, or an open save dialog
+would block the boot. Rules learned from measuring Chrome via
+`chrome://password-manager-internals`:
+
+- **Never navigate after the XHR login.** A `location.replace()`/reload right
+  after it makes Chrome log `No provisional save manager` — the pending save is
+  discarded and the prompt never appears. The disappearing form is the entire
+  "login succeeded" signal (`OnDynamicFormSubmission`).
+- Do **not** clear the password field before that signal.
+- Keep the real `<form>` with `name=` + `autocomplete=username/current-password`
+  fields; `#authov` is opened server-side via the `__AUTHOPEN__` placeholder in
+  `do_GET("/")` (`_auth_state()`) so the card is there from the first frame.
+  Visibility itself is *not* an autofill factor — Chrome fills `display:none`
+  forms too (measured A/B).
+- Fields that must **not** be autofilled with the account password (API key
+  `#tgt-key`, new-user `#nu-pass`) need `autocomplete="new-password"`;
+  `autocomplete="off"` is ignored for password inputs.
+- `doLogout()` does a real `location.replace("/")` (fresh form, no history entry).
+- Independent of the browser, the last username is kept in a `monitor_lastuser`
+  cookie (never the password) and prefills the field.
+
+Test harness for all of this lives in the session scratchpad (`cdp.py` = stdlib
+WebSocket/CDP client, `save_test.py` = real login + internals log, `boot_test.py`
+= boot/JS-error check, works headless and headful via `xvfb-run`).
+
 **LDAP/AD** is configured in the UI (⚙ → 👥 *Benutzer & Zugriff*), stored in
 `auth.json.ldap`; the `VLLM_LDAP_*` env vars only **seed** it on first creation.
-`ldap_login()` does a hand-rolled **simple bind** and, if an admin/readonly group
-is configured, an **LDAP search for `memberOf`** (BER `SearchRequest`, stdlib) to
-map AD groups → role. Besides the two legacy single fields, **any number of AD
-groups can be released** in the UI (table *Active-Directory-Gruppen (Freigabe)*,
-stored in `auth.json.ad_groups` as `{name, role}`; `name` may be a CN or a full
-DN, matched by `_group_match()` against `memberOf`). Role resolution
+`ldap_login()` does a hand-rolled **simple bind** and then **always** resolves the
+user's groups via `_ldap_user_groups()` (BER `SearchRequest`, stdlib) — never
+conditionally, because the releases live in `auth.json.ad_groups`, not in the
+legacy `group_admin`/`group_readonly` fields. `memberOf` alone is **not enough**:
+it lists only *direct* groups and never the **primary group** (typically
+„Domänen-Benutzer"/„Domain Users"), so `_ldap_user_groups()` additionally reads the
+constructed AD attribute **`tokenGroups`** (SIDs of all groups incl. nested +
+primary; only available on a **base-scope** search of the user object) and resolves
+those SIDs to DNs in one `(|(objectSid=…)…)` search (`_f_eq_raw` passes raw SID
+bytes; `_ldap_search(..., scope=…, binary=…)` keeps binary attrs undecoded). If
+`tokenGroups` is unavailable, the primary group is reconstructed from
+`objectSid` + `primaryGroupID` (`_sid_group()`). Besides the two legacy single
+fields, **any number of AD groups can be released** in the UI (table
+*Active-Directory-Gruppen (Freigabe)*, stored in `auth.json.ad_groups` as
+`{name, role}`; `name` may be a CN or a full DN, matched by `_group_match()`).
+A successful bind without any release fails the login with its own reason
+(`resolve_login(..., info)` → `?login=norole` + stderr line), not the generic
+"wrong password" message. Role resolution
 (`resolve_ad_role`): explicit AD-user entry > released groups (admin beats
 readonly) > legacy `group_admin`/`group_readonly` > `default_role`. Managed via
 `POST/DELETE /api/users` with `kind: "adgroup"`; the directory search offers
