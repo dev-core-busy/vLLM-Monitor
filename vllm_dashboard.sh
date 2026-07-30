@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.23.0"
+__version__ = "0.24.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -485,7 +485,7 @@ def build_config():
 _tokens_cache = None      # (erzeugt_ts, ergebnis) – teure Volltabellen-Aggregation cachen
 
 
-def build_tokens():
+def _tokens_all():
     """Generierte Tokens **pro Kalendertag** seit Aufzeichnungsbeginn, je Modell.
     Aus den kumulativen Countern über positive Deltas gebildet (Counter-Resets
     beim Server-Neustart werden verworfen). Ergebnis 60 s gecacht."""
@@ -535,6 +535,33 @@ def build_tokens():
     res = {"days": out, "models": sorted(models)}
     _tokens_cache = (now, res)
     return res
+
+
+def build_tokens(range_s=None, start=None, end=None):
+    """Tages-Token-Daten. Ohne Zeitraum: alle Tage seit Aufzeichnungsbeginn
+    (für den „seit Aufzeichnung"-Chart). Mit Zeitraum (range_s bzw. start/end in
+    Sekunden): auf das Fenster gefilterte Tage plus Summen/Ø – für die
+    Token-Zähler-Kachel (analog build_energy)."""
+    base = _tokens_all()
+    if range_s is None and start is None:
+        return base
+    import datetime
+    now = int(time.time())
+    if start is not None and end is not None:
+        since, until = start, end
+    else:
+        until = now
+        since = until - (range_s or 86400)
+    d_since = datetime.date.fromtimestamp(since).isoformat()
+    d_until = datetime.date.fromtimestamp(until).isoformat()
+    days = [d for d in base["days"] if d_since <= d["date"] <= d_until]
+    gen = sum(d["gen"] for d in days)
+    prompt = sum(d["prompt"] for d in days)
+    ndays = len(days)
+    return {"days": days, "models": base["models"],
+            "total_gen": round(gen), "total_prompt": round(prompt),
+            "avg_gen_day": round(gen / ndays) if ndays else None,
+            "since": since * 1000, "until": until * 1000}
 
 
 def build_alerts(limit=100):
@@ -2034,7 +2061,13 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/config":
             self._json(build_config())
         elif parsed.path == "/api/tokens":
-            self._json(build_tokens())
+            fr, to = _abs_window(qs)
+            if fr is not None:
+                self._json(build_tokens(start=fr, end=to))
+            elif "range" in qs:
+                self._json(build_tokens(_range_from(qs)))
+            else:
+                self._json(build_tokens())
         elif parsed.path == "/api/alerts":
             try:
                 lim = int(qs.get("limit", ["100"])[0])
@@ -2912,6 +2945,12 @@ const CHARTS=[
          '<div class="ebig" id="energybig"></div>'+
          '<div class="chartwrap energywrap"><canvas id="c_energy"></canvas></div>',
   desc:"Energieverbrauch der GPUs je Kalendertag im gewählten Zeitraum.\nBerechnet aus der gemessenen Leistungsaufnahme (DCGM), über die Zeit\naufintegriert – auf den Rohdaten, nicht auf den verdichteten Diagrammpunkten.\nMesslücken werden übersprungen statt hochgerechnet (schraffierter Balken)."},
+ // eigene Kachel: generierte Tokens je Tag als Balken -> eigene Chart-Instanz in renderTokensTile()
+ {id:"tokens",title:"Token-Zähler",
+  custom:'<div class="ehead" id="tokenshead"></div>'+
+         '<div class="ebig" id="tokensbig"></div>'+
+         '<div class="chartwrap energywrap"><canvas id="c_tokens"></canvas></div>',
+  desc:"Generierte Tokens je Kalendertag im gewählten Zeitraum.\nAus den kumulativen Countern über positive Deltas gebildet\n(Counter-Resets beim Server-Neustart werden verworfen).\nDie Vorschau zeigt die Gesamtsumme; das Balkendiagramm erscheint maximiert."},
  {id:"req",title:"Requests aktiv / wartend",fields:[{k:"running",l:"aktiv"},{k:"waiting",l:"wartend",dash:[4,3]}],
   desc:"Anzahl der gerade verarbeiteten (aktiv) und in der Warteschlange\nstehenden (wartend) Anfragen dieses Modells.\nWartend > 0 heißt: die Instanz ist an der Kapazitätsgrenze."},
  {id:"waitreason",title:"Wartend nach Grund",fields:[{k:"waiting_capacity",l:"capacity"},{k:"waiting_deferred",l:"deferred",dash:[4,3]}],
@@ -3509,7 +3548,7 @@ function ensureAbsDefaults(){ const f=document.getElementById("absfrom"), t=docu
   if(!f.value){ const d=new Date(); d.setHours(0,0,0,0); f.value=toLocalInput(d); } }
 function applyAbs(){ store.set("vllm_absfrom",document.getElementById("absfrom").value);
   store.set("vllm_absto",document.getElementById("absto").value);
-  startRefresh(); fetchCompare(); fetchAnnotations(); fetchEnergy(); }
+  startRefresh(); fetchCompare(); fetchAnnotations(); fetchEnergy(); fetchTokensTile(); }
 function rangeLabel(){ const sel=document.getElementById("range");
   if(sel.value==="custom"){ const w=absWindow();
     return w ? new Date(w.from*1000).toLocaleString()+" – "+new Date(w.to*1000).toLocaleString()
@@ -3592,7 +3631,11 @@ function applyTheme(t){document.body.dataset.theme=t;store.set("vllm_theme",t);
   if(energyChart){ const o=energyChart.options.scales;
     o.x.ticks.color=o.y.ticks.color=o.y.title.color=css("--muted");
     o.x.border.color=o.y.border.color=css("--border"); o.y.grid.color=css("--grid");
-    energyChart.update(); }}
+    energyChart.update(); }
+  if(tokTileChart){ const o=tokTileChart.options.scales;
+    o.x.ticks.color=o.y.ticks.color=o.y.title.color=css("--muted");
+    o.x.border.color=o.y.border.color=css("--border"); o.y.grid.color=css("--grid");
+    tokTileChart.update(); }}
 
 // --- Init ---
 function buildGrid(){
@@ -3630,7 +3673,7 @@ function toggleMax(card,id){
     const hdr=document.querySelector("header");
     card.style.top=((hdr?hdr.offsetHeight:56)+8)+"px";     // unter der Titelleiste beginnen
   } else { card.style.top=""; }
-  const c=charts[id]||(id==="energy"?energyChart:null);
+  const c=charts[id]||(id==="energy"?energyChart:(id==="tokens"?tokTileChart:null));
   if(c){
     // Mausrad-/Pinch-Zoom + Verschieben nur bei maximierter Karte (sonst zu leicht versehentlich)
     const z=c.options.plugins.zoom;                        // fehlt beim Balkendiagramm
@@ -3863,6 +3906,7 @@ document.getElementById("an_copy").onclick=()=>{
 
 let tokChart=null, rangeTokChart=null, lastTokens=null, _tokTs=0;   // früh deklariert (applyTheme greift darauf zu)
 let energyChart=null, lastEnergy=null;                              // dito – applyTheme läuft vor renderEnergy
+let tokTileChart=null, lastTokenTile=null;                          // Token-Zähler-Kachel (analog energyChart)
 buildGrid();
 applyTheme(store.get("vllm_theme")||"dark");
 // Anomalie-Marker in allen Diagrammen (Umschalter, Zustand im Cookie)
@@ -3891,7 +3935,7 @@ applyDensity(store.get("vllm_density")||"normal");
 document.getElementById("range").onchange=()=>{store.set("vllm_range",rangeSel());
   document.getElementById("absrange").style.display=isAbs()?"":"none";
   if(isAbs())ensureAbsDefaults();
-  fetchConfig();startRefresh();fetchCompare();fetchAnnotations();fetchEnergy();};
+  fetchConfig();startRefresh();fetchCompare();fetchAnnotations();fetchEnergy();fetchTokensTile();};
 document.getElementById("absapply").onclick=applyAbs;
 ["absfrom","absto"].forEach(id=>document.getElementById(id).addEventListener("change",()=>{ if(isAbs())applyAbs(); }));
 document.getElementById("annbtn").onclick=addAnnotation;
@@ -4216,6 +4260,97 @@ function renderEnergy(){
     energyChart.update();
   }
 }
+// ---- Token-Zähler-Kachel (generierte Tokens/Tag, analog GPU-Verbrauch) ----
+// Werte über den Balken – nur maximiert, mit Tsd/Mio-Formatierung (fmtBig).
+const tokbarvals={id:"tokbarvals",afterDatasetsDraw(c){
+  const ds=c.data.datasets[0]; if(!ds)return;
+  if(!c.canvas.closest(".card.maximized"))return;
+  const ctx=c.ctx; ctx.save();
+  ctx.font="10px sans-serif"; ctx.textAlign="center"; ctx.textBaseline="bottom";
+  const meta=c.getDatasetMeta(0);
+  const skip=Math.ceil(meta.data.length/14);
+  meta.data.forEach((el,i)=>{ const v=ds.data[i];
+    if(v==null||(skip>1&&i%skip))return;
+    const room=el.y-3>=c.chartArea.top+9;
+    ctx.fillStyle=room?css("--muted"):"#fff";
+    ctx.fillText(fmtBig(v),el.x,room?el.y-3:el.y+13); });
+  ctx.restore();
+}};
+// Ø generierte Tokens/Tag als hervorgehobene Linie (nur maximiert).
+const tokavgline={id:"tokavgline",afterDatasetsDraw(c){
+  if(!c.canvas.closest(".card.maximized"))return;
+  const v=lastTokenTile&&lastTokenTile.avg_gen_day; if(v==null)return;
+  const a=c.chartArea, y=c.scales.y.getPixelForValue(v);
+  if(y<a.top||y>a.bottom)return;
+  const ctx=c.ctx, col=css("--accent"); ctx.save();
+  ctx.strokeStyle=col; ctx.lineWidth=2; ctx.setLineDash([7,4]);
+  ctx.beginPath(); ctx.moveTo(a.left,y); ctx.lineTo(a.right,y); ctx.stroke();
+  ctx.setLineDash([]);
+  const txt="Ø "+fmtBig(v)+" Tok/Tag";
+  ctx.font="600 11px sans-serif"; ctx.textBaseline="middle"; ctx.textAlign="right";
+  const w=ctx.measureText(txt).width+10, h=17, x=a.right-w-4;
+  const ty=(y-h/2-2<a.top)?y+h/2+3:y-h/2-3;
+  ctx.fillStyle=col; ctx.globalAlpha=.15;
+  ctx.fillRect(x,ty-h/2,w,h); ctx.globalAlpha=1;
+  ctx.strokeStyle=col; ctx.lineWidth=1; ctx.strokeRect(x,ty-h/2,w,h);
+  ctx.fillStyle=col; ctx.fillText(txt,a.right-9,ty);
+  ctx.restore();
+}};
+async function fetchTokensTile(){
+  if(!document.getElementById("tokenshead"))return;
+  try{ const q=isAbs()?(()=>{const w=absWindow();return w?"from="+w.from+"&to="+w.to:"range="+rangeVal();})():"range="+rangeVal();
+    lastTokenTile=await(await fetch("/api/tokens?"+q)).json(); }catch(e){ lastTokenTile=null; }
+  renderTokensTile();
+}
+function renderTokensTile(){
+  const head=document.getElementById("tokenshead"), cv=document.getElementById("c_tokens");
+  const big=document.getElementById("tokensbig");
+  if(!head||!cv||!big)return;
+  const j=lastTokenTile, days=(j&&!j.error&&j.days)||[];
+  if(!days.length){
+    head.innerHTML='<span class="enote">Keine generierten Tokens im Zeitraum.</span>';
+    big.innerHTML='<span class="s">Keine generierten Tokens im gewählten Zeitraum.</span>';
+    if(tokTileChart){ tokTileChart.data.labels=[]; tokTileChart.data.datasets[0].data=[]; tokTileChart.update(); }
+    return;
+  }
+  // Vorschau: Gesamtsumme (der „Zähler")
+  big.innerHTML='<span class="v">'+fmtBig(j.total_gen)+' generiert</span>'
+    +'<span class="hint" title="Kachel maximieren">⛶ maximieren für Diagramm</span>';
+  const hint=big.querySelector(".hint");
+  if(hint) hint.onclick=()=>{ const b=big.closest("[data-id]").querySelector(".cbtn.max"); if(b)b.click(); };
+  head.innerHTML=(j.avg_gen_day!=null?'<span class="eavg">Ø '+fmtBig(j.avg_gen_day)+'/Tag</span>':'')
+    +'<b>'+fmtBig(j.total_gen)+' generiert</b>'
+    +'<span class="emeta">'+fmtBig(j.total_prompt)+' Prompt-Tokens</span>';
+
+  const labels=days.map(d=>new Date(d.date+"T12:00:00")
+    .toLocaleDateString("de-DE",{day:"2-digit",month:"2-digit"}));
+  const data=days.map(d=>d.gen);
+  const tip=i=>{ const d=days[i], dt=new Date(d.date+"T12:00:00");
+    return [dt.toLocaleDateString("de-DE",{weekday:"long",day:"2-digit",month:"2-digit",year:"numeric"}),
+            fmtBig(d.gen)+" generiert", fmtBig(d.prompt)+" Prompt"]; };
+  if(!tokTileChart){
+    tokTileChart=new Chart(cv,{type:"bar",plugins:[tokbarvals,tokavgline],
+      data:{labels,datasets:[{data,backgroundColor:"#3fb950",borderWidth:0,borderRadius:2}]},
+      options:{animation:false,responsive:true,maintainAspectRatio:false,
+        layout:{padding:{top:14}},
+        scales:{
+          x:{ticks:{color:css("--muted"),maxRotation:0,autoSkip:true,maxTicksLimit:14},
+             grid:{display:false},border:{color:css("--border")}},
+          y:{beginAtZero:true,title:{display:true,text:"Tokens",color:css("--muted"),font:{size:10}},
+             ticks:{color:css("--muted"),callback:v=>fmtBig(v)},
+             grid:{color:css("--grid")},border:{color:css("--border")}}},
+        plugins:{legend:{display:false},
+          tooltip:{callbacks:{title:c=>tip(c[0].dataIndex)[0],
+                              label:c=>tip(c.dataIndex).slice(1)}}}}});
+  } else {
+    tokTileChart.data.labels=labels;
+    tokTileChart.data.datasets[0].data=data;
+    const o=tokTileChart.options;
+    o.plugins.tooltip.callbacks.title=c=>tip(c[0].dataIndex)[0];
+    o.plugins.tooltip.callbacks.label=c=>tip(c.dataIndex).slice(1);
+    tokTileChart.update();
+  }
+}
 async function addAnnotation(){
   const label=prompt('Annotation für den aktuellen Zeitpunkt (z. B. „Deploy v0.22.2"):');
   if(!label||!label.trim())return;
@@ -4374,9 +4509,10 @@ let _booted=false;
 async function bootDashboard(){
   if(_booted)return; _booted=true;
   await loadServerPrefs();   // serverseitige Ansicht laden, bevor gerendert wird
-  fetchConfig(); startRefresh(); fetchAlerts(); fetchCompare(); fetchAnnotations(); fetchEnergy();
+  fetchConfig(); startRefresh(); fetchAlerts(); fetchCompare(); fetchAnnotations(); fetchEnergy(); fetchTokensTile();
   setInterval(fetchConfig,30000); setInterval(fetchAlerts,30000); setInterval(fetchAnnotations,30000);
   setInterval(fetchEnergy,60000);   // Tagesverbrauch ändert sich langsam
+  setInterval(fetchTokensTile,60000);
 }
 
 // ===================== Authentifizierung =====================

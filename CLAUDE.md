@@ -68,6 +68,15 @@ writing such rules: the surrounding "Diagramme" section is itself a `.card`, so
 `.card:not(.maximized) …` always matches — use the child combinator
 (`.card.maximized > …`).
 
+The **"Token-Zähler"** tile is built the same way (a second `custom` CHARTS
+entry, own instance `tokTileChart`, own `tokbarvals`/`tokavgline` plugins reusing
+the `.ehead`/`.ebig`/`.energywrap` classes): **generated tokens per calendar day**
+as a bar chart in the selected range, with an Ø/day line. Its preview shows the
+**total** as the large figure (the "counter", `fmtBig`). Data comes from the
+range-aware `build_tokens(range_s|start,end)` via `GET /api/tokens?range=…` —
+**without** params `build_tokens()` still returns all days since recording for the
+existing Effizienz "seit Aufzeichnung" chart (`_tokens_all()`, 60 s cached).
+
 Tile layout: every `.card` is a flex column and its canvas lives in a
 `.chartwrap` (`flex:1`, `min-height:var(--card-h)`, canvas absolutely filling
 it). That keeps the x-axes of all tiles in a grid row on one line regardless of

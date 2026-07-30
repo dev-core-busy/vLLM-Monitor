@@ -4,6 +4,19 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.24.0] – 2026-07-30
+
+### Hinzugefügt
+- **Kachel „Token-Zähler"** (analog zur GPU-Verbrauch-Kachel): zeigt die
+  **generierten Tokens je Kalendertag** im gewählten Zeitraum als Balkendiagramm
+  mit Ø-Linie und Werten über den Balken (nur maximiert). Die Vorschau zeigt
+  schlicht die **Gesamtsumme** als große Kennzahl; der Kopf ergänzt Ø/Tag und die
+  Prompt-Tokens. Eigene Chart-Instanz (`tokTileChart`), kein 🔍-Analysepanel.
+  Backend: `build_tokens(range_s|start,end)` liefert das auf das Fenster
+  gefilterte Ergebnis inkl. Summen/Ø; `GET /api/tokens?range=…|from=…&to=…`
+  (ohne Parameter weiterhin alle Tage seit Aufzeichnung für den bestehenden
+  Effizienz-Chart).
+
 ## [0.22.0] – 2026-07-29
 
 ### Hinzugefügt
