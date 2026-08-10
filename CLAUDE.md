@@ -84,6 +84,36 @@ how many lines the heading wraps to, and makes `toggleMax()` free of manual
 height math — the flex child fills the maximized card exactly, so nothing
 scrolls. **New tiles must wrap their canvas in `.chartwrap`.**
 
+**Signals that only exist under load** (`hit_rate`, all latency percentiles) are
+**not** derived from the delta to the previous chart bucket — over a single
+bucket (~76 s in a 17 h window) they are undefined most of the time, because the
+servers are idle, which yields a scatter of dots rather than a readable curve.
+`build_series()` instead compares each point against `pts[i - kwin]`, a full
+**sliding window** back (`_smooth_window()`: ~1/34 of the displayed span, min 4
+buckets, max 1 h → 30 min at 17 h), and returns that length as `win`. Measured on
+real data this turns 34 fragments averaging 1.8 points into 9 runs averaging 42
+— an actual curve. The rates (`RATES`, tokens/s …) keep the short bucket delta;
+they are dense anyway. Tiles whose fields are smoothed are labelled with the
+window (`isSmoothed()` → `.wnote` in the card heading), otherwise the curve
+cannot be interpreted.
+
+**Gaps are not data.** Even after smoothing, the remaining gaps are real:
+`hit_rate` stays `None` whenever `dq == 0` (no prefix queries at all → no
+defined hit rate), and the percentiles whenever no request completed in the
+window. A long run of exactly `0` is *not* a gap and not a bug — it means
+queries happened with zero cache hits (verified: 26 870 queries / 0 hits in one
+30 min window). `datasets()` therefore **keeps** those `null` points instead of
+filtering them out, and `spanGaps` is a **time limit** (`gapMs()`, 2.5 × bucket)
+rather than `true` — otherwise Chart.js draws a straight line across an
+hours-long idle phase and invents a trend that was never measured. On top of
+that, `renderMode(data)` decides per series how to draw it: the criterion is not
+how many values there are but whether they *connect* — average length of a
+contiguous run ≥ 5 points → line, below that → scatter plot with visible points.
+Without this a run of one point is invisible at `pointRadius:0`, and a run of two
+is a meaningless vertical stroke. Dense series (tokens/s, KV cache, running
+requests, GPU) are unaffected and keep their line. `compareDatasets()` applies
+the same logic, so the comparison overlay cannot contradict the main series.
+
 The collector evaluates **configurable alert thresholds** (`VLLM_ALERT_KV/TEMP/
 ERR/OFFLINE_MIN`, also read by the dashboard and exposed in `/api/config`) and
 records state transitions (raised/cleared) into an `events` table — one row per

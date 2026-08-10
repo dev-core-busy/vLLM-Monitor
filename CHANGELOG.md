@@ -4,6 +4,28 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.25.0] – 2026-08-10
+
+### Geändert
+- **Gleitendes Fenster für Signale, die nur unter Last existieren**
+  (Prefix-Trefferquote, alle Latenz-Perzentile): Sie werden nicht mehr aus dem
+  Delta zum vorherigen Chart-Bucket berechnet (~76 s – dort meist undefiniert,
+  weil die Server im Leerlauf sind), sondern gegen den Messpunkt ein volles
+  Fenster zurück (`_smooth_window()`: ~1/34 des Zeitraums, mindestens vier
+  Buckets, höchstens eine Stunde → 30 min bei 17 h). Aus 34 Fragmenten à 1,8
+  Punkten werden so 9 Verläufe à 47 Punkten. Die Fensterlänge liefert
+  `/api/series` als `win`; betroffene Kacheln tragen sie im Kopf
+  („· gleitend 35 min").
+- **Messlücken werden nicht mehr überbrückt.** `spanGaps` ist jetzt ein
+  Zeitlimit (2,5 × Bucket) statt `true` – vorher zog Chart.js über stundenlange
+  Leerlaufphasen eine Gerade und erfand damit einen nie gemessenen Verlauf.
+  `datasets()`/`compareDatasets()` behalten die `null`-Punkte, statt sie
+  herauszufiltern.
+- **Darstellungsmodus je Serie** (`renderMode()`): Maßstab ist nicht die Anzahl
+  der Messwerte, sondern ob sie zusammenhängen – Ø-Länge einer zusammenhängenden
+  Strecke ≥ 5 Punkte → Linie, darunter → Streudiagramm mit sichtbaren Punkten.
+  Dichte Serien (Tokens/s, KV-Cache, GPU) bleiben unverändert.
+
 ## [0.24.0] – 2026-07-30
 
 ### Hinzugefügt

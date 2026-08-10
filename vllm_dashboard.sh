@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.24.0"
+__version__ = "0.25.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -233,6 +233,14 @@ def db_span():
     return max(60, int(time.time()) - int(row[0]))
 
 
+def _smooth_window(span, bucket):
+    """Länge des gleitenden Fensters für zeitweise undefinierte Signale.
+
+    Rund 1/34 des dargestellten Zeitraums (17 h -> 30 min, 6 h -> ~10 min,
+    1 h -> ~2 min), mindestens vier Chart-Buckets und höchstens eine Stunde."""
+    return int(max(bucket * 4, min(3600, span / 34.0)))
+
+
 def build_series(range_s, offset_s=0, start=None, end=None):
     if not os.path.exists(DB_PATH):
         return {"error": "Keine Datenbank – läuft der Collector?", "models": {}}
@@ -266,11 +274,22 @@ def build_series(range_s, offset_s=0, start=None, end=None):
     for r in in_window:
         models.setdefault(r["model"], []).append(r)
 
+    # Glättungsfenster für die nur zeitweise definierten Signale (Trefferquote,
+    # Latenz-Perzentile). Über ein einzelnes Bucket (hier 76 s) ist ein solches
+    # Signal fast immer undefiniert, weil das System die meiste Zeit im
+    # Leerlauf ist – das ergibt bestenfalls eine Punktwolke. Über ein
+    # gleitendes Fenster gemittelt entsteht daraus ein auswertbarer Verlauf.
+    win = _smooth_window(end - since, bucket)
+    kwin = max(1, int(round(float(win) / bucket)))
+
     out = {}
     for model, pts in models.items():
         series = []
-        prev = anchor_by_model.get(model)
-        for r in pts:
+        prev = anchor = anchor_by_model.get(model)
+        for i, r in enumerate(pts):
+            # Bezugspunkt ein volles Fenster zurück (am linken Rand so weit
+            # zurück, wie Daten vorhanden sind).
+            base = pts[i - kwin] if i >= kwin else anchor
             p = {
                 "t": (r["ts"] + offset_s) * 1000,   # bei Vergleich aufs aktuelle Fenster projiziert
                 "kv": (_clean(r["kv_cache_usage"]) or 0.0) * 100.0,
@@ -285,24 +304,26 @@ def build_series(range_s, offset_s=0, start=None, end=None):
                     for col, field in RATES.items():
                         d = (r[col] or 0) - (prev[col] or 0)
                         p[field] = round(d / dt, 3) if d >= 0 else None
-                    dq = (r["prefix_queries_total"] or 0) - (prev["prefix_queries_total"] or 0)
-                    dh = (r["prefix_hits_total"] or 0) - (prev["prefix_hits_total"] or 0)
-                    p["hit_rate"] = round(100.0 * dh / dq, 2) if dq > 0 else None
-                    # Perzentile aus Histogramm-Bucket-Deltas
-                    for bcol, (pref, scale) in HISTOS.items():
-                        delta = _bucket_delta(r[bcol], prev[bcol])
-                        for pname, pv in PCTS.items():
-                            q = _percentile(delta, pv) if delta else None
-                            p["%s_%s" % (pref, pname)] = round(q * scale, 2) if q is not None else None
                     # Counter-Reset-Markierung
                     if (r["prompt_tokens_total"] or 0) < (prev["prompt_tokens_total"] or 0):
                         p["reset"] = True
+            # Trefferquote und Perzentile über das gleitende Fenster
+            if base is not None and r["ts"] > base["ts"]:
+                dq = (r["prefix_queries_total"] or 0) - (base["prefix_queries_total"] or 0)
+                dh = (r["prefix_hits_total"] or 0) - (base["prefix_hits_total"] or 0)
+                p["hit_rate"] = round(100.0 * dh / dq, 2) if dq > 0 and dh >= 0 else None
+                # Perzentile aus Histogramm-Bucket-Deltas
+                for bcol, (pref, scale) in HISTOS.items():
+                    delta = _bucket_delta(r[bcol], base[bcol])
+                    for pname, pv in PCTS.items():
+                        q = _percentile(delta, pv) if delta else None
+                        p["%s_%s" % (pref, pname)] = round(q * scale, 2) if q is not None else None
             series.append(_sanitize(p))
             prev = r
         out[model] = series
 
     return {"now": now * 1000, "range": range_s, "bucket": bucket,
-            "offset": offset_s, "models": out}
+            "win": win, "offset": offset_s, "models": out}
 
 
 # --- Energieverbrauch der GPUs (aus der Leistungsaufnahme integriert) --------
@@ -2380,6 +2401,7 @@ PAGE = r"""<!DOCTYPE html>
   .tokbox>div{position:relative;height:250px;}
   #efftok canvas{max-height:none!important;}   /* globale Kachel-Deckelung hier aufheben */
   .card h2{font-size:12px;margin:0 0 6px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;}
+  .card h2 .wnote{text-transform:none;letter-spacing:0;font-weight:400;opacity:.75;}
   .cardbtns{position:absolute;top:5px;right:7px;display:flex;gap:3px;z-index:6;}
   .cbtn{background:var(--panel);border:1px solid var(--border);color:var(--muted);border-radius:5px;
         width:22px;height:20px;font-size:13px;line-height:1;padding:0;cursor:pointer;}
@@ -3276,6 +3298,34 @@ function capacityOf(model){
   return i&&i.capacity_tokens?i.capacity_tokens:null;
 }
 
+// Maximale Messlücke, über die eine Linie noch durchgezogen wird.
+// Ohne dieses Limit verbindet Chart.js zwei Punkte beiderseits einer stunden-
+// langen Lücke zu einer Geraden – die dann einen Verlauf zeigt, den es nie gab
+// (z. B. Prefix-Hit-Rate: im Leerlauf gibt es keine Anfragen und damit keinen
+// definierten Wert, kein linear steigendes Signal).
+function gapMs(){
+  const b=(lastData&&lastData.bucket)?lastData.bucket:15;
+  return Math.max(b*2.5,60)*1000;
+}
+// Serien, die serverseitig über ein gleitendes Fenster gemittelt werden
+// (siehe _smooth_window): Trefferquote und Latenz-Perzentile.
+function isSmoothed(spec){
+  return !spec.custom && fieldsFor(spec).some(f=>f.k==="hit_rate"||/_p\d+$/.test(f.k));
+}
+// Darstellungsmodus je Serie. Entscheidend ist nicht, wie viele Messwerte es
+// gibt, sondern ob sie zusammenhängen: Signale, die nur während laufender
+// Anfragen existieren (Latenz-Perzentile, Prefix-Hit-Rate), zerfallen in viele
+// sehr kurze Fragmente. Eine Linie erfindet dort Verläufe und macht aus zwei
+// benachbarten Messungen einen sinnlosen senkrechten Strich, während einzelne
+// Messwerte mit pointRadius 0 komplett unsichtbar wären. Solche Serien werden
+// als Streudiagramm gezeichnet, zusammenhängende weiterhin als Linie.
+function renderMode(data){
+  let n=data.length,v=0,segs=0,inSeg=false;
+  data.forEach(p=>{ if(p.y!=null){v++; if(!inSeg){segs++;inSeg=true;}} else inSeg=false; });
+  if(!v||v===n) return {r:0,line:true};
+  if(v/segs>=5) return {r:v>400?0:1.2,line:true};   // Lücken, aber lange Strecken
+  return {r:v>400?1.4:v>150?1.8:2.4,line:false};    // fragmentiert -> Punkte
+}
 function datasets(models,spec){
   const names=Object.keys(models).sort();
   const ds=[];
@@ -3288,14 +3338,22 @@ function datasets(models,spec){
         let y=p[f.k];
         if(spec.id==="kvtok"){y=(cap&&p.kv!=null)?Math.round(p.kv/100*cap):null;}
         else if(spec.id==="vram"){y=(p.vram_bytes!=null)?Math.round(p.vram_bytes/1e7)/100:null;}
-        return {x:p.t,y};
-      }).filter(p=>p.y!==null&&p.y!==undefined);
+        return {x:p.t,y:(y===undefined?null:y)};
+      });
       let anomSet=null;
       if(window._anomOn){ const a=detectAnomalies(data); if(a.count) anomSet=new Set(a.items.map(i=>i.t)); }
+      const rm=renderMode(data);
       ds.push({label:shortModel(name)+(f.l?" · "+f.l:""),data,borderColor:color,backgroundColor:color,
-               borderDash:f.dash||[],borderWidth:1.8,tension:.25,spanGaps:true,
-               pointRadius: anomSet?(ctx=>{const r=ctx.raw;return r&&anomSet.has(r.x)?3.5:0;}):0,
-               pointBackgroundColor:"#ff4d4f",pointBorderColor:"#ff4d4f"});
+               borderDash:f.dash||[],borderWidth:1.8,tension:rm.line?.25:0,
+               spanGaps:gapMs(),showLine:rm.line,
+               pointRadius: (anomSet||rm.r)?(ctx=>{const r=ctx.raw;
+                 return (anomSet&&r&&anomSet.has(r.x))?3.5:rm.r;}):0,
+               pointHoverRadius:4,
+               pointBackgroundColor: anomSet?(ctx=>{const r=ctx.raw;
+                 return (r&&anomSet.has(r.x))?"#ff4d4f":color;}):color,
+               pointBorderColor: anomSet?(ctx=>{const r=ctx.raw;
+                 return (r&&anomSet.has(r.x))?"#ff4d4f":color;}):color,
+               pointBorderWidth:0});
     });
   });
   return ds;
@@ -3314,10 +3372,13 @@ function compareDatasets(models,spec){
       const data=models[name].map(p=>{ let y=p[f.k];
         if(spec.id==="kvtok"){y=(cap&&p.kv!=null)?Math.round(p.kv/100*cap):null;}
         else if(spec.id==="vram"){y=(p.vram_bytes!=null)?Math.round(p.vram_bytes/1e7)/100:null;}
-        return {x:p.t,y};
-      }).filter(p=>p.y!==null&&p.y!==undefined);
+        return {x:p.t,y:(y===undefined?null:y)};
+      });
+      const rm=renderMode(data);
       ds.push({label:shortModel(name)+(f.l?" · "+f.l:"")+" · Vgl.",data,borderColor:color,
-               backgroundColor:color,borderDash:[5,4],borderWidth:1.2,pointRadius:0,tension:.25,spanGaps:true});
+               backgroundColor:color,borderDash:[5,4],borderWidth:1.2,
+               pointRadius:rm.r,pointBorderWidth:0,pointHoverRadius:3,
+               tension:rm.line?.25:0,spanGaps:gapMs(),showLine:rm.line});
     });
   });
   return ds;
@@ -3358,6 +3419,13 @@ function withCompare(dsets,spec){
 }
 function redrawCharts(models){
   PLOTS.forEach(spec=>{charts[spec.id].data.datasets=withCompare(datasets(models,spec),spec);charts[spec.id].update();});
+  // Geglättete Kacheln beschriften – ohne die Fensterlänge ist der Verlauf
+  // nicht interpretierbar.
+  const w=lastData&&lastData.win;
+  PLOTS.filter(isSmoothed).forEach(spec=>{
+    const el=document.getElementById("wn_"+spec.id);
+    if(el) el.textContent=w?" · gleitend "+durTxt(w):"";
+  });
 }
 
 function num(v,d){return v==null?"–":(typeof v==="number"?(Number.isInteger(v)?v:v.toFixed(d==null?1:d)):v);}
@@ -3647,7 +3715,8 @@ function buildGrid(){
              `<button class="cbtn close" title="Kachel ausblenden">✕</button></div>`;
   orderBy(CHARTS,saved,s=>s.id).forEach(spec=>{
     const d=document.createElement("div");d.className="card";d.dataset.id=spec.id;
-    d.innerHTML=btns(spec)+`<h2 title="${spec.desc||""}"><span class="grip" title="Ziehen zum Verschieben">⠿</span>${spec.title}</h2>`
+    d.innerHTML=btns(spec)+`<h2 title="${spec.desc||""}"><span class="grip" title="Ziehen zum Verschieben">⠿</span>${spec.title}`
+      +(isSmoothed(spec)?`<span class="wnote" id="wn_${spec.id}"></span>`:"")+`</h2>`
       +(spec.custom||`<div class="chartwrap"><canvas id="c_${spec.id}"></canvas></div>`);
     g.appendChild(d);
   });
