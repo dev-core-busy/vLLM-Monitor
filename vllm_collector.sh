@@ -36,7 +36,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.25.0"
+__version__ = "0.25.1"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)

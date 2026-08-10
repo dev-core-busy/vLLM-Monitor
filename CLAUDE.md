@@ -84,6 +84,19 @@ how many lines the heading wraps to, and makes `toggleMax()` free of manual
 height math — the flex child fills the maximized card exactly, so nothing
 scrolls. **New tiles must wrap their canvas in `.chartwrap`.**
 
+**Numbers are always formatted.** With a `linear` x-axis Chart.js prints the raw
+epoch value in the tooltip title (`1.770.844.123.000`) and the unrounded y value
+— unreadable. `mkChart()` therefore always sets `tooltip.callbacks`
+(`fmtTime()` for the title, `fmtNum()` + the spec's `unit` for the label,
+`filter` drops `null` points) and `fmtAxis()` for the y ticks; comparison
+datasets carry `cmpOff` so their real timestamp can be shown next to the
+projected one. `fmtNum()`/`decFor()`/`fmtAxis()`/`fmtTime()` are **function
+declarations** (hoisted — a tile may draw during boot) and use `de-DE`
+formatting; `num()` and `fmtBig()` route through them. **A new tile needs a
+`unit` in its CHARTS entry**, and any additional `new Chart(...)` needs its own
+tooltip callbacks — the axis may abbreviate (Mio/Tsd), the tooltip shows the
+exact value.
+
 **Signals that only exist under load** (`hit_rate`, all latency percentiles) are
 **not** derived from the delta to the previous chart bucket — over a single
 bucket (~76 s in a 17 h window) they are undefined most of the time, because the

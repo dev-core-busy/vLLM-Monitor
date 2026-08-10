@@ -4,6 +4,22 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.25.1] – 2026-08-10
+
+### Behoben
+- **Lesbare Zahlen in allen Diagrammen.** Die Zeitreihen-Kacheln hatten keine
+  Tooltip-Callbacks; bei einer linearen X-Achse zeigte Chart.js deshalb den
+  rohen Zeitstempel in Millisekunden („1.770.844.123.000") und den Y-Wert
+  ungerundet („96.68999999999998"). Der Tooltip nennt jetzt den vollständigen
+  Zeitpunkt („Mo., 10.08.2026, 02:59:49 Uhr") und den Wert in deutscher
+  Schreibweise samt Einheit („GPU 0: 96,7 GB"); `null`-Punkte werden
+  ausgefiltert. Vergleichslinien führen zusätzlich ihren echten Zeitpunkt mit,
+  da sie aufs aktuelle Fenster projiziert sind.
+- Y-Achsen kürzen große Werte (`1,4 Mio` statt `1400000`), Balken-Tooltips
+  zeigen weiterhin die exakte Zahl. Jede Kachel trägt dafür eine `unit`;
+  `num()` und `fmtBig()` nutzen dieselben Formatierer, damit KPI-Zeile und
+  Diagramme gleich schreiben.
+
 ## [0.25.0] – 2026-08-10
 
 ### Geändert

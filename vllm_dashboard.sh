@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.25.0"
+__version__ = "0.25.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -2949,17 +2949,17 @@ const COLORS=["#58a6ff","#f778ba","#3fb950","#d29922","#a371f7","#ff7b72"];
 if(window.ChartZoom) Chart.register(window.ChartZoom);
 
 const CHARTS=[
- {id:"kv",title:"KV-Cache-Auslastung (%)",fields:[{k:"kv"}],max:100,threshold:90,
+ {id:"kv",title:"KV-Cache-Auslastung (%)",unit:"%",fields:[{k:"kv"}],max:100,threshold:90,
   desc:"Belegung des KV-Caches – des GPU-Speichers für die Kontexte laufender Requests.\n100 % = voll: neue oder lange Anfragen müssen warten oder werden verdrängt.\nDauerhaft hohe Werte deuten auf einen Speicherengpass hin."},
- {id:"kvtok",title:"KV-Belegung (Tokens, rel. zur Kapazität)",fields:[{k:"kv_tokens"}],
+ {id:"kvtok",title:"KV-Belegung (Tokens, rel. zur Kapazität)",unit:"Tokens",fields:[{k:"kv_tokens"}],
   desc:"Belegte KV-Cache-Tokens, absolut statt in Prozent.\nBezugsgröße ist die Kapazität num_gpu_blocks × block_size.\nZeigt, wie viel Kontext gleichzeitig im GPU-Speicher liegt."},
- {id:"vram",title:"VRAM-Belegung (GB)",fields:[{k:"vram_bytes"}],
+ {id:"vram",title:"VRAM-Belegung (GB)",unit:"GB",fields:[{k:"vram_bytes"}],
   desc:"Belegter GPU-Speicher in GB.\nQuelle: DCGM (FB_USED je GPU) bzw. Ollama /api/ps (size_vram).\nBei vLLM-Instanzen nicht verfügbar – dort bleibt das Panel leer."},
- {id:"gpu_util",title:"GPU-Auslastung (%)",fields:[{k:"gpu_util",l:"SM"},{k:"gpu_mem_util",l:"Mem",dash:[4,3]}],max:100,
+ {id:"gpu_util",title:"GPU-Auslastung (%)",unit:"%",fields:[{k:"gpu_util",l:"SM"},{k:"gpu_mem_util",l:"Mem",dash:[4,3]}],max:100,
   desc:"GPU-Hardware-Auslastung (NVIDIA DCGM).\nSM = Rechenwerk-Auslastung, Mem = Speicher-Kopier-Auslastung.\nNur für GPU-Instanzen (DCGM-Exporter)."},
- {id:"gpu_temp",title:"GPU-Temperatur (°C)",fields:[{k:"gpu_temp"}],
+ {id:"gpu_temp",title:"GPU-Temperatur (°C)",unit:"°C",fields:[{k:"gpu_temp"}],
   desc:"GPU-Kerntemperatur in °C (NVIDIA DCGM).\nSteigt unter Last; Drosselung droht bei Überhitzung.\nNur für GPU-Instanzen."},
- {id:"gpu_power",title:"GPU-Leistung (W)",fields:[{k:"gpu_power"}],
+ {id:"gpu_power",title:"GPU-Leistung (W)",unit:"W",fields:[{k:"gpu_power"}],
   desc:"Aktuelle Leistungsaufnahme der GPU in Watt (NVIDIA DCGM).\nIndikator für Auslastung/Energieverbrauch.\nNur für GPU-Instanzen."},
  // eigene Kachel: Balkendiagramm statt Zeitreihe -> eigene Chart-Instanz in renderEnergy()
  {id:"energy",title:"GPU-Verbrauch",
@@ -2973,25 +2973,25 @@ const CHARTS=[
          '<div class="ebig" id="tokensbig"></div>'+
          '<div class="chartwrap energywrap"><canvas id="c_tokens"></canvas></div>',
   desc:"Generierte Tokens je Kalendertag im gewählten Zeitraum.\nAus den kumulativen Countern über positive Deltas gebildet\n(Counter-Resets beim Server-Neustart werden verworfen).\nDie Vorschau zeigt die Gesamtsumme; das Balkendiagramm erscheint maximiert."},
- {id:"req",title:"Requests aktiv / wartend",fields:[{k:"running",l:"aktiv"},{k:"waiting",l:"wartend",dash:[4,3]}],
+ {id:"req",title:"Requests aktiv / wartend",unit:"Requests",fields:[{k:"running",l:"aktiv"},{k:"waiting",l:"wartend",dash:[4,3]}],
   desc:"Anzahl der gerade verarbeiteten (aktiv) und in der Warteschlange\nstehenden (wartend) Anfragen dieses Modells.\nWartend > 0 heißt: die Instanz ist an der Kapazitätsgrenze."},
- {id:"waitreason",title:"Wartend nach Grund",fields:[{k:"waiting_capacity",l:"capacity"},{k:"waiting_deferred",l:"deferred",dash:[4,3]}],
+ {id:"waitreason",title:"Wartend nach Grund",unit:"Requests",fields:[{k:"waiting_capacity",l:"capacity"},{k:"waiting_deferred",l:"deferred",dash:[4,3]}],
   desc:"Warum Requests warten:\n'capacity' = keine Scheduling-/Speicherkapazität (echte Last).\n'deferred' = vorübergehende Beschränkung (z. B. KV-Transfer, LoRA-Budget)."},
- {id:"preempt",title:"Preemptions/s",fields:[{k:"preempt_ps"}],
+ {id:"preempt",title:"Preemptions/s",unit:"/s",fields:[{k:"preempt_ps"}],
   desc:"Rate der verdrängten Requests pro Sekunde.\n> 0 = KV-Cache-Druck: laufende Sequenzen werden pausiert und später\nneu berechnet – das kostet zusätzliche Zeit und Durchsatz."},
- {id:"gen",title:"Generierung (Tokens/s)",fields:[{k:"gen_tps"}],
+ {id:"gen",title:"Generierung (Tokens/s)",unit:"Tok/s",fields:[{k:"gen_tps"}],
   desc:"Ausgabe-Durchsatz: erzeugte Tokens pro Sekunde über alle Requests.\nKernmaß für die Antwortgeschwindigkeit unter Last.\nSinkt, wenn KV-Cache oder GPU zum Flaschenhals werden."},
- {id:"prompt",title:"Prompt-Durchsatz (Tokens/s)",fields:[{k:"prompt_tps"}],
+ {id:"prompt",title:"Prompt-Durchsatz (Tokens/s)",unit:"Tok/s",fields:[{k:"prompt_tps"}],
   desc:"Verarbeitete Eingabe-(Prefill-)Tokens pro Sekunde.\nHoch bei langen Prompts oder vielen neuen Anfragen\n(typisch für RAG und Zusammenfassungen)."},
- {id:"ttft",title:"Time-to-First-Token (ms)",pct:"ttft",
+ {id:"ttft",title:"Time-to-First-Token (ms)",unit:"ms",pct:"ttft",
   desc:"Zeit bis zum ersten Antwort-Token (gewähltes Perzentil).\nMaß für die gefühlte Reaktionszeit des Modells.\nSteigt bei Warteschlange oder langen Eingabe-Prompts."},
- {id:"e2e",title:"E2E-Latenz (s)",pct:"e2e",
+ {id:"e2e",title:"E2E-Latenz (s)",unit:"s",pct:"e2e",
   desc:"Gesamtdauer eines Requests: von Eingang bis zum letzten Token\n(gewähltes Perzentil). Enthält Warten + Prefill + Generierung.\nWichtigste Nutzer-Kennzahl für die Antwortdauer."},
- {id:"itl",title:"Inter-Token-Latenz (ms)",pct:"itl",
+ {id:"itl",title:"Inter-Token-Latenz (ms)",unit:"ms",pct:"itl",
   desc:"Durchschnittlicher Abstand zwischen zwei Ausgabe-Tokens\n(gewähltes Perzentil). Bestimmt, wie flüssig die Antwort 'tippt'.\nHohe Werte = ruckelige/langsame Ausgabe."},
- {id:"finish",title:"Requests nach Ergebnis (/s)",fields:[{k:"stop_ps",l:"stop"},{k:"error_ps",l:"error"},{k:"abort_ps",l:"abort",dash:[4,3]},{k:"length_ps",l:"length",dash:[2,2]}],
+ {id:"finish",title:"Requests nach Ergebnis (/s)",unit:"/s",fields:[{k:"stop_ps",l:"stop"},{k:"error_ps",l:"error"},{k:"abort_ps",l:"abort",dash:[4,3]},{k:"length_ps",l:"length",dash:[2,2]}],
   desc:"Abschlussrate nach Grund pro Sekunde:\nstop = normal beendet, length = Längenlimit erreicht,\nabort = abgebrochen, error = Fehler. error/abort > 0 = Probleme."},
- {id:"hit",title:"Prefix-Cache-Hit-Rate (%)",fields:[{k:"hit_rate"}],max:100,
+ {id:"hit",title:"Prefix-Cache-Hit-Rate (%)",unit:"%",fields:[{k:"hit_rate"}],max:100,
   desc:"Anteil der Prompt-Tokens, die aus dem Prefix-Cache wiederverwendet\nwurden statt neu berechnet zu werden.\nHoch = effizient bei wiederkehrenden Prompt-Anfängen (System-Prompts, RAG)."},
 ];
 
@@ -3265,8 +3265,37 @@ function tickLabel(v){
   return sp>36*3600 ? day+" "+hm : hm;
 }
 
+// --- Zahlenformat für Tooltip und Achsen -----------------------------------
+// Deutsche Schreibweise mit Tausenderpunkt und einer Nachkommastellenzahl nach
+// Größenordnung (14.336 Tokens, 21,45 GB, 0,004 /s) statt der Rohausgabe.
+// Bewusst Funktionsdeklarationen: gehoistet und damit auch verfügbar, wenn eine
+// Kachel schon während des Bootens zeichnet.
+function decFor(v){
+  const a=Math.abs(v);
+  if(a>=100)return 0; if(a>=10)return 1; if(a>=1)return 2;
+  return a>0?3:0;
+}
+function fmtNum(v,d){
+  if(v==null||typeof v!=="number"||!isFinite(v))return "–";
+  return v.toLocaleString("de-DE",{maximumFractionDigits:(d==null?decFor(v):d)});
+}
+// Achsen brauchen kurze Beschriftungen, sonst überlappen die Ticks
+function fmtAxis(v){
+  const a=Math.abs(v);
+  if(a>=1e6)return fmtNum(v/1e6,1)+" Mio";
+  if(a>=1e4)return fmtNum(v/1e3,0)+" Tsd";
+  return fmtNum(v);
+}
+// Vollständiger Zeitpunkt im Tooltip – die X-Achse zeigt nur die Uhrzeit
+function fmtTime(x){
+  const d=new Date(x);
+  return d.toLocaleDateString("de-DE",{weekday:"short",day:"2-digit",month:"2-digit",year:"numeric"})
+    +", "+d.toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit",second:"2-digit"})+" Uhr";
+}
+
 function mkChart(spec){
   const ctx=document.getElementById("c_"+spec.id);
+  const unit=spec.unit?" "+spec.unit:"";
   const yMax=spec.max?{max:spec.max}:{};
   charts[spec.id]=new Chart(ctx,{type:"line",data:{datasets:[]},plugins:[overlay],
     options:{animation:false,responsive:true,maintainAspectRatio:false,
@@ -3278,10 +3307,26 @@ function mkChart(spec){
         if(hit&&confirm('Annotation „'+hit.label+'" löschen?')) delAnnotation(hit.id);},
       scales:{
         x:{type:"linear",ticks:{callback:v=>tickLabel(v),maxRotation:0,color:css("--muted")},grid:{color:css("--grid")}},
-        y:{beginAtZero:true,...yMax,ticks:{color:css("--muted")},grid:{color:css("--grid")}}
+        y:{beginAtZero:true,...yMax,ticks:{color:css("--muted"),callback:v=>fmtAxis(v)},grid:{color:css("--grid")}}
       },
       plugins:{
         legend:{display:false},
+        tooltip:{callbacks:{
+          // Ohne diese Callbacks zeigt Chart.js bei einer linearen X-Achse den
+          // rohen Zeitstempel in Millisekunden ("1.770.844.123.000") und den
+          // Y-Wert ungerundet – beides unlesbar.
+          title:items=>items.length?fmtTime(items[0].parsed.x):"",
+          label:c=>{
+            const y=c.parsed.y; if(y==null)return null;
+            // Vergleichslinien liegen aufs aktuelle Fenster projiziert –
+            // dazu der echte Zeitpunkt, sonst zeigt der Tooltip zwei Werte
+            // zur selben Uhrzeit ohne Hinweis auf den anderen Zeitraum.
+            const off=c.dataset.cmpOff;
+            const orig=off?" ("+new Date(c.parsed.x-off*1000)
+              .toLocaleString("de-DE",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})+")":"";
+            return c.dataset.label+": "+fmtNum(y)+unit+orig;
+          }},
+          filter:item=>item.parsed.y!=null},
         zoom:{pan:{enabled:false,mode:"x"},zoom:{wheel:{enabled:false},drag:{enabled:false},pinch:{enabled:false},mode:"x"}},
         annotation:false
       }}});
@@ -3376,6 +3421,7 @@ function compareDatasets(models,spec){
       });
       const rm=renderMode(data);
       ds.push({label:shortModel(name)+(f.l?" · "+f.l:"")+" · Vgl.",data,borderColor:color,
+               cmpOff:compareOffset(),
                backgroundColor:color,borderDash:[5,4],borderWidth:1.2,
                pointRadius:rm.r,pointBorderWidth:0,pointHoverRadius:3,
                tension:rm.line?.25:0,spanGaps:gapMs(),showLine:rm.line});
@@ -3428,7 +3474,9 @@ function redrawCharts(models){
   });
 }
 
-function num(v,d){return v==null?"–":(typeof v==="number"?(Number.isInteger(v)?v:v.toFixed(d==null?1:d)):v);}
+// Kennzahlen der KPI-Zeile: gleiche deutsche Schreibweise wie in den Diagrammen
+function num(v,d){return v==null?"–":(typeof v==="number"
+  ?fmtNum(v,Number.isInteger(v)?0:(d==null?1:d)):v);}
 function durTxt(sec){ if(sec==null)return "–"; sec=Math.floor(sec);
   if(sec<60)return sec+" s"; if(sec<3600)return Math.floor(sec/60)+" min";
   const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60); return h+" h"+(m?" "+m+" min":""); }
@@ -4394,9 +4442,10 @@ function renderTokensTile(){
   const labels=days.map(d=>new Date(d.date+"T12:00:00")
     .toLocaleDateString("de-DE",{day:"2-digit",month:"2-digit"}));
   const data=days.map(d=>d.gen);
+  // Im Tooltip die genaue Zahl – die Kurzform (Mio/Tsd) steht schon am Balken
   const tip=i=>{ const d=days[i], dt=new Date(d.date+"T12:00:00");
     return [dt.toLocaleDateString("de-DE",{weekday:"long",day:"2-digit",month:"2-digit",year:"numeric"}),
-            fmtBig(d.gen)+" generiert", fmtBig(d.prompt)+" Prompt"]; };
+            fmtNum(d.gen,0)+" Tokens generiert", fmtNum(d.prompt,0)+" Prompt-Tokens"]; };
   if(!tokTileChart){
     tokTileChart=new Chart(cv,{type:"bar",plugins:[tokbarvals,tokavgline],
       data:{labels,datasets:[{data,backgroundColor:"#3fb950",borderWidth:0,borderRadius:2}]},
@@ -4441,8 +4490,8 @@ async function delAnnotation(id){
 })();
 function avgField(series,key){ let s=0,n=0; series.forEach(p=>{const v=p[key]; if(v!=null&&!isNaN(v)){s+=v;n++;}}); return n?s/n:null; }
 function fmtBig(v){ if(v==null)return "–"; const a=Math.abs(v);
-  if(a>=1e9)return (v/1e9).toFixed(1)+" Mrd"; if(a>=1e6)return (v/1e6).toFixed(1)+" Mio";
-  if(a>=1e3)return (v/1e3).toFixed(0)+" Tsd"; return Math.round(v).toString(); }
+  if(a>=1e9)return fmtNum(v/1e9,1)+" Mrd"; if(a>=1e6)return fmtNum(v/1e6,1)+" Mio";
+  if(a>=1e3)return fmtNum(v/1e3,0)+" Tsd"; return fmtNum(Math.round(v),0); }
 function renderEfficiency(){
   const body=document.getElementById("effbody"); if(!body||!lastData)return;
   let totTps=0, gpuUtil=null, gpuPow=null;
@@ -4485,7 +4534,8 @@ function renderRangeTokenChart(){
       options:{animation:false,responsive:true,maintainAspectRatio:false,
         scales:{x:{ticks:{color:css("--muted"),maxRotation:0,autoSkip:false},grid:{display:false}},
                 y:{beginAtZero:true,ticks:{color:css("--muted"),callback:v=>fmtBig(v)},grid:{color:css("--grid")}}},
-        plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>fmtBig(c.parsed.y)+" Tok"}}}}});
+        plugins:{legend:{display:false},
+          tooltip:{callbacks:{label:c=>fmtNum(Math.round(c.parsed.y),0)+" Tokens"}}}}});
   } else {
     rangeTokChart.data.labels=labels; rangeTokChart.data.datasets[0].data=data;
     rangeTokChart.data.datasets[0].backgroundColor=colors; rangeTokChart.update();
@@ -4513,7 +4563,10 @@ function renderTokenChart(data){
         scales:{x:{stacked:true,ticks:{color:css("--muted"),maxRotation:0,autoSkip:true,maxTicksLimit:14},grid:{display:false}},
                 y:{stacked:true,beginAtZero:true,ticks:{color:css("--muted"),callback:v=>fmtBig(v)},grid:{color:css("--grid")}}},
         plugins:{legend:{display:models.length>1,labels:{color:css("--muted"),boxWidth:10,font:{size:10}}},
-          tooltip:{callbacks:{label:c=>c.dataset.label+": "+fmtBig(c.parsed.y)+" Tok"}}}}});
+          tooltip:{callbacks:{
+            title:c=>c.length?new Date(c[0].label+"T12:00:00")
+              .toLocaleDateString("de-DE",{weekday:"long",day:"2-digit",month:"2-digit",year:"numeric"}):"",
+            label:c=>c.dataset.label+": "+fmtNum(Math.round(c.parsed.y),0)+" Tokens"}}}}});
   } else {
     tokChart.data.labels=labels; tokChart.data.datasets=dsets;
     tokChart.options.plugins.legend.display=models.length>1; tokChart.update();
