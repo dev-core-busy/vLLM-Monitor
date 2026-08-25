@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.25.1"
+__version__ = "0.26.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -2700,6 +2700,13 @@ PAGE = r"""<!DOCTYPE html>
       <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Generierte Tokens pro Tag – seit Aufzeichnungsbeginn (je Modell gestapelt)</div>
       <div class="tokbox"><div><canvas id="tokchart"></canvas></div></div>
     </div>
+    <div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Generierte Tokens pro Tag – seit Aufzeichnungsbeginn (kumuliert)
+        <label style="margin-left:10px;cursor:pointer" title="Logarithmische y-Achse: exponentielles Wachstum wird zur Geraden">
+          <input type="checkbox" id="cumtoklog" style="vertical-align:-1px"> log. Achse</label>
+        <span id="cumtokrate" style="margin-left:10px"></span></div>
+      <div class="tokbox"><div><canvas id="cumtokchart"></canvas></div></div>
+    </div>
   </div>
 </div>
 
@@ -3091,6 +3098,9 @@ function applyLoadedPrefs(){
   applyCollapse("instcard","insttoggle","vllm_inst_collapsed",true);
   applyCollapse("alertcard","alerttoggle","vllm_alert_collapsed",false);
   applyCollapse("effcard","efftoggle","vllm_eff_collapsed",false);
+  try{ const lg=document.getElementById("cumtoklog");
+       lg.checked=store.get("vllm_cumtok_log")==="1";
+       if(lastTokens) renderCumTokenChart(lastTokens); }catch(e){}
 }
 // Vorhandene DOM-Karten (mit data-id) in die gespeicherte Reihenfolge bringen,
 // ohne sie neu zu erzeugen (buildGrid/renderKPIs laufen sonst nur einmal).
@@ -3744,6 +3754,8 @@ function applyTheme(t){document.body.dataset.theme=t;store.set("vllm_theme",t);
   if(rangeTokChart){ rangeTokChart.options.scales.x.ticks.color=css("--muted");
     rangeTokChart.options.scales.y.ticks.color=css("--muted"); rangeTokChart.options.scales.y.grid.color=css("--grid");
     renderRangeTokenChart(); }
+  if(cumTokChart && lastTokens){ cumTokChart.options.scales.x.ticks.color=css("--muted");
+    renderCumTokenChart(lastTokens); }   // Linien-/Achsenfarben werden dort neu gesetzt
   if(energyChart){ const o=energyChart.options.scales;
     o.x.ticks.color=o.y.ticks.color=o.y.title.color=css("--muted");
     o.x.border.color=o.y.border.color=css("--border"); o.y.grid.color=css("--grid");
@@ -4021,7 +4033,7 @@ document.getElementById("an_copy").onclick=()=>{
   if(navigator.clipboard)navigator.clipboard.writeText(txt).catch(()=>{});
 };
 
-let tokChart=null, rangeTokChart=null, lastTokens=null, _tokTs=0;   // früh deklariert (applyTheme greift darauf zu)
+let tokChart=null, rangeTokChart=null, cumTokChart=null, lastTokens=null, _tokTs=0;   // früh deklariert (applyTheme greift darauf zu)
 let energyChart=null, lastEnergy=null;                              // dito – applyTheme läuft vor renderEnergy
 let tokTileChart=null, lastTokenTile=null;                          // Token-Zähler-Kachel (analog energyChart)
 buildGrid();
@@ -4486,7 +4498,8 @@ async function delAnnotation(id){
   sync();
   et.onclick=()=>{ const collapsed=ec.classList.toggle("collapsed"); store.set("vllm_eff_collapsed", collapsed?"1":"0"); sync();
     if(!collapsed){ fetchTokens(true); renderRangeTokenChart();
-      setTimeout(()=>{ try{ tokChart&&tokChart.resize(); rangeTokChart&&rangeTokChart.resize(); }catch(e){} },60); } };
+      setTimeout(()=>{ try{ tokChart&&tokChart.resize(); rangeTokChart&&rangeTokChart.resize();
+                            cumTokChart&&cumTokChart.resize(); }catch(e){} },60); } };
 })();
 function avgField(series,key){ let s=0,n=0; series.forEach(p=>{const v=p[key]; if(v!=null&&!isNaN(v)){s+=v;n++;}}); return n?s/n:null; }
 function fmtBig(v){ if(v==null)return "–"; const a=Math.abs(v);
@@ -4546,7 +4559,8 @@ async function fetchTokens(force){
   const now=Date.now();
   if(!force && now-_tokTs<55000) return;   // deckt sich mit dem 60-s-Server-Cache
   _tokTs=now;
-  try{ lastTokens=await(await fetch("/api/tokens")).json(); renderTokenChart(lastTokens); }catch(e){}
+  try{ lastTokens=await(await fetch("/api/tokens")).json();
+       renderTokenChart(lastTokens); renderCumTokenChart(lastTokens); }catch(e){}
 }
 function renderTokenChart(data){
   const cv=document.getElementById("tokchart"); if(!cv||!data)return;
@@ -4572,6 +4586,101 @@ function renderTokenChart(data){
     tokChart.options.plugins.legend.display=models.length>1; tokChart.update();
   }
 }
+// Liniendiagramm: kumulierte generierte Tokens seit Aufzeichnungsbeginn
+function isoDay(d){ const p=n=>String(n).padStart(2,"0");
+  return d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate()); }
+function cumTokenSeries(data){
+  const days=(data&&data.days)||[]; if(!days.length) return null;
+  const models=data.models||[], byDate={}; days.forEach(d=>byDate[d.date]=d);
+  // Lückenlose Kalendertage – Tage ohne Messung fehlen in days[] und würden die
+  // Kategorie-Achse stauchen, also die Kurvenform verfälschen.
+  const labels=[], end=new Date(days[days.length-1].date+"T12:00:00");
+  for(let t=new Date(days[0].date+"T12:00:00"); t<=end; t.setDate(t.getDate()+1)) labels.push(isoDay(t));
+  const tot=[], per={}, cm={}; let ct=0;
+  models.forEach(m=>per[m]=[]);
+  labels.forEach(dt=>{ const d=byDate[dt];
+    if(d){ ct+=d.gen; models.forEach(m=>{ cm[m]=(cm[m]||0)+(d.models[m]||0); }); }
+    tot.push(ct); models.forEach(m=>per[m].push(cm[m]||0)); });
+  return {labels, tot, per, models};
+}
+// Lineare Regression -> Steigung und Bestimmtheitsmaß R².
+function linReg(xs,ys){
+  const n=xs.length; if(n<3) return null;
+  const mx=xs.reduce((a,b)=>a+b,0)/n, my=ys.reduce((a,b)=>a+b,0)/n;
+  let sxy=0,sxx=0,syy=0;
+  for(let i=0;i<n;i++){ const dx=xs[i]-mx, dy=ys[i]-my; sxy+=dx*dy; sxx+=dx*dx; syy+=dy*dy; }
+  if(!sxx||!syy) return null;
+  return {slope:sxy/sxx, r2:(sxy*sxy)/(sxx*syy)};
+}
+// Wächst die Kurve exponentiell oder linear? Der Fit über ln(y) macht aus
+// exponentiellem Wachstum eine Gerade; verglichen wird er gegen den linearen
+// Fit über dieselben Punkte. Der erste Tag bleibt außen vor – die Aufzeichnung
+// startet mitten am Tag, sein Wert ist ein angebrochener und im Log-Raum ein
+// massiver Ausreißer (real gemessen: R² 0,41 mit, 0,98 ohne).
+function fitInfo(vals){
+  const from = vals.length>=6 ? 1 : 0;
+  const xs=[], ly=[], y=[];
+  for(let i=from;i<vals.length;i++){ if(vals[i]>0){ xs.push(i); ly.push(Math.log(vals[i])); y.push(vals[i]); } }
+  const ex=linReg(xs,ly), li=linReg(xs,y);
+  if(!ex||!li) return null;
+  return {growth:Math.exp(ex.slope)-1, dbl:(ex.slope>0?Math.LN2/ex.slope:null),
+          expR2:ex.r2, linSlope:li.slope, linR2:li.r2};
+}
+function renderCumTokenChart(data){
+  const cv=document.getElementById("cumtokchart"); if(!cv)return;
+  const s=cumTokenSeries(data); if(!s)return;
+  const log=document.getElementById("cumtoklog").checked;
+  const clip=v=>(log && !(v>0)) ? null : v;   // log-Achse kann 0 nicht darstellen
+  const dsets=[{label:"gesamt", data:s.tot.map(clip), borderColor:css("--accent"),
+                backgroundColor:css("--accent")+"22", borderWidth:2, pointRadius:0,
+                fill:!log, tension:0.15, order:0}];
+  if(s.models.length>1) s.models.forEach(m=>dsets.push({
+    label:shortModel(m), data:s.per[m].map(clip), borderColor:colorFor(m),
+    borderWidth:1.2, pointRadius:0, fill:false, tension:0.15, order:1 }));
+  const hint=document.getElementById("cumtokrate"), f=fitInfo(s.tot);
+  if(hint){
+    let h="";
+    if(f && f.expR2>=f.linR2){
+      h="exponentiell: "+(f.growth>=0?"+":"")+fmtNum(f.growth*100,1)+" %/Tag"+
+        (f.dbl?" · Verdopplung ≈ "+fmtNum(f.dbl,1)+" Tage":"")+
+        " (R²="+fmtNum(f.expR2,2)+", linear "+fmtNum(f.linR2,2)+")";
+    } else if(f){
+      h="eher linear: Ø +"+fmtBig(f.linSlope)+" Tokens/Tag"+
+        " (R²="+fmtNum(f.linR2,2)+", exponentiell "+fmtNum(f.expR2,2)+")";
+    }
+    hint.textContent=h;
+    hint.title="Regression über die kumulierte Kurve ohne den ersten (angebrochenen) Aufzeichnungstag; "+
+               "verglichen werden exponentieller und linearer Verlauf über R².";
+  }
+  // Log-Achse: Chart.js beschriftet sonst auch die Zwischenschritte, die
+  // Beschriftungen überlagern sich – nur 1er- und 3er-Dekaden anschreiben.
+  const logTick=v=>{ const m=v/Math.pow(10,Math.floor(Math.log10(v)));
+    return (Math.abs(m-1)<0.05||Math.abs(m-3)<0.05)?fmtBig(v):""; };
+  const yscale = log
+    ? {type:"logarithmic",ticks:{color:css("--muted"),callback:logTick},grid:{color:css("--grid")}}
+    : {beginAtZero:true,ticks:{color:css("--muted"),callback:v=>fmtBig(v)},grid:{color:css("--grid")}};
+  if(!cumTokChart){
+    cumTokChart=new Chart(cv,{type:"line",data:{labels:s.labels,datasets:dsets},
+      options:{animation:false,responsive:true,maintainAspectRatio:false,
+        interaction:{mode:"index",intersect:false},
+        scales:{x:{ticks:{color:css("--muted"),maxRotation:0,autoSkip:true,maxTicksLimit:14},grid:{display:false}},
+                y:yscale},
+        plugins:{legend:{display:dsets.length>1,labels:{color:css("--muted"),boxWidth:10,font:{size:10}}},
+          tooltip:{callbacks:{
+            title:c=>c.length?new Date(c[0].label+"T12:00:00")
+              .toLocaleDateString("de-DE",{weekday:"long",day:"2-digit",month:"2-digit",year:"numeric"}):"",
+            label:c=>c.dataset.label+": "+fmtNum(Math.round(c.parsed.y),0)+" Tokens"}}}}});
+  } else {
+    cumTokChart.data.labels=s.labels; cumTokChart.data.datasets=dsets;
+    cumTokChart.options.scales.y=yscale;
+    cumTokChart.options.plugins.legend.display=dsets.length>1; cumTokChart.update();
+  }
+}
+document.getElementById("cumtoklog").onchange=()=>{
+  store.set("vllm_cumtok_log", document.getElementById("cumtoklog").checked?"1":"0");
+  renderCumTokenChart(lastTokens);
+};
+document.getElementById("cumtoklog").checked = store.get("vllm_cumtok_log")==="1";
 window._notifOn = store.get("vllm_notif")==="1";
 function syncNotifBtn(){
   const b=document.getElementById("notif"); if(!b)return;

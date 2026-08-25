@@ -4,6 +4,29 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.26.0] – 2026-08-25
+
+### Hinzugefügt
+- **Drittes Diagramm unter „Effizienz & Kapazität": „Generierte Tokens pro Tag
+  – seit Aufzeichnungsbeginn (kumuliert)".** Liniendiagramm der aufsummierten
+  Tagessummen (Gesamtlinie als Fläche, je Modell eine eigene Linie), gespeist
+  aus denselben Daten wie das Tagesbalken-Diagramm (`/api/tokens` ohne
+  Zeitraum) – keine zusätzliche Serverlast.
+  - **Lückenlose Kalendertage:** Tage ohne Messung fehlen in `days[]` und
+    hätten die Kategorie-Achse gestaucht, also die Kurvenform verfälscht;
+    `cumTokenSeries()` füllt sie mit dem fortgeschriebenen Stand auf.
+  - **Umschalter „log. Achse":** exponentielles Wachstum wird auf der
+    logarithmischen y-Achse zur Geraden. Beschriftet werden nur 1er- und
+    3er-Dekaden, sonst überlagern sich die Zwischenschritte.
+  - **Wachstumshinweis in der Überschrift:** `fitInfo()` legt eine Regression
+    über `ln(y)` und eine lineare Regression über dieselben Punkte und nennt
+    das besser passende Modell samt R² – exponentiell mit Wachstum pro Tag und
+    Verdopplungszeit, sonst „eher linear" mit Tokens/Tag. Der erste
+    Aufzeichnungstag bleibt außen vor: Er ist angebrochen und im Log-Raum ein
+    massiver Ausreißer (real gemessen R² 0,41 mit, 0,98 ohne ihn).
+  - Der Zustand des Schalters liegt in `vllm_cumtok_log` und wandert damit über
+    `prefs.json` mit dem Benutzer.
+
 ## [0.25.1] – 2026-08-10
 
 ### Behoben

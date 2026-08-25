@@ -77,6 +77,20 @@ range-aware `build_tokens(range_s|start,end)` via `GET /api/tokens?range=…` �
 **without** params `build_tokens()` still returns all days since recording for the
 existing Effizienz "seit Aufzeichnung" chart (`_tokens_all()`, 60 s cached).
 
+The Effizienz section carries a third chart, **"… seit Aufzeichnungsbeginn
+(kumuliert)"** (`cumtokchart`/`cumTokChart`), fed from the very same
+`lastTokens` payload — no extra request. `cumTokenSeries()` fills the **missing
+calendar days** (days without measurements are simply absent from `days[]` and
+would compress the category axis, i.e. distort the shape) by carrying the
+running total forward. A "log. Achse" checkbox (`vllm_cumtok_log`, so it travels
+with the user via `prefs.json`) switches the y axis to `logarithmic`, where
+exponential growth becomes a straight line; only 1× and 3× decades are labelled,
+otherwise the intermediate ticks overlap. `fitInfo()` regresses `ln(y)` and `y`
+over the same points and names the better-fitting model with its R² in the
+heading (growth %/day + doubling time, or "eher linear"); the **first recording
+day is excluded** — it is a partial day and a massive outlier in log space
+(measured on real data: R² 0.41 with it, 0.98 without).
+
 Tile layout: every `.card` is a flex column and its canvas lives in a
 `.chartwrap` (`flex:1`, `min-height:var(--card-h)`, canvas absolutely filling
 it). That keeps the x-axes of all tiles in a grid row on one line regardless of
