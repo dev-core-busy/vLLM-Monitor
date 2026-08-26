@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.27.1"
+__version__ = "0.28.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -267,12 +267,26 @@ def build_series(range_s, offset_s=0, start=None, end=None):
                WHERE ts < ? GROUP BY model) a
           ON s.model = a.model AND s.ts = a.mts
     """, (since,)).fetchall()
-    conn.close()
 
     anchor_by_model = {r["model"]: r for r in anchors}
     models = {}
     for r in in_window:
         models.setdefault(r["model"], []).append(r)
+
+    # Modelle, deren Aufzeichnung erst innerhalb des Fensters beginnt (frisch
+    # hinzugefügte Instanz), haben keinen Anker davor. Ohne Bezugspunkt gibt es
+    # weder Raten noch Perzentile – beides braucht ein Delta –, und bei langen
+    # Zeiträumen (bei „seit Beginn" ist ein Bucket fast eine Stunde) fällt die
+    # ganze junge Reihe in ein, zwei Buckets: die Kachel bliebe leer. Als Anker
+    # dient dann der älteste Rohwert des Fensters.
+    for model, pts in models.items():
+        if model not in anchor_by_model:
+            first = conn.execute(
+                "SELECT * FROM samples WHERE model=? AND ts >= ? AND ts < ? "
+                "ORDER BY ts LIMIT 1", (model, since, end)).fetchone()
+            if first is not None and first["ts"] < pts[0]["ts"]:
+                anchor_by_model[model] = first
+    conn.close()
 
     # Glättungsfenster für die nur zeitweise definierten Signale (Trefferquote,
     # Latenz-Perzentile). Über ein einzelnes Bucket (hier 76 s) ist ein solches
@@ -290,11 +304,18 @@ def build_series(range_s, offset_s=0, start=None, end=None):
             # Bezugspunkt ein volles Fenster zurück (am linken Rand so weit
             # zurück, wie Daten vorhanden sind).
             base = pts[i - kwin] if i >= kwin else anchor
+            # Fehlender KV-Wert ist NICHT 0 %: Server ohne KV-Cache (vLLM-Omni,
+            # Ollama, STT) zeichneten sonst eine 0-Linie, die eine Messung
+            # behauptet, die es gar nicht gibt.
+            kvv = _clean(r["kv_cache_usage"])
             p = {
                 "t": (r["ts"] + offset_s) * 1000,   # bei Vergleich aufs aktuelle Fenster projiziert
-                "kv": (_clean(r["kv_cache_usage"]) or 0.0) * 100.0,
+                "kv": kvv * 100.0 if kvv is not None else None,
                 "gen_total": r["generation_tokens_total"],   # kumulierte Tokens (für KPI-Gesamtwert)
                 "prompt_total": r["prompt_tokens_total"],
+                # Kumulierte Abschlüsse – bei Modellen ohne Token-Ausgabe
+                # (Bild/Video/Audio) der einzige sinnvolle Mengenzähler.
+                "req_total": r["requests_success_total"],
             }
             for col, field in GAUGES.items():
                 p[field] = r[col]
@@ -304,6 +325,10 @@ def build_series(range_s, offset_s=0, start=None, end=None):
                     for col, field in RATES.items():
                         d = (r[col] or 0) - (prev[col] or 0)
                         p[field] = round(d / dt, 3) if d >= 0 else None
+                    # Requests je Stunde: bei Bildmodellen sind Sekundenraten
+                    # (ein Bild ≈ 8 s, wenige pro Stunde) nicht mehr ablesbar.
+                    if p.get("req_ps") is not None:
+                        p["req_ph"] = round(p["req_ps"] * 3600.0, 2)
                     # Counter-Reset-Markierung
                     if (r["prompt_tokens_total"] or 0) < (prev["prompt_tokens_total"] or 0):
                         p["reset"] = True
@@ -3061,6 +3086,8 @@ const CHARTS=[
   desc:"Abschlussrate nach Grund pro Sekunde:\nstop = normal beendet, length = Längenlimit erreicht,\nabort = abgebrochen, error = Fehler. error/abort > 0 = Probleme."},
  {id:"hit",title:"Prefix-Cache-Hit-Rate (%)",unit:"%",fields:[{k:"hit_rate"}],max:100,
   desc:"Anteil der Prompt-Tokens, die aus dem Prefix-Cache wiederverwendet\nwurden statt neu berechnet zu werden.\nHoch = effizient bei wiederkehrenden Prompt-Anfängen (System-Prompts, RAG)."},
+ {id:"reqph",title:"Abgeschlossene Requests/h",unit:"/h",fields:[{k:"req_ph"}],
+  desc:"Fertig bearbeitete Anfragen, hochgerechnet auf eine Stunde.\nFür Modelle ohne Token-Ausgabe (vLLM-Omni: Bilder, Video, Audio) ist das\nder eigentliche Durchsatz – Tokens/s bleibt dort bauartbedingt 0."},
 ];
 
 // Kacheln mit echtem Chart.js-Diagramm (alles außer den Sonderkacheln wie „Verbrauch pro Tag“)
@@ -3580,6 +3607,15 @@ function renderKPIs(){
         <div class="metric"><b>${last.vram_bytes!=null?(last.vram_bytes/1e9).toFixed(0):"–"} GB</b>VRAM</div>
         <div class="metric ${tempBad?"bad":""}"><b>${num(last.gpu_temp,0)} °C</b>Temp</div>
         <div class="metric"><b>${num(last.gpu_power,0)} W</b>Leistung</div>`;
+    }else if(kind==="vllm-omni"){
+      // Bild-/Video-/Audio-Modelle geben keine Tokens aus (gen tok/s ist dort
+      // bauartbedingt 0) und haben weder KV-Cache noch TTFT – gezählt wird,
+      // was sie wirklich leisten: abgeschlossene Anfragen und deren Dauer.
+      row=`<div class="metric"><b>${num(last.running,0)}</b>aktiv${wait?` / ${num(wait,0)} wartend`:""}</div>
+        <div class="metric"><b>${num(last.req_ph,1)}</b>Requests/h</div>
+        <div class="metric"><b>${fmtBig(last.req_total)}</b>abgeschlossen</div>
+        <div class="metric"><b>${num(last["e2e_"+pct])}</b>Dauer ${pct} (s)</div>
+        <div class="metric ${errBad?"bad":""}"><b>${num(err,2)}</b>Fehler/s</div>`;
     }else{
       row=`<div class="metric"><b>${num(last.running,0)}</b>aktiv${wait?` / ${num(wait,0)} wartend`:""}</div>
         <div class="metric ${kvBad?"bad":""}"><b>${kv.toFixed(0)}%</b>KV-Cache</div>
@@ -3659,17 +3695,22 @@ function renderInstances(){
     // nicht „aus". Der Grund steht als Titel an der Typ-Spalte.
     const kindTxt=i.kind||"vllm";
     const kindTitle = kindTxt==="vllm-omni"
-      ? "vLLM-Omni veröffentlicht keine Engine-Konfiguration (KV-Kapazität, Kontextlänge, "
-        +"GPU-Speicheranteil, Prefix-Cache) und keine max_model_len – diese Spalten bleiben leer."
+      ? "vLLM-Omni veröffentlicht weder eine Engine-Konfiguration (KV-Kapazität, "
+        +"GPU-Speicheranteil, Prefix-Cache) noch eine max_model_len – deshalb „n. v.“ "
+        +"statt eines Werts. Durchsatz für solche Modelle: Kachel „Abgeschlossene Requests/h“."
       : "";
-    const pfx = i.enable_prefix_caching==null ? "–"
+    // Fehlt der Wert, weil der Servertyp ihn gar nicht kennt, ist „n. v." die
+    // ehrlichere Angabe als ein Strich, der nach „gerade nicht gemessen" aussieht.
+    const nv = kindTitle ? `<span style="color:var(--muted);font-style:italic" title="${kindTitle}">n. v.</span>` : "–";
+    const pfx = i.enable_prefix_caching==null ? nv
               : (i.enable_prefix_caching==="True" ? "an" : "aus");
+    if(capcell==="–") capcell=nv;
     tr.innerHTML=`<td><span class="dot ${i.online?"on":"off"}"></span> ${statusTxt}</td>
       <td${kindTitle?` title="${kindTitle}" style="cursor:help"`:""}>${kindTxt}${kindTitle?" <span style=\"color:var(--muted)\">ⓘ</span>":""}</td>
       <td>${i.host}:${i.port}</td><td>${shortModel(i.model)}</td><td>${i.version||"–"}</td>
       <td>${capcell}</td>
-      <td>${i.max_model_len?Number(i.max_model_len).toLocaleString("de-DE"):"–"}</td>
-      <td>${i.gpu_memory_utilization!=null?i.gpu_memory_utilization:"–"}</td>
+      <td>${i.max_model_len?Number(i.max_model_len).toLocaleString("de-DE"):nv}</td>
+      <td>${i.gpu_memory_utilization!=null?i.gpu_memory_utilization:nv}</td>
       <td>${pfx}</td>
       <td style="white-space:nowrap;text-align:right">
         <button class="cbtn ihide" title="${hid?"In „Modelle & GPU“ einblenden":"In „Modelle & GPU“ ausblenden"}">${hid?"🙈":"👁"}</button>
@@ -3820,7 +3861,7 @@ function download(name,text,type){const b=new Blob([text],{type});const u=URL.cr
   const a=document.createElement("a");a.href=u;a.download=name;a.click();URL.revokeObjectURL(u);}
 function exportCSV(){
   if(!lastData)return;
-  const fields=["gen_tps","prompt_tps","kv","running","waiting","hit_rate","ttft_p95","e2e_p95","itl_p95","error_ps"];
+  const fields=["gen_tps","prompt_tps","req_ph","kv","running","waiting","hit_rate","ttft_p95","e2e_p95","itl_p95","error_ps"];
   let rows=["model,ts,iso,"+fields.join(",")];
   Object.entries(lastData.models).forEach(([m,s])=>s.forEach(p=>{
     rows.push([m,p.t,new Date(p.t).toISOString(),...fields.map(f=>p[f]==null?"":p[f])].join(","));}));

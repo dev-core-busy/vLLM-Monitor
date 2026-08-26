@@ -4,6 +4,33 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.28.0] – 2026-08-26
+
+### Hinzugefügt
+- **Kachel „Abgeschlossene Requests/h"** (`req_ph`) und ein eigener KPI-Kopf für
+  vLLM-Omni: *aktiv · Requests/h · abgeschlossen · Dauer p95 · Fehler/s*.
+  Bild-/Video-/Audio-Modelle geben keine Tokens aus – „gen tok/s 0" und
+  „0 generiert" waren dort korrekt, aber nutzlos. Gezählt wird jetzt, was solche
+  Modelle wirklich leisten. Neues Feld `req_total` (kumulierte Abschlüsse) als
+  Mengenzähler analog zu den Tokens.
+- Instanzen-Tabelle: Spalten, die ein Servertyp gar nicht kennt, stehen als
+  kursives **„n. v."** mit Erklärung am ⓘ der Typ-Spalte statt als Strich, der
+  wie „gerade nicht gemessen" aussieht.
+
+### Behoben
+- **Junge Instanzen hatten in langen Zeiträumen gar keine Werte.** Ohne
+  Messpunkt vor dem Fensterbeginn fehlte der Bezugspunkt für jedes Delta – und
+  bei „seit Beginn" (ein Bucket ≈ 54 min) fiel die gesamte junge Reihe in ein
+  bis zwei Buckets. Ergebnis: keine Raten, keine Perzentile, eine leere Kachel
+  und eine KPI-Karte voller Striche, obwohl Daten vorhanden waren. `build_series()`
+  nimmt für Modelle ohne Anker jetzt den ältesten Rohwert des Fensters als
+  Bezugspunkt. Gemessen an FLUX (35 min alt): „seit Beginn" vorher alles leer,
+  jetzt 7,2 Requests/h und Dauer p50 5,0 s / p95 9,5 s.
+- **KV-Cache-Kachel zeichnete eine 0-%-Linie für Server ohne KV-Cache.** Ein
+  fehlender Wert wurde als 0 durchgereicht – vLLM-Omni, Ollama und STT
+  behaupteten damit eine Messung, die es nicht gibt. Fehlt der Wert, bleibt die
+  Kurve jetzt leer (Gegenprobe: Qwen 122 Werte, FLUX/GPU/STT 0).
+
 ## [0.27.1] – 2026-08-26
 
 ### Behoben

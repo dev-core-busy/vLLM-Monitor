@@ -156,6 +156,18 @@ exposes a **Prometheus exporter** at `GET /metrics` (`build_prometheus()`,
 prefix `vllm_monitor_`, labels host/port/model; cumulative values as counters)
 for scraping by an existing Prometheus/Grafana — additive to the SQLite pipeline.
 
+Omni models emit **no tokens**, so `gen_tps`/`gen_total` are a truthful 0 and
+useless. Their throughput is the tile **„Abgeschlossene Requests/h"** (`req_ph`
+= `req_ps × 3600`) plus `req_total`; `renderKPIs()` has its own `vllm-omni`
+branch (aktiv · Requests/h · abgeschlossen · Dauer p95 · Fehler/s). Columns a
+server type does not know show an italic **„n. v."**, never a dash and never a
+made-up 0 — the same reason `kv` stays `None` instead of 0 % for servers without
+a KV cache. And because every rate and percentile needs a delta,
+`build_series()` gives models **without an anchor** (recording started inside
+the window) their oldest raw row of the window as one: otherwise a freshly added
+instance is entirely blank in long ranges, where one bucket is ~54 min and its
+whole history collapses into a single point.
+
 **vLLM-Omni** serves the same numbers under the prefix **`vllm_omni:`** and with
 two different names (`requests_success_total`, `e2e_request_latency_s`).
 `normalize_metric()` rewrites them to the vLLM spelling **while parsing**, so
