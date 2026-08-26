@@ -4,6 +4,43 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.27.0] – 2026-08-26
+
+### Hinzugefügt
+- **vLLM-Omni wird unterstützt.** Omni-Server (Bild-/Video-/Omni-Modelle)
+  veröffentlichen ihre Kennzahlen unter dem Präfix `vllm_omni:` und mit zwei
+  abweichenden Namen (`requests_success_total`, `e2e_request_latency_s`).
+  Der Parser suchte auf `vllm:` – deshalb blieben alle Messwerte solcher
+  Instanzen leer (nachgeprüft an Port 9079: `samples`-Zeilen ohne einen
+  einzigen Wert). `normalize_metric()` bildet die Namen jetzt beim Parsen auf
+  die vLLM-Schreibweise ab, sodass `GAUGE_COUNTER`/`HISTOGRAMS`/`extract()`
+  unverändert greifen. Erfasst werden damit laufende/wartende Requests,
+  Prompt-/Generation-Tokens, `requests_success` (inkl. `finished_reason`) und
+  die E2E-Latenz samt Histogramm. KV-Cache, Prefix-Cache, TTFT, ITL und
+  `cache_config_info` gibt es bei Omni nicht – diese Spalten bleiben leer.
+- Neuer Ziel-Typ **„vLLM-Omni"** im ⚙-Dialog *Instanzen verwalten*
+  (`_TARGET_KINDS`, `load_extra_targets()`). Die Art wird zusätzlich **am
+  Präfix erkannt**, nicht am Eintrag: ein als `vllm` angelegtes Ziel wird
+  automatisch als `vllm-omni` geführt, sobald der Server Omni-Metriken liefert
+  (bestehende Einträge müssen also nicht angefasst werden).
+- **✕ für veraltete Einträge** in der Instanzen-Tabelle. Bisher hatten nur
+  Zeilen, die zu einem Eintrag in `targets.json` gehören, einen Löschknopf –
+  Altlasten wie ein längst abgeschaltetes Ollama-Modell ließen sich nicht
+  entfernen. Neu: `DELETE /api/instances?id=host:port:modell` (`del_instance()`)
+  entfernt **nur die Registrierung** in der `config`-Tabelle; die Messreihen
+  bleiben erhalten, das Modell bleibt also in den Diagrammen sichtbar (👁
+  blendet es dort aus). Aktive Einträge werden abgelehnt – sie wären beim
+  nächsten Scrape ohnehin wieder da.
+  - Welches ✕ eine Zeile bekommt, entscheidet `port_live`: Liefert der Port
+    weiter Daten, ist ein veralteter Eintrag ein **ausgetauschtes Modell** und
+    bekommt das Eintrags-✕ – sonst würde das bisherige Ziel-✕ die ganze
+    Instanz mitsamt dem laufenden Modell löschen.
+  - `build_config()` ordnet Instanzen jetzt über **Host:Port** statt über
+    (Art, Host, Port) einem Ziel zu und liefert dessen `target_id` mit. Sonst
+    verlöre eine als `vllm` eingetragene, als `vllm-omni` erkannte Instanz ihr
+    Ziel-✕.
+- `durTxt()` rechnet ab zwei Tagen in Tagen („vor 13,5 Tagen" statt „vor 324 h").
+
 ## [0.26.0] – 2026-08-25
 
 ### Hinzugefügt

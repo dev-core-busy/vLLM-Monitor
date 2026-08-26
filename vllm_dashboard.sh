@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -477,9 +477,18 @@ def build_config():
     inst.sort(key=lambda i: (i["host"] or "", i["port"] or 0))
 
     # Markieren, welche Instanzen über targets.json verwaltbar (löschbar) sind.
-    managed = {(t.get("kind"), t.get("host"), str(t.get("port"))) for t in _load_targets()}
+    # Zuordnung über Host:Port, NICHT über die Art: ein als „vllm" eingetragenes
+    # Ziel wird als „vllm-omni" erkannt, sobald der Server Omni-Metriken liefert.
+    # Die id kommt aus der Datei, damit sie zum Eintrag dort passt.
+    tmap = {(str(t.get("host")), str(t.get("port"))): _target_id(t) for t in _load_targets()}
+    # Ports, die aktuell noch Daten liefern – dort ist ein veralteter Eintrag ein
+    # ausgetauschtes Modell und nicht das ganze Ziel.
+    live_ports = {(i["host"], str(i["port"])) for i in inst if i["online"]}
     for i in inst:
-        i["managed"] = (i.get("kind"), i.get("host"), str(i.get("port"))) in managed
+        tid = tmap.get((str(i.get("host")), str(i.get("port"))))
+        i["managed"] = tid is not None
+        i["target_id"] = tid
+        i["port_live"] = (i["host"], str(i["port"])) in live_ports
 
     # Self-Monitoring: Herzschlag des Collectors
     collector = None
@@ -687,7 +696,7 @@ def del_annotation(aid):
 TARGETS_FILE = os.environ.get("VLLM_TARGETS_FILE") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "targets.json")
 _targets_lock = threading.Lock()
-_TARGET_KINDS = ("vllm", "ollama", "stt", "dcgm", "lmstudio")
+_TARGET_KINDS = ("vllm", "vllm-omni", "ollama", "stt", "dcgm", "lmstudio")
 
 # Seit der Einführung der Instanz-API-Keys enthält targets.json Geheimnisse –
 # bestehende Dateien einmalig absichern (Collector läuft als derselbe Benutzer).
@@ -780,7 +789,8 @@ def del_target(tid):
         victim = next((t for t in targets if _target_id(t) == tid), None)
         if victim is None:
             return {"ok": True}
-        if victim.get("kind") == "vllm" and sum(1 for t in targets if t.get("kind") == "vllm") <= 1:
+        if (victim.get("kind") in ("vllm", "vllm-omni")
+                and sum(1 for t in targets if t.get("kind") in ("vllm", "vllm-omni")) <= 1):
             return {"error": "Die letzte vLLM-Instanz kann nicht gelöscht werden."}
         _save_targets([t for t in targets if _target_id(t) != tid])
     # DB-Reste entfernen, sonst zeigt build_config die Instanz weiter (als offline) an
@@ -794,6 +804,47 @@ def del_target(tid):
             conn.close()
         except sqlite3.OperationalError:
             pass
+    return {"ok": True}
+
+
+def del_instance(iid):
+    """Einen veralteten Instanz-Eintrag aus der config-Tabelle entfernen
+    (id = „host:port:modell"; das Modell darf Doppelpunkte enthalten, daher
+    maxsplit=2). Die Messreihen bleiben erhalten – der Eintrag ist nur die
+    Registrierung, die der Collector beim nächsten erfolgreichen Scrape neu
+    anlegt. Genau deshalb werden aktive Einträge abgelehnt: sie wären sofort
+    wieder da."""
+    parts = (iid or "").split(":", 2)
+    if len(parts) != 3:
+        return {"error": "ungültige id"}
+    host, port, model = parts[0], parts[1], parts[2]
+    try:
+        port = int(port)
+    except ValueError:
+        return {"error": "ungültiger Port"}
+    if not os.path.exists(DB_PATH):
+        return {"error": "Keine Datenbank"}
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT up FROM config WHERE host=? AND port=? AND model=?",
+                           (host, port, model)).fetchone()
+        if row is None:
+            conn.close()
+            return {"ok": True}
+        last = conn.execute("SELECT MAX(ts) FROM samples WHERE host=? AND port=? AND model=?",
+                            (host, port, model)).fetchone()[0]
+        age = (int(time.time()) - last) if last else None
+        if row["up"] and age is not None and age <= STALE_AFTER:
+            conn.close()
+            return {"error": "Der Eintrag liefert gerade Daten und kann nicht "
+                             "entfernt werden. Dafür die Instanz aus der Überwachung nehmen."}
+        conn.execute("DELETE FROM config WHERE host=? AND port=? AND model=?",
+                     (host, port, model))
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        conn.close()
+        return {"error": "Datenbankfehler: %s" % e}
+    conn.close()
     return {"ok": True}
 
 
@@ -2249,6 +2300,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "ungültige id"})
         elif parsed.path == "/api/targets" and "id" in qs:
             self._json(del_target(qs["id"][0]))
+        elif parsed.path == "/api/instances" and "id" in qs:
+            self._json(del_instance(qs["id"][0]))
         elif parsed.path == "/api/users" and "username" in qs:
             self._json(users_delete(qs["username"][0], qs.get("kind", ["local"])[0]))
         elif parsed.path == "/api/alerts":
@@ -2767,7 +2820,8 @@ PAGE = r"""<!DOCTYPE html>
     <h4 style="margin:14px 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">Neu hinzufügen</h4>
     <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
       <select id="tgt-kind" style="background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:4px 6px">
-        <option value="vllm">vLLM</option><option value="ollama">Ollama</option>
+        <option value="vllm">vLLM</option><option value="vllm-omni">vLLM-Omni</option>
+        <option value="ollama">Ollama</option>
         <option value="lmstudio">LM Studio</option>
         <option value="stt">STT</option><option value="dcgm">DCGM/GPU</option>
       </select>
@@ -3489,6 +3543,7 @@ function num(v,d){return v==null?"–":(typeof v==="number"
   ?fmtNum(v,Number.isInteger(v)?0:(d==null?1:d)):v);}
 function durTxt(sec){ if(sec==null)return "–"; sec=Math.floor(sec);
   if(sec<60)return sec+" s"; if(sec<3600)return Math.floor(sec/60)+" min";
+  if(sec>=172800)return fmtNum(sec/86400,1)+" Tagen";   // sonst „321 h" bei Altlasten
   const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60); return h+" h"+(m?" "+m+" min":""); }
 
 function renderKPIs(){
@@ -3583,8 +3638,15 @@ function renderInstances(){
     else if(i.vram_bytes){capcell=(i.vram_bytes/1e9).toFixed(2)+" GB VRAM";}
     const statusTxt = i.online ? "online" : (i.configured && i.age==null ? "nicht erreichbar" : "offline");
     const hid=hiddenModels.has(i.model);
-    const delBtn = i.managed
-      ? `<button class="cbtn idel adminonly" title="Instanz aus der Überwachung entfernen">✕</button>` : "";
+    // Ein ✕ je Zeile. Veraltete Einträge werden nur aus der Liste entfernt
+    // (Messreihen bleiben); erreichbare bzw. komplett tote Ziele dagegen aus der
+    // Überwachung. Ein veralteter Eintrag auf einem Port, der weiter Daten
+    // liefert, ist ein ausgetauschtes Modell – dort darf nicht das ganze Ziel weg.
+    const entryOnly = !i.online && (i.port_live || !i.managed);
+    const delBtn = entryOnly
+      ? `<button class="cbtn ient adminonly" title="Veralteten Eintrag aus der Liste entfernen (Messreihen bleiben erhalten)">✕</button>`
+      : (i.managed
+         ? `<button class="cbtn idel adminonly" title="Instanz aus der Überwachung entfernen">✕</button>` : "");
     tr.innerHTML=`<td><span class="dot ${i.online?"on":"off"}"></span> ${statusTxt}</td>
       <td>${i.kind||"vllm"}</td>
       <td>${i.host}:${i.port}</td><td>${shortModel(i.model)}</td><td>${i.version||"–"}</td>
@@ -3601,15 +3663,31 @@ function renderInstances(){
     };
     const db=tr.querySelector(".idel");
     if(db) db.onclick=()=>delInstance(i);
+    const eb=tr.querySelector(".ient");
+    if(eb) eb.onclick=()=>delEntry(i);
     tb.appendChild(tr);
   });
 }
 async function delInstance(i){
   if(!confirm(`Instanz ${i.host}:${i.port} (${shortModel(i.model)}) aus der Überwachung entfernen?`))return;
-  try{ const r=await(await fetch("/api/targets?id="+encodeURIComponent(i.kind+":"+i.host+":"+i.port),{method:"DELETE"})).json();
+  // id aus targets.json verwenden: die erkannte Art (z. B. vllm-omni) kann von
+  // der eingetragenen abweichen, dann fände der Server den Eintrag nicht.
+  const id=i.target_id||(i.kind+":"+i.host+":"+i.port);
+  try{ const r=await(await fetch("/api/targets?id="+encodeURIComponent(id),{method:"DELETE"})).json();
     if(r&&r.error){ alert(r.error); return; } }catch(e){ return; }
   hiddenModels.delete(i.model); saveHiddenModels();
   fetchConfig(); fetchOnce();   // Instanzen-Tabelle + KPIs/Diagramme sofort aktualisieren
+}
+// Veralteten Eintrag aus der Liste nehmen – die Messreihen bleiben erhalten,
+// das Modell taucht also weiter in den Diagrammen auf (👁 blendet es dort aus).
+async function delEntry(i){
+  const alt=i.age!=null?` Letzte Messung vor ${durTxt(i.age)}.`:"";
+  if(!confirm(`Eintrag ${i.host}:${i.port} (${shortModel(i.model)}) aus der Liste entfernen?`
+    +alt+`\n\nDie Messreihen bleiben erhalten; das Modell bleibt in den Diagrammen sichtbar.`))return;
+  try{ const r=await(await fetch("/api/instances?id="+encodeURIComponent(i.host+":"+i.port+":"+i.model),
+    {method:"DELETE"})).json();
+    if(r&&r.error){ alert(r.error); return; } }catch(e){ return; }
+  fetchConfig();
 }
 document.querySelectorAll("#insttable th[data-col]").forEach(th=>th.onclick=()=>{
   const col=th.getAttribute("data-col");

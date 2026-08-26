@@ -156,7 +156,18 @@ exposes a **Prometheus exporter** at `GET /metrics` (`build_prometheus()`,
 prefix `vllm_monitor_`, labels host/port/model; cumulative values as counters)
 for scraping by an existing Prometheus/Grafana — additive to the SQLite pipeline.
 
-**UI-managed instances:** extra vLLM/Ollama/**LM-Studio**/STT/DCGM targets can be
+**vLLM-Omni** serves the same numbers under the prefix **`vllm_omni:`** and with
+two different names (`requests_success_total`, `e2e_request_latency_s`).
+`normalize_metric()` rewrites them to the vLLM spelling **while parsing**, so
+`GAUGE_COUNTER`/`HISTOGRAMS`/`extract()` need no special case; KV cache, prefix
+cache, TTFT, ITL and `cache_config_info` simply do not exist there and stay
+NULL. The kind is decided by the **prefix found in `/metrics`**, not by the
+configured target type (`scrape_vllm_target()` stores `kind="vllm-omni"`), so an
+existing `vllm` entry keeps working when the server behind it is Omni — which is
+also why `build_config()` maps instances to targets by **host:port** (not by
+kind) and hands the UI the `target_id` from the file.
+
+**UI-managed instances:** extra vLLM/**vLLM-Omni**/Ollama/**LM-Studio**/STT/DCGM targets can be
 added, paused or removed from the ⚙ menu; they persist in `targets.json`
 (`VLLM_TARGETS_FILE`) which the collector re-reads every scrape
 (`load_extra_targets()` → `scrape_vllm_target()`/`scrape_ollama`/`scrape_lmstudio`/…)
@@ -167,6 +178,14 @@ context length, and an optional generation probe on `/api/v0/chat/completions`
 that runs **only against already-loaded models** to avoid cold-load stalls).
 Config: `VLLM_LMSTUDIO_TARGETS` (`host:port:label`), `VLLM_LMSTUDIO_PROBE`,
 `VLLM_LMSTUDIO_PROMPT`, `VLLM_LMSTUDIO_MAX_TOKENS`.
+
+Rows in the instance table carry **one ✕ each**, and which one depends on
+`port_live`: a stale row on a port that still delivers data is a *swapped
+model*, so it gets the entry-✕ (`DELETE /api/instances`, `del_instance()`) which
+drops **only the `config` registration** and keeps the samples — deleting the
+target there would take the running model with it. Everything else keeps the
+target-✕ (`DELETE /api/targets`, which does purge samples). Active entries are
+refused by `del_instance()`; the collector would recreate them anyway.
 
 **API-Keys der überwachten Server:** jedes Ziel in `targets.json` kann ein Feld
 `api_key` tragen (im ⚙-Dialog *Instanzen verwalten* als Passwortfeld gepflegt).

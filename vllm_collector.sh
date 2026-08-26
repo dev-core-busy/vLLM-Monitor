@@ -36,7 +36,7 @@ import sqlite3
 import signal
 from urllib import request, error
 
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration  (alles per Umgebungsvariable überschreibbar)
@@ -171,9 +171,10 @@ def seed_vllm_from_env():
 
 
 def _file_has_vllm():
-    """True, sobald targets.json überhaupt einen vLLM-Eintrag hat (auch pausiert).
-    Dann ist die Datei maßgeblich und die Env-Targets dienen nur noch als Seed."""
-    return any(t.get("kind") == "vllm" for t in _read_targets_file())
+    """True, sobald targets.json überhaupt einen vLLM-Eintrag hat (auch pausiert,
+    auch Omni). Dann ist die Datei maßgeblich und die Env-Targets dienen nur
+    noch als Seed."""
+    return any(t.get("kind") in ("vllm", "vllm-omni") for t in _read_targets_file())
 
 
 def load_extra_targets():
@@ -188,7 +189,7 @@ def load_extra_targets():
         if not t.get("enabled", True):
             continue
         kind, host, port = t.get("kind"), t.get("host"), t.get("port")
-        if not host or port is None or kind not in out:
+        if not host or port is None or (kind not in out and kind != "vllm-omni"):
             continue
         try:
             port = int(port)
@@ -198,7 +199,9 @@ def load_extra_targets():
         key = (t.get("api_key") or "").strip()
         if kind == "dcgm":
             out["dcgm"].append((host, port, key))
-        elif kind == "vllm":
+        elif kind in ("vllm", "vllm-omni"):
+            # Beide sprechen Prometheus über /metrics; scrape_vllm_target
+            # erkennt am Präfix, welche Variante wirklich antwortet.
             out["vllm"].append({"host": host, "port": port, "api_key": key})
         else:  # ollama / stt / lmstudio
             out[kind].append({"host": host, "port": port, "api_key": key,
@@ -289,6 +292,15 @@ GAUGE_COUNTER = {
     "vllm:prefix_cache_hits_total":     "prefix_hits_total",
     "vllm:num_preemptions_total":       "preemptions_total",
 }
+
+# vLLM-Omni (Bild-/Video-/Omni-Modelle) veröffentlicht dieselben Kennzahlen unter
+# dem Präfix „vllm_omni:" und mit zwei abweichenden Namen. Die Namen werden beim
+# Parsen auf die vLLM-Schreibweise gebracht, damit GAUGE_COUNTER/HISTOGRAMS und
+# extract() unverändert greifen. Nicht vorhanden sind dort KV-Cache,
+# Prefix-Cache, TTFT, ITL und cache_config_info – diese Spalten bleiben leer.
+OMNI_PREFIX = "vllm_omni:"
+_OMNI_RENAME = (("requests_success_total", "request_success_total"),
+                ("e2e_request_latency_s", "e2e_request_latency_seconds"))
 
 # Histogramme -> (sum-Spalte, count-Spalte, bucket-Spalte)
 HISTOGRAMS = {
@@ -492,6 +504,19 @@ _LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([^\s]+)\s*$')
 _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
 
 
+def normalize_metric(name):
+    """`vllm_omni:…` auf die vLLM-Schreibweise abbilden (siehe _OMNI_RENAME).
+    Alle anderen Namen (auch DCGM) bleiben unverändert."""
+    if not name.startswith(OMNI_PREFIX):
+        return name
+    rest = name[len(OMNI_PREFIX):]
+    for src, dst in _OMNI_RENAME:
+        if rest == src or rest.startswith(src + "_"):
+            rest = dst + rest[len(src):]
+            break
+    return "vllm:" + rest
+
+
 def parse_prometheus(text):
     out = []
     for line in text.splitlines():
@@ -501,7 +526,7 @@ def parse_prometheus(text):
         m = _LINE.match(line)
         if not m:
             continue
-        name, labelblock, raw = m.group(1), m.group(2), m.group(3)
+        name, labelblock, raw = normalize_metric(m.group(1)), m.group(2), m.group(3)
         try:
             val = float(raw)
         except ValueError:
@@ -941,6 +966,9 @@ def scrape_vllm_target(conn, ts, host, port, verbose=True, key=None):
         return 0
     _down_since.pop((host, port), None)
     record_alert(conn, ts, host, port, None, "offline", False, severity="crit")
+    # Art des Servers am Präfix erkennen, nicht am eingetragenen Typ: ein als
+    # „vllm" angelegtes Ziel kann längst Omni sprechen (und umgekehrt).
+    kind = "vllm-omni" if OMNI_PREFIX in text else "vllm"
     samples = parse_prometheus(text)
     per_model = extract(samples)
     cfg = extract_config(samples)
@@ -972,7 +1000,7 @@ def scrape_vllm_target(conn, ts, host, port, verbose=True, key=None):
         mc["up"] = 1
         mc["max_model_len"] = maxlen.get(model)
         mc["version"] = version
-        mc["kind"] = "vllm"
+        mc["kind"] = kind
         store_config(conn, host, port, model, mc)
         kv = values.get("kv_cache_usage")
         if kv is not None:
