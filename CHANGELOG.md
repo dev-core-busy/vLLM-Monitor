@@ -4,6 +4,27 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.27.1] – 2026-08-26
+
+### Behoben
+- **Typwechsel eines Ziels löschte dessen Messreihen.** Beim Bearbeiten legte
+  der Client den geänderten Eintrag neu an und schickte anschließend ein
+  `DELETE /api/targets` auf die alte id – und `del_target()` räumt neben dem
+  Ziel auch `config` und `samples` des Ports ab. Da die id den Typ enthält,
+  reichte schon das Umstellen von „vLLM" auf „vLLM-Omni", um die Historie
+  desselben, weiterhin überwachten Servers zu verlieren (real passiert an Port
+  9079). Das Umbenennen läuft jetzt vollständig in `add_target()`: `prev_id`
+  entfernt den alten Eintrag mitsamt Key-Übernahme, der Client löscht nicht
+  mehr. Zusätzlich ordnet `add_target()` über **Host:Port** zu – ein Port trägt
+  genau einen Server, ein Typwechsel ersetzt den Eintrag also, statt einen
+  zweiten mit derselben Adresse anzulegen (der doppelt gescrapt würde).
+- **„Prefix-Cache: aus" war eine Behauptung, keine Messung.** Die Spalte zeigte
+  „aus", sobald der Wert fehlte – also auch für STT-, GPU- und vLLM-Omni-Zeilen,
+  die diese Angabe gar nicht liefern. Unbekannt wird jetzt als „–" dargestellt.
+- vLLM-Omni-Zeilen tragen in der Typ-Spalte ein „ⓘ" mit dem Grund für die leeren
+  Engine-Spalten (der Server veröffentlicht weder `cache_config_info` noch eine
+  `max_model_len`, geprüft an allen 38 Metriknamen und an `/v1/models`).
+
 ## [0.27.0] – 2026-08-26
 
 ### Hinzugefügt

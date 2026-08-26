@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.27.0"
+__version__ = "0.27.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -760,24 +760,31 @@ def add_target(body):
     # API-Key: fehlt das Feld (z. B. beim Aktiv-Häkchen), bleibt der gespeicherte
     # Key erhalten; ein leerer String löscht ihn ausdrücklich.
     new_key = body.get("api_key")
-    # Beim Bearbeiten mit geänderter Host/Port-Kombination entsteht ein neuer
-    # Eintrag – dann den Key des Vorgängers (prev_id) übernehmen.
+    # Beim Bearbeiten mit geänderter Host/Port-Kombination zeigt prev_id auf den
+    # alten Eintrag: Key übernehmen und ihn hier entfernen. Das Umbenennen läuft
+    # damit vollständig über diesen Aufruf – der Client darf danach NICHT löschen,
+    # denn del_target() räumt auch die Messreihen des Ports ab.
     prev_id = body.get("prev_id") or None
     with _targets_lock:
         targets = _load_targets()
-        for i, t in enumerate(targets):
-            if _target_id(t) == nid:
-                key = (t.get("api_key") or "") if new_key is None else str(new_key)
-                if key.strip():
-                    newt["api_key"] = key.strip()
-                targets[i] = newt
-                break
+        moved = None
+        if prev_id:
+            pidx = next((n for n, t in enumerate(targets)
+                         if _target_id(t) == prev_id and _target_id(t) != nid), None)
+            if pidx is not None:
+                moved = targets.pop(pidx)
+        # Ein Port trägt genau einen Server, deshalb Zuordnung über Host:Port:
+        # ein Typwechsel (vllm -> vllm-omni) ersetzt den Eintrag, statt einen
+        # zweiten mit gleicher Adresse anzulegen (der doppelt gescrapt würde).
+        idx = next((n for n, t in enumerate(targets)
+                    if str(t.get("host")) == host and str(t.get("port")) == str(port)), None)
+        old = targets[idx] if idx is not None else (moved or {})
+        key = (old.get("api_key") or "") if new_key is None else str(new_key)
+        if key.strip():
+            newt["api_key"] = key.strip()
+        if idx is not None:
+            targets[idx] = newt
         else:
-            if new_key is None and prev_id:
-                old = next((t for t in targets if _target_id(t) == prev_id), None)
-                new_key = (old or {}).get("api_key")
-            if new_key is not None and str(new_key).strip():
-                newt["api_key"] = str(new_key).strip()
             targets.append(newt)
         _save_targets(targets)
     return {"ok": True, "id": nid}
@@ -3647,13 +3654,23 @@ function renderInstances(){
       ? `<button class="cbtn ient adminonly" title="Veralteten Eintrag aus der Liste entfernen (Messreihen bleiben erhalten)">✕</button>`
       : (i.managed
          ? `<button class="cbtn idel adminonly" title="Instanz aus der Überwachung entfernen">✕</button>` : "");
+    // Die vier Engine-Spalten stammen aus vllm:cache_config_info bzw. /v1/models.
+    // vLLM-Omni veröffentlicht beides nicht – „unbekannt" ist dort die Wahrheit,
+    // nicht „aus". Der Grund steht als Titel an der Typ-Spalte.
+    const kindTxt=i.kind||"vllm";
+    const kindTitle = kindTxt==="vllm-omni"
+      ? "vLLM-Omni veröffentlicht keine Engine-Konfiguration (KV-Kapazität, Kontextlänge, "
+        +"GPU-Speicheranteil, Prefix-Cache) und keine max_model_len – diese Spalten bleiben leer."
+      : "";
+    const pfx = i.enable_prefix_caching==null ? "–"
+              : (i.enable_prefix_caching==="True" ? "an" : "aus");
     tr.innerHTML=`<td><span class="dot ${i.online?"on":"off"}"></span> ${statusTxt}</td>
-      <td>${i.kind||"vllm"}</td>
+      <td${kindTitle?` title="${kindTitle}" style="cursor:help"`:""}>${kindTxt}${kindTitle?" <span style=\"color:var(--muted)\">ⓘ</span>":""}</td>
       <td>${i.host}:${i.port}</td><td>${shortModel(i.model)}</td><td>${i.version||"–"}</td>
       <td>${capcell}</td>
       <td>${i.max_model_len?Number(i.max_model_len).toLocaleString("de-DE"):"–"}</td>
       <td>${i.gpu_memory_utilization!=null?i.gpu_memory_utilization:"–"}</td>
-      <td>${i.enable_prefix_caching==="True"?"an":"aus"}</td>
+      <td>${pfx}</td>
       <td style="white-space:nowrap;text-align:right">
         <button class="cbtn ihide" title="${hid?"In „Modelle & GPU“ einblenden":"In „Modelle & GPU“ ausblenden"}">${hid?"🙈":"👁"}</button>
         ${delBtn}</td>`;
@@ -4225,10 +4242,9 @@ document.getElementById("tgt-add").onclick=async()=>{
     const r=await(await fetch("/api/targets",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify(payload)})).json();
     if(r.error){ msg.textContent="⚠️ "+r.error; return; }
-    // Bei geänderter Host/Port-Kombination den alten Eintrag entfernen
-    if(editing && editing!==newId){
-      try{ await fetch("/api/targets?id="+encodeURIComponent(editing),{method:"DELETE"}); }catch(e){}
-    }
+    // Den alten Eintrag räumt add_target() selbst weg (prev_id). Hier NICHT
+    // löschen: DELETE /api/targets wirft auch die Messreihen des Ports weg –
+    // beim bloßen Ändern des Typs wäre die Historie desselben Servers futsch.
     msg.textContent=(editing?"Gespeichert":"Hinzugefügt")+" – wird beim nächsten Scrape (≤ 15 s) übernommen.";
     loadTargets();
   }catch(e){ msg.textContent="Fehler: "+e; }

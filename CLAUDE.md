@@ -179,6 +179,14 @@ that runs **only against already-loaded models** to avoid cold-load stalls).
 Config: `VLLM_LMSTUDIO_TARGETS` (`host:port:label`), `VLLM_LMSTUDIO_PROBE`,
 `VLLM_LMSTUDIO_PROMPT`, `VLLM_LMSTUDIO_MAX_TOKENS`.
 
+Renaming a target (type/host/port) happens **entirely inside `add_target()`**
+(`prev_id` drops the old entry and carries its key over); the client must not
+issue a `DELETE` afterwards, because `del_target()` also purges `config` and
+`samples` for that port — changing only the *type* would otherwise wipe the
+history of the very server that stays monitored. `add_target()` matches
+existing entries by **host:port** (one port = one server), so a type change
+replaces the entry instead of adding a second one that would be scraped twice.
+
 Rows in the instance table carry **one ✕ each**, and which one depends on
 `port_live`: a stale row on a port that still delivers data is a *swapped
 model*, so it gets the entry-✕ (`DELETE /api/instances`, `del_instance()`) which
