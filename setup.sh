@@ -190,7 +190,9 @@ do_install() {
     stt="$(ask "STT-Server (faster-whisper)? host:port:label (leer=keiner)" "$D_STT")"
     lmstudio="$(ask "LM-Studio-Instanz(en)? host:port:label (Standardport 1234, leer=keine)" "$D_LMSTUDIO")"
     dcgm="$(ask "NVIDIA DCGM-Exporter (GPU)? host:port (leer=keiner)" "$D_DCGM")"
-    ai_url="$(ask "KI-Auswertung: Chat-Endpunkt (host:port o. .../v1/chat/completions, leer=aus)" "$D_AI_URL")"
+    # nur Vorbelegung: gepflegt wird die KI-Verbindung spaeter im Dashboard
+    # (Zahnrad-Menue -> KI-Verbindung), gespeichert in settings.json
+    ai_url="$(ask "KI-Auswertung: Chat-Endpunkt (host:port o. .../v1/chat/completions, leer=spaeter im UI)" "$D_AI_URL")"
     ai_model=""
     [ -n "$ai_url" ] && ai_model="$(ask "KI-Modell (Name lt. /v1/models)" "$D_AI_MODEL")"
     report_when=""

@@ -4,6 +4,37 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.29.0] – 2026-09-28
+
+### Hinzugefügt
+- **KI-Verbindung im ⚙-Menü konfigurierbar** (🤖 *KI-Verbindung*, nur Admins).
+  Endpunkt, Modell, API-Key, Token-Budget, Zeitgrenze und „Denk-Phase
+  abschalten" wurden bisher ausschließlich über die Env-Variablen `VLLM_AI_*`
+  gesetzt – wer kein systemd-Unit editieren wollte, konnte die 🔍-Auswertungen
+  und den 📋 KI-Report gar nicht in Betrieb nehmen. Die Werte liegen jetzt in
+  `settings.json` (Abschnitt `ai`, 0600, gitignored) und überschreiben die Env,
+  die nur noch die Vorbelegung ist. Der Key wird – wie bei den Ziel-Keys – **nie**
+  an den Browser ausgeliefert (`key_set`); ein fehlendes Feld beim Speichern
+  heißt „unverändert", `""` heißt „löschen".
+- **„Verbindung testen"** im selben Dialog: holt erst die Modellliste des
+  Endpunkts (füllt die Vorschlagsliste – gegen Tippfehler im Modellnamen) und
+  schickt dann eine Mini-Anfrage, zusammen mit Antwortzeit und Klartextfehler
+  (z. B. `HTTP 401`). Prüft die eingetippten, noch nicht gespeicherten Werte.
+  Die Endpunkt-Vorschläge kommen aus den überwachten vLLM-/LM-Studio-Instanzen.
+- **Eigenes ✕ für „Vollbild schließen".** In der maximierten Kachel bedeutete das
+  ✕ bisher *Kachel ausblenden* – naheliegend war aber „Fenster zu". Maximiert
+  trägt der Ausblenden-Knopf jetzt einen **🗑 Mülleimer**, daneben schließt ein
+  **✕** nur das Vollbild (wie Esc). Unmaximiert bleibt alles wie gehabt.
+
+### Geändert
+- `POST /api/analyze` nimmt **keine** Verbindungsdaten mehr aus dem Request-Body
+  (Relikt der früheren browser-seitigen Konfiguration). Endpunkt, Modell und Key
+  kommen ausschließlich aus der Server-Config; sonst könnte jeder angemeldete
+  Nutzer – auch read-only – den Server als Proxy auf beliebige URLs benutzen.
+  Ungespeicherte Werte prüft nur noch das Admin-Endpunkt-Paar
+  `POST /api/ai` / `POST /api/ai/test`.
+- `settings.json` wird mit **0600** geschrieben (enthält jetzt den KI-Key).
+
 ## [0.28.0] – 2026-08-26
 
 ### Hinzugefügt

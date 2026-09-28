@@ -109,6 +109,9 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
 - ⚡ **Live-Push (SSE)**, Zoom/Pan, synchrones Fadenkreuz, Counter-Reset-Marker,
   CSV-/JSON-Export, Hell/Dunkel, frei wählbare Kachelfarben & -dichte,
   Health-Übersicht & KV-Kapazität je Instanz.
+- 🪟 **Kachel-Knöpfe:** 🔍 Analyse, ⛶ maximieren, ✕ Kachel ausblenden. In der
+  maximierten Kachel wird daraus 🗑 (ausblenden) und ✕ (Vollbild schließen, wie
+  Esc); ausgeblendete Kacheln holt „Ausgeblendet: n ⟲" zurück.
 
 ## Architektur
 
@@ -214,11 +217,13 @@ Dashboard:
 |----------|---------|-----------|
 | `VLLM_LABEL` | *(leer)* | Untertitel in der Kopfzeile (z. B. Host/Standort) |
 | `VLLM_DASH_BIND` | `127.0.0.1` | Bind-Adresse; `0.0.0.0` = netzwerkweit erreichbar |
-| `VLLM_AI_URL` | *(leer)* | KI-Auswertung: OpenAI-kompatibler Chat-Endpunkt (`host:port` oder volle `…/v1/chat/completions`-URL; leer = aus). Gilt für **alle** Frontends. |
-| `VLLM_AI_MODEL` | *(leer)* | Modellname für die KI-Auswertung (lt. `/v1/models`) |
+| `VLLM_AI_URL` | *(leer)* | KI-Auswertung: OpenAI-kompatibler Chat-Endpunkt (`host:port` oder volle `…/v1/chat/completions`-URL; leer = aus). **Nur Vorbelegung** – gepflegt wird die Verbindung im ⚙-Menü unter 🤖 *KI-Verbindung*. |
+| `VLLM_AI_MODEL` | *(leer)* | Modellname für die KI-Auswertung (lt. `/v1/models`) – dito nur Vorbelegung |
 | `VLLM_AI_KEY` | *(leer)* | Optionaler Bearer-Token (lokales vLLM meist ohne). Wird nie im Browser gespeichert oder ausgeliefert. |
 | `VLLM_AI_MAX_TOKENS` | `2000` | Token-Budget der KI-Antwort |
+| `VLLM_AI_TIMEOUT` | `120` | Zeitgrenze für eine KI-Antwort in Sekunden |
 | `VLLM_AI_NO_THINK` | `0` | `1` schaltet die Denk-Phase von Reasoning-Modellen (Qwen3 u. a.) ab (`chat_template_kwargs.enable_thinking=false`) – liefert direkte, saubere Antworten. Empfohlen bei vLLM. |
+| `VLLM_SETTINGS_FILE` | `settings.json` | Alarm-Schwellwerte **und** die im UI gepflegte KI-Verbindung inkl. Key (0600, nicht ins Git) |
 | `VLLM_REPORT_DIR` | `reports/` | Zielordner für geplante KI-Schicht-Reports |
 | `VLLM_REPORT_RANGE` | `28800` | Zeitfenster des Reports in Sekunden (Default 8 h) |
 | `VLLM_AUTH_FILE` | `auth.json` (neben der DB) | Speicherort für Benutzer, Rollen und LDAP-Konfiguration (Passwörter PBKDF2-gehasht, 0600, nicht ins Git). Verwaltung im UI unter ⚙ → 👥 *Benutzer & Zugriff*. |
@@ -233,11 +238,16 @@ erzeugt einen deutschen Betriebs-Report (Kennzahlen + Alarme + KI-Bewertung) und
 legt ihn unter `VLLM_REPORT_DIR` ab. `setup.sh` kann dafür einen systemd-Timer
 einrichten (Abfrage `OnCalendar`, z. B. `*-*-* 06,14,22:00`).
 
-Die KI-Auswertung wird **ausschließlich server-seitig** über `VLLM_AI_*`
-konfiguriert (Env bzw. `setup.sh`) – es gibt keine Konfiguration im Browser.
+**KI-Verbindung einrichten:** ⚙-Menü → 🤖 *KI-Verbindung* (nur Admins). Dort
+werden Endpunkt, Modell, API-Key, Token-Budget, Zeitgrenze und „Denk-Phase
+abschalten" gepflegt; *Verbindung testen* holt die Modellliste des Endpunkts und
+schickt eine Mini-Anfrage, bevor gespeichert wird. Die Werte landen in
+`settings.json` (0600) und gelten zentral für **alle** Frontends; die
+`VLLM_AI_*`-Variablen sind nur noch die Vorbelegung beim allerersten Start.
 `GET /api/config` meldet den Frontends nur, *ob* eine KI konfiguriert ist (und
 welcher Endpunkt/welches Modell), **nie den Key**. Der Analyse-Request enthält
-lediglich den Prompt; Endpunkt, Modell und Key liegen komplett auf dem Server.
+lediglich den Prompt; Endpunkt, Modell und Key liegen komplett auf dem Server –
+`POST /api/analyze` akzeptiert bewusst keine Verbindungsdaten aus dem Browser.
 
 CLI-Aufruf des Dashboards: `python3 vllm_dashboard.sh [PORT] [BIND]`
 (z. B. `python3 vllm_dashboard.sh 8899 0.0.0.0`).

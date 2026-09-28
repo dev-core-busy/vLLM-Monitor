@@ -29,12 +29,20 @@ one or more vLLM instances (host via `VLLM_HOST`, ports/labels via
   graphed **per model over time**. Each chart has a 🔍 analysis panel: locally
   computed stats (min/max/avg/trend per series) plus an optional AI evaluation.
   The AI call is proxied server-side via `POST /api/analyze` → an
-  OpenAI-compatible chat endpoint (`VLLM_AI_URL`/`VLLM_AI_MODEL`/`VLLM_AI_KEY`,
-  e.g. one of the monitored vLLM instances). `ai_analyze()` normalizes the URL
-  (accepts `host:port`, `…/v1`, or the full path), sets
-  `chat_template_kwargs.enable_thinking=false` when `VLLM_AI_NO_THINK=1`, and
-  falls back to the `reasoning` field for reasoning models (Qwen3) when
-  `content` is empty. The analysis panel also shows deterministic anomaly
+  OpenAI-compatible chat endpoint (e.g. one of the monitored vLLM instances).
+  The connection is **configured in the UI** (⚙ → 🤖 *KI-Verbindung*, admin-only)
+  and stored in `settings.json.ai` (`load_ai_config()`/`save_ai_config()`, 0600 —
+  it holds the key); the `VLLM_AI_*` env vars are only the seed/default.
+  `_normalize_ai_url()` accepts `host:port`, `…/v1`, or the full path;
+  `ai_analyze(body, conn=None)` sets `chat_template_kwargs.enable_thinking=false`
+  when `no_think` is on, and falls back to the `reasoning` field for reasoning
+  models (Qwen3) when `content` is empty. **The connection never comes from the
+  request body** — otherwise any logged-in user (incl. read-only) could use the
+  server as a proxy to arbitrary URLs; `conn` exists solely for `ai_test()`
+  (`POST /api/ai/test`, admin), which probes unsaved values by first fetching
+  `/v1/models` (fills the model datalist) and then sending a tiny chat request.
+  `ai_public()` is what the browser sees — key replaced by `key_set`, plus
+  `configured` (url **and** model set). The analysis panel also shows deterministic anomaly
   detection (median/MAD) and a linear forecast; a "📋 KI-Report" button sends an
   aggregate prompt over all charts. `GET /api/alerts` serves the alert history,
   `GET /api/series?offset=…` returns a shifted window for period comparison, and
@@ -97,6 +105,14 @@ it). That keeps the x-axes of all tiles in a grid row on one line regardless of
 how many lines the heading wraps to, and makes `toggleMax()` free of manual
 height math — the flex child fills the maximized card exactly, so nothing
 scrolls. **New tiles must wrap their canvas in `.chartwrap`.**
+
+Every tile carries four `.cbtn`s (`buildGrid()`/`wireCardButtons()`): 🔍 analyze,
+⛶ maximize, `.close` = *hide the tile*, and `.unmax` = *close the fullscreen*.
+`.unmax` is hidden by CSS unless the card is maximized — via the **child**
+combinator (`.card.maximized > .cardbtns > .cbtn.unmax`), because a maximized
+tile is a descendant of the section `.card` and a plain descendant selector
+would reveal the button on every sibling tile too. Since both actions would
+otherwise be a ✕, `toggleMax()` swaps the `.close` glyph to 🗑 while maximized.
 
 **Numbers are always formatted.** With a `linear` x-axis Chart.js prints the raw
 epoch value in the tooltip title (`1.770.844.123.000`) and the unrounded y value

@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.28.0"
+__version__ = "0.29.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -48,8 +48,9 @@ LABEL = os.environ.get("VLLM_LABEL", "")
 CERT_PATH = None            # wird in main() gesetzt, wenn TLS aktiv ist
 PUSH_INTERVAL = 5           # SSE-Push-Takt (Sekunden)
 
-# KI-Auswertung: OpenAI-kompatibler Chat-Endpunkt (Default: leer -> im Frontend
-# konfigurierbar). Werte aus dem Request-Body haben Vorrang vor diesen Defaults.
+# KI-Auswertung: OpenAI-kompatibler Chat-Endpunkt. Diese Env-Werte sind nur noch
+# die Vorbelegung – gepflegt wird die Verbindung im ⚙-Menü („KI-Verbindung") und
+# in settings.json abgelegt (load_ai_config() überschreibt die Defaults hier).
 AI_URL = os.environ.get("VLLM_AI_URL", "")        # z. B. http://host:9081/v1/chat/completions
 AI_MODEL = os.environ.get("VLLM_AI_MODEL", "")
 AI_KEY = os.environ.get("VLLM_AI_KEY", "")
@@ -529,11 +530,9 @@ def build_config():
     except sqlite3.OperationalError:
         collector = None            # alter Collector ohne Heartbeat-Tabelle
     conn.close()
-    # Zentrale KI-Config (Server-Default für alle Frontends). Der Key selbst wird
-    # NIE ausgeliefert – nur, ob server-seitig einer gesetzt ist.
-    ai = {"url": AI_URL, "model": AI_MODEL, "key_set": bool(AI_KEY),
-          "configured": bool(AI_URL)}
-    return {"now": now * 1000, "instances": inst, "ai": ai,
+    # Zentrale KI-Config (gilt für alle Frontends). Der Key selbst wird NIE
+    # ausgeliefert – nur, ob einer gesetzt ist.
+    return {"now": now * 1000, "instances": inst, "ai": ai_public(),
             "thresholds": load_thresholds(), "collector": collector}
 
 
@@ -915,6 +914,13 @@ def save_thresholds(body):
             if v < 0:
                 return {"error": "Werte dürfen nicht negativ sein"}
             cur[k] = v
+    _settings_write("thresholds", cur)
+    return {"ok": True, "thresholds": cur}
+
+
+def _settings_write(section, value):
+    """Einen Abschnitt in settings.json ersetzen (atomar, 0600 – die Datei
+    enthält mit dem KI-Key ein Geheimnis)."""
     with _settings_lock:
         data = {}
         try:
@@ -922,12 +928,132 @@ def save_thresholds(body):
                 data = json.load(f)
         except (OSError, ValueError):
             data = {}
-        data["thresholds"] = cur
+        if not isinstance(data, dict):
+            data = {}
+        data[section] = value
         tmp = SETTINGS_FILE + ".tmp"
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
+        os.chmod(tmp, 0o600)
         os.replace(tmp, SETTINGS_FILE)
-    return {"ok": True, "thresholds": cur}
+
+
+# --- KI-Verbindung (im UI editierbar; Env VLLM_AI_* ist nur die Vorbelegung) ---
+_AI_DEFAULTS = {"url": AI_URL, "model": AI_MODEL, "key": AI_KEY,
+                "no_think": AI_NO_THINK, "max_tokens": AI_MAX_TOKENS,
+                "timeout": AI_TIMEOUT}
+
+
+def load_ai_config():
+    """KI-Verbindung: settings.json überschreibt die Env-Defaults."""
+    c = dict(_AI_DEFAULTS)
+    try:
+        with open(SETTINGS_FILE) as f:
+            d = json.load(f).get("ai") or {}
+        if isinstance(d, dict):
+            for k in ("url", "model", "key"):
+                if isinstance(d.get(k), str):
+                    c[k] = d[k].strip()
+            if "no_think" in d:
+                c["no_think"] = bool(d["no_think"])
+            for k, cast in (("max_tokens", int), ("timeout", float)):
+                if d.get(k) is not None:
+                    try:
+                        c[k] = cast(d[k])
+                    except (ValueError, TypeError):
+                        pass
+    except (OSError, ValueError, AttributeError):
+        pass
+    return c
+
+
+def ai_public(c=None):
+    """KI-Config für das Frontend – der Key wird NIE ausgeliefert, nur ob einer
+    gesetzt ist."""
+    c = c or load_ai_config()
+    return {"url": c["url"], "model": c["model"], "key_set": bool(c["key"]),
+            "no_think": bool(c["no_think"]), "max_tokens": c["max_tokens"],
+            "timeout": c["timeout"],
+            "configured": bool(c["url"] and c["model"])}
+
+
+def save_ai_config(body):
+    """KI-Verbindung aus dem ⚙-Dialog übernehmen. Wie bei den Ziel-Keys gilt:
+    fehlendes Feld ``key`` = unverändert, "" = löschen."""
+    if not isinstance(body, dict):
+        return {"error": "ungültige Anfrage"}
+    cur = load_ai_config()
+    if "url" in body:
+        cur["url"] = _normalize_ai_url(body.get("url"))
+    if "model" in body:
+        cur["model"] = (body.get("model") or "").strip()
+    if "key" in body:
+        cur["key"] = (body.get("key") or "").strip()
+    if "no_think" in body:
+        cur["no_think"] = bool(body.get("no_think"))
+    if "max_tokens" in body:
+        try:
+            cur["max_tokens"] = max(64, int(body["max_tokens"]))
+        except (ValueError, TypeError):
+            return {"error": "ungültiges Token-Budget"}
+    if "timeout" in body:
+        try:
+            cur["timeout"] = max(5.0, float(body["timeout"]))
+        except (ValueError, TypeError):
+            return {"error": "ungültige Zeitgrenze (Sekunden)"}
+    _settings_write("ai", cur)
+    return {"ok": True, "ai": ai_public(cur)}
+
+
+def ai_test(body):
+    """Verbindung prüfen, bevor sie gespeichert wird: erst die Modellliste des
+    Endpunkts holen (hilft beim Tippfehler im Modellnamen), dann einen winzigen
+    Chat-Request. Nicht übergebene Felder kommen aus der gespeicherten Config."""
+    if not isinstance(body, dict):
+        return {"error": "ungültige Anfrage"}
+    cur = load_ai_config()
+    url = _normalize_ai_url(body.get("url") if "url" in body else cur["url"])
+    model = ((body.get("model") if "model" in body else cur["model"]) or "").strip()
+    key = body.get("key")
+    if key is None:                       # Feld nicht mitgeschickt -> gespeicherten Key nutzen
+        key = cur["key"]
+    key = (key or "").strip()
+    if not url:
+        return {"error": "Kein Endpunkt angegeben."}
+    out = {"url": url}
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    # 1) Modellliste (optional – manche Endpunkte kennen /v1/models nicht)
+    try:
+        murl = url[:-len("/chat/completions")] + "/models"
+        req = urlrequest.Request(murl, headers=headers, method="GET")
+        with urlrequest.urlopen(req, timeout=15, context=ctx) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        out["models"] = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
+    except Exception:
+        out["models"] = []
+    # 2) kurzer Chat-Request
+    if not model:
+        out["error"] = "Kein Modell angegeben."
+        return out
+    t0 = time.time()
+    res = ai_analyze({"user": "Antworte ausschließlich mit: OK", "max_tokens": 32,
+                      "system": "Du bist ein Verbindungstest."},
+                     conn={"url": url, "model": model, "key": key,
+                           "no_think": cur["no_think"], "timeout": min(cur["timeout"], 30.0),
+                           "max_tokens": 32})
+    out["ms"] = int((time.time() - t0) * 1000)
+    if res.get("error"):
+        out["error"] = res["error"]
+    else:
+        out["ok"] = True
+        out["model"] = res.get("model") or model
+        out["text"] = (res.get("text") or "")[:200]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1912,25 +2038,30 @@ def _normalize_ai_url(u):
     return u + "/v1/chat/completions"
 
 
-def ai_analyze(body):
+def ai_analyze(body, conn=None):
     """Leitet eine Analyse-Anfrage an einen OpenAI-kompatiblen Chat-Endpunkt
-    (z. B. das überwachte vLLM) weiter. Request-Body überschreibt die Defaults."""
-    url = _normalize_ai_url(body.get("url") or AI_URL or "")
-    model = (body.get("model") or AI_MODEL or "").strip()
-    key = (body.get("key") or AI_KEY or "").strip()
+    (z. B. das überwachte vLLM) weiter. Die Verbindung kommt aus der
+    gespeicherten Config (⚙ → KI-Verbindung) – **nicht** aus dem Request-Body,
+    sonst könnte jeder angemeldete Nutzer den Server als Proxy missbrauchen.
+    ``conn`` nutzt nur ai_test(), um ungespeicherte Werte zu prüfen."""
+    cfg = conn or load_ai_config()
+    url = _normalize_ai_url(cfg.get("url"))
+    model = (cfg.get("model") or "").strip()
+    key = (cfg.get("key") or "").strip()
     system = body.get("system") or (
         "Du bist ein erfahrener Monitoring-Analyst für LLM-Server (vLLM). "
         "Antworte knapp, sachlich und auf Deutsch.")
     user = body.get("user") or ""
     if not url:
         return {"error": "Kein KI-Endpunkt konfiguriert. Bitte im ⚙-Menü unter "
-                         "'KI-Auswertung' einen /v1/chat/completions-Endpunkt eintragen."}
+                         "'🤖 KI-Verbindung' einen /v1/chat/completions-Endpunkt eintragen."}
     if not model:
-        return {"error": "Kein KI-Modell konfiguriert (⚙-Menü → KI-Auswertung)."}
+        return {"error": "Kein KI-Modell konfiguriert (⚙-Menü → 🤖 KI-Verbindung)."}
+    limit = cfg.get("max_tokens") or AI_MAX_TOKENS
     try:
-        max_tokens = int(body.get("max_tokens") or AI_MAX_TOKENS)
+        max_tokens = int(body.get("max_tokens") or limit)
     except (ValueError, TypeError):
-        max_tokens = AI_MAX_TOKENS
+        max_tokens = limit
     req_obj = {
         "model": model,
         "messages": [{"role": "system", "content": system},
@@ -1939,10 +2070,7 @@ def ai_analyze(body):
         "max_tokens": max_tokens,
         "stream": False,
     }
-    no_think = body.get("no_think")
-    if no_think is None:
-        no_think = AI_NO_THINK
-    if no_think:
+    if cfg.get("no_think"):
         # Qwen3 & Co.: Denk-Phase im Chat-Template abschalten -> direkte Antwort
         req_obj["chat_template_kwargs"] = {"enable_thinking": False}
     payload = json.dumps(req_obj).encode("utf-8")
@@ -1954,7 +2082,7 @@ def ai_analyze(body):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     try:
-        with urlrequest.urlopen(req, timeout=AI_TIMEOUT, context=ctx) as r:
+        with urlrequest.urlopen(req, timeout=(cfg.get("timeout") or AI_TIMEOUT), context=ctx) as r:
             data = json.loads(r.read().decode("utf-8"))
     except urlerror.HTTPError as e:
         detail = ""
@@ -1977,8 +2105,9 @@ def ai_analyze(body):
         text, finish = "", None
     if not text and finish == "length":
         return {"error": "KI-Antwort abgeschnitten (Token-Budget erschöpft). "
-                         "Im ⚙-Menü ggf. ein Modell ohne langes Reasoning wählen oder "
-                         "VLLM_AI_MAX_TOKENS erhöhen."}
+                         "Im ⚙-Menü → 🤖 KI-Verbindung „Denk-Phase abschalten\" setzen, "
+                         "das Token-Budget erhöhen oder ein Modell ohne langes "
+                         "Reasoning wählen."}
     return {"text": text, "model": model}
 
 
@@ -2292,6 +2421,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "ungültige Anfrage"})
                 return
             self._json(save_thresholds(body))
+        elif parsed.path == "/api/ai":
+            body = self._read_body()
+            if body is None:
+                self._json({"error": "ungültige Anfrage"})
+                return
+            self._json(save_ai_config(body))
+        elif parsed.path == "/api/ai/test":
+            body = self._read_body()
+            if body is None:
+                self._json({"error": "ungültige Anfrage"})
+                return
+            self._json(ai_test(body))
         elif parsed.path == "/api/annotations":
             body = self._read_body()
             if body is None:
@@ -2492,6 +2633,11 @@ PAGE = r"""<!DOCTYPE html>
         width:22px;height:20px;font-size:13px;line-height:1;padding:0;cursor:pointer;}
   .cbtn:hover{color:var(--fg);border-color:var(--accent);}
   .cbtn.close:hover{color:var(--bad);border-color:var(--bad);}
+  /* „Vollbild schließen" gibt es nur in der maximierten Kachel; direkter
+     Kind-Selektor, damit eine maximierte Kachel nicht die Knöpfe der anderen
+     Karten im Abschnitt einblendet */
+  .cbtn.unmax{display:none;}
+  .card.maximized > .cardbtns > .cbtn.unmax{display:inline-block;}
   .card.maximized{position:fixed;inset:14px;z-index:2000;margin:0;overflow:auto;
     box-shadow:0 0 0 100vmax rgba(0,0,0,.55);}
   .cbtn.analyze:hover{color:var(--accent);border-color:var(--accent);}
@@ -2732,6 +2878,7 @@ PAGE = r"""<!DOCTYPE html>
       <button id="targetsbtn" title="Zusätzliche Instanzen (vLLM/Ollama/STT/GPU) ohne Unit-Editieren hinzufügen/entfernen">🖧 Instanzen verwalten</button>
       <button id="usersbtn" class="adminonly" title="Lokale und Active-Directory-Nutzer sowie LDAP-Zugriff verwalten (nur Admins)">👥 Benutzer &amp; Zugriff</button>
       <button id="threshbtn" class="adminonly" title="Alarm-Schwellwerte (KV-Cache, GPU-Temperatur, Fehler, Offline) anpassen (nur Admins)">🔔 Schwellwerte</button>
+      <button id="aibtn" class="adminonly" title="KI-Verbindung für die 🔍-Auswertungen und den KI-Report einrichten: OpenAI-kompatibler Endpunkt, Modell, API-Key (nur Admins)">🤖 KI-Verbindung</button>
       <button id="export" title="Aktuell angezeigte Zeitreihen als CSV-Datei herunterladen">⬇ Export CSV</button>
       <button id="exportjson" title="Aktuell angezeigte Zeitreihen als JSON-Datei herunterladen">⬇ Export JSON</button>
       <a href="/metrics" target="_blank" rel="noopener" title="Prometheus-Exporter: aktuelle Werte im Prometheus-Textformat (für vorhandenes Prometheus/Grafana). Präfix vllm_monitor_, Labels host/port/model." style="display:block;font-size:12px;padding:2px 0;color:var(--fg);text-decoration:none;border-top:1px solid var(--border);margin-top:2px;padding-top:6px">📡 Prometheus /metrics ↗</a>
@@ -3033,6 +3180,42 @@ sudo update-ca-certificates</pre>
     <div style="display:flex;gap:8px;align-items:center;margin-top:14px">
       <button class="abtn" id="th-save">Speichern</button>
       <span id="th-msg" style="color:var(--muted);font-size:12px;min-height:16px"></span>
+    </div>
+  </div>
+</div>
+
+<!-- KI-Verbindung (nur Admins) -->
+<div id="aimodal" class="modal-ov">
+  <div class="modal-card" style="max-width:600px">
+    <h2 style="display:flex;align-items:center;gap:10px">🤖 KI-Verbindung
+      <button class="cbtn close" id="ai-close" title="Schließen" style="margin-left:auto">×</button></h2>
+    <p>Endpunkt für die 🔍-Auswertungen und den 📋 KI-Report. Erwartet eine
+       OpenAI-kompatible Chat-API – z. B. eine der überwachten vLLM-Instanzen.
+       Die Angabe darf <code>host:port</code>, <code>…/v1</code> oder die volle
+       <code>…/v1/chat/completions</code>-URL sein.</p>
+    <div style="display:grid;grid-template-columns:auto 1fr;gap:10px 12px;align-items:center">
+      <label for="ai-url">Endpunkt</label>
+      <input id="ai-url" class="uinput" list="ai-urls" placeholder="http://10.0.0.5:8000/v1" autocomplete="off">
+      <datalist id="ai-urls"></datalist>
+      <label for="ai-model">Modell</label>
+      <input id="ai-model" class="uinput" list="ai-models" placeholder="Qwen3-30B" autocomplete="off">
+      <datalist id="ai-models"></datalist>
+      <label for="ai-key">API-Key</label>
+      <input id="ai-key" class="uinput" type="password" autocomplete="new-password"
+             placeholder="leer = kein Key">
+      <label for="ai-max">Token-Budget je Antwort</label>
+      <input id="ai-max" class="uinput" type="number" min="64" step="100" style="width:120px">
+      <label for="ai-timeout">Zeitgrenze (Sekunden)</label>
+      <input id="ai-timeout" class="uinput" type="number" min="5" step="5" style="width:120px">
+      <span></span>
+      <label style="display:flex;gap:7px;align-items:center;font-size:13px"
+             title="Reasoning-Modelle (Qwen3 u. a.) verbrauchen das Token-Budget sonst in der Denk-Phase und antworten leer">
+        <input id="ai-nothink" type="checkbox"> Denk-Phase abschalten (Reasoning-Modelle)</label>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:14px;flex-wrap:wrap">
+      <button class="abtn" id="ai-save">Speichern</button>
+      <button class="abtn" id="ai-test" title="Modellliste abrufen und eine Mini-Anfrage senden – ohne zu speichern">Verbindung testen</button>
+      <span id="ai-msg" style="color:var(--muted);font-size:12px;min-height:16px"></span>
     </div>
   </div>
 </div>
@@ -3908,7 +4091,8 @@ function buildGrid(){
   const btns=spec=>`<div class="cardbtns">`+
              (spec.custom?"":`<button class="cbtn analyze" title="Analyse & KI-Auswertung">🔍</button>`)+
              `<button class="cbtn max" title="Maximieren (Esc schließt)">⛶</button>`+
-             `<button class="cbtn close" title="Kachel ausblenden">✕</button></div>`;
+             `<button class="cbtn close" title="Kachel ausblenden">✕</button>`+
+             `<button class="cbtn unmax" title="Vollbild schließen (Esc)">✕</button></div>`;
   orderBy(CHARTS,saved,s=>s.id).forEach(spec=>{
     const d=document.createElement("div");d.className="card";d.dataset.id=spec.id;
     d.innerHTML=btns(spec)+`<h2 title="${spec.desc||""}"><span class="grip" title="Ziehen zum Verschieben">⠿</span>${spec.title}`
@@ -3934,6 +4118,11 @@ function applyHidden(){
 function toggleMax(card,id){
   const on=card.classList.toggle("maximized");
   document.body.style.overflow=on?"hidden":"";
+  // Im Vollbild bedeutet ✕ „Fenster schließen" – das Ausblenden der Kachel
+  // bekommt deshalb den Mülleimer, damit beides unterscheidbar bleibt.
+  const hide=card.querySelector(":scope > .cardbtns > .cbtn.close");
+  if(hide){ hide.textContent=on?"🗑":"✕";
+    hide.title=on?"Kachel ausblenden (beendet das Vollbild)":"Kachel ausblenden"; }
   if(on){ window.scrollTo(0,0);
     const hdr=document.querySelector("header");
     card.style.top=((hdr?hdr.offsetHeight:56)+8)+"px";     // unter der Titelleiste beginnen
@@ -3966,6 +4155,7 @@ function wireCardButtons(container){
     const card=b.closest("[data-id]"); if(!card)return;
     if(b.classList.contains("analyze")) openAnalysis(card.dataset.id);
     else if(b.classList.contains("max")) toggleMax(card,card.dataset.id);
+    else if(b.classList.contains("unmax")){ if(card.classList.contains("maximized")) toggleMax(card,card.dataset.id); }
     else if(b.classList.contains("close")){ const h=loadHidden(); if(!h.includes(card.dataset.id)){h.push(card.dataset.id);saveHidden(h);} if(card.classList.contains("maximized"))toggleMax(card,card.dataset.id); applyHidden(); }
   });
 }
@@ -3978,8 +4168,8 @@ document.addEventListener("keydown",e=>{
 });
 
 // --- KI-Auswertung & Analyse-Panel ---
-// KI-Auswertung wird ausschließlich server-seitig konfiguriert (Env VLLM_AI_*).
-// Frühere browser-seitige Overrides aufräumen.
+// Die KI-Verbindung liegt zentral auf dem Server (⚙ → 🤖 KI-Verbindung, gespeichert
+// in settings.json) – früher gab es browser-seitige Overrides, die hier aufräumen.
 ["vllm_ai_key","vllm_ai_url","vllm_ai_model","vllm_ai_on"].forEach(k=>store.del(k));
 const fmt=v=>{ if(v==null||isNaN(v))return "–"; const a=Math.abs(v);
   return a>=100?v.toFixed(0):a>=1?v.toFixed(1):v.toFixed(2); };
@@ -4140,7 +4330,11 @@ async function runAI(){
   if(!anCur)return;
   const out=document.getElementById("an_ai"), meta=document.getElementById("an_aimeta"), gen=document.getElementById("an_gen");
   const serverConfigured=lastConfig&&lastConfig.ai&&lastConfig.ai.configured;
-  if(!serverConfigured){ out.textContent='Kein KI-Endpunkt konfiguriert. Bitte server-seitig VLLM_AI_URL / VLLM_AI_MODEL setzen (z. B. über setup.sh).'; return; }
+  if(!serverConfigured){
+    out.textContent=document.body.classList.contains("is-admin")
+      ? 'Kein KI-Endpunkt konfiguriert. Im ⚙-Menü unter „🤖 KI-Verbindung" Endpunkt und Modell eintragen.'
+      : 'Kein KI-Endpunkt konfiguriert – bitte von einem Admin im ⚙-Menü unter „🤖 KI-Verbindung" einrichten lassen.';
+    return; }
   gen.disabled=true; out.textContent="KI wertet aus …"; meta.textContent=""; const t0=Date.now();
   try{
     const user=anCur.report?buildReportPrompt():aiPrompt(anCur);
@@ -5190,6 +5384,79 @@ document.getElementById("th-save").onclick=async()=>{
   if(j.error){ msg.style.color="var(--bad)"; msg.textContent=j.error; return; }
   msg.style.color="var(--good)"; msg.textContent="Gespeichert – greift beim nächsten Scrape (≤ 15 s).";
   if(lastConfig) lastConfig.thresholds=j.thresholds;
+  fetchConfig();
+};
+
+// ---- KI-Verbindung (nur Admins) ----
+let aiKeyDirty=false;                      // Key nur senden, wenn er angefasst wurde
+function openAI(){
+  const ai=(lastConfig&&lastConfig.ai)||{};
+  document.getElementById("ai-url").value=ai.url||"";
+  document.getElementById("ai-model").value=ai.model||"";
+  const k=document.getElementById("ai-key");
+  k.value=""; aiKeyDirty=false;
+  k.placeholder=ai.key_set?"gespeichert – leer lassen = unverändert":"leer = kein Key";
+  document.getElementById("ai-max").value=ai.max_tokens!=null?ai.max_tokens:2000;
+  document.getElementById("ai-timeout").value=ai.timeout!=null?ai.timeout:120;
+  document.getElementById("ai-nothink").checked=!!ai.no_think;
+  document.getElementById("ai-msg").textContent="";
+  document.getElementById("ai-models").innerHTML="";
+  // Vorschläge: die überwachten Instanzen mit OpenAI-kompatibler API
+  const seen=new Set(), opts=[];
+  ((lastConfig&&lastConfig.instances)||[]).forEach(i=>{
+    if(["vllm","vllm-omni","lmstudio"].indexOf(i.kind)<0)return;
+    const u="http://"+i.host+":"+i.port+"/v1";
+    if(seen.has(u))return; seen.add(u);
+    opts.push(`<option value="${_esc(u)}">${_esc(i.model||"")}</option>`);
+  });
+  document.getElementById("ai-urls").innerHTML=opts.join("");
+  document.getElementById("aimodal").style.display="flex";
+}
+function aiBody(){
+  const b={url:document.getElementById("ai-url").value.trim(),
+    model:document.getElementById("ai-model").value.trim(),
+    no_think:document.getElementById("ai-nothink").checked,
+    max_tokens:parseInt(document.getElementById("ai-max").value,10),
+    timeout:parseFloat(document.getElementById("ai-timeout").value)};
+  if(isNaN(b.max_tokens)) delete b.max_tokens;
+  if(isNaN(b.timeout)) delete b.timeout;
+  if(aiKeyDirty) b.key=document.getElementById("ai-key").value;   // fehlt = unverändert
+  return b;
+}
+document.getElementById("aibtn").onclick=openAI;
+document.getElementById("ai-key").addEventListener("input",()=>{aiKeyDirty=true;});
+document.getElementById("ai-close").onclick=()=>document.getElementById("aimodal").style.display="none";
+document.getElementById("aimodal").onclick=e=>{ if(e.target===e.currentTarget) e.currentTarget.style.display="none"; };
+document.getElementById("ai-test").onclick=async()=>{
+  const msg=document.getElementById("ai-msg"), btn=document.getElementById("ai-test");
+  const body=aiBody();
+  if(!body.url){ msg.style.color="var(--bad)"; msg.textContent="Bitte einen Endpunkt eintragen."; return; }
+  btn.disabled=true; msg.style.color="var(--muted)"; msg.textContent="Teste Verbindung …";
+  let j; try{ j=await(await fetch("/api/ai/test",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)})).json(); }
+  catch(e){ btn.disabled=false; msg.style.color="var(--bad)"; msg.textContent="Netzwerkfehler."; return; }
+  btn.disabled=false;
+  // Modellliste als Vorschlag hinterlegen – hilft beim Tippfehler im Modellnamen
+  const dl=document.getElementById("ai-models");
+  dl.innerHTML=(j.models||[]).map(m=>`<option value="${_esc(m)}">`).join("");
+  if(j.error){ msg.style.color="var(--bad)";
+    msg.textContent="⚠️ "+j.error+((j.models&&j.models.length)?" · verfügbar: "+j.models.join(", "):""); return; }
+  msg.style.color="var(--good)";
+  msg.textContent="Verbindung OK – "+(j.model||"")+" antwortete in "+((j.ms||0)/1000).toFixed(1)+" s.";
+};
+document.getElementById("ai-save").onclick=async()=>{
+  const msg=document.getElementById("ai-msg");
+  let j; try{ j=await(await fetch("/api/ai",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(aiBody())})).json(); }
+  catch(e){ msg.style.color="var(--bad)"; msg.textContent="Netzwerkfehler."; return; }
+  if(j.error){ msg.style.color="var(--bad)"; msg.textContent=j.error; return; }
+  if(lastConfig) lastConfig.ai=j.ai;
+  aiKeyDirty=false;
+  document.getElementById("ai-key").value="";
+  document.getElementById("ai-key").placeholder=j.ai.key_set?"gespeichert – leer lassen = unverändert":"leer = kein Key";
+  document.getElementById("ai-url").value=j.ai.url||"";           // normalisierte URL zeigen
+  msg.style.color="var(--good)";
+  msg.textContent=j.ai.configured?"Gespeichert – gilt für alle Auswertungen.":"Gespeichert – für Auswertungen fehlt noch ein Modell.";
   fetchConfig();
 };
 
