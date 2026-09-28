@@ -4,6 +4,23 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.29.1] – 2026-09-28
+
+### Behoben
+- **„Generierte Tokens pro Tag" ignorierte den gewählten Zeitraum.** Das
+  Diagramm in *Effizienz & Kapazität* zeigte immer alle gespeicherten Tage
+  (durch die 30-Tage-Aufbewahrung also „die letzten 30 Tage"), obwohl direkt
+  darüber ein Diagramm für den gewählten Zeitraum steht. Es folgt jetzt der
+  Auswahl in der Kopfzeile – inklusive „benutzerdefiniert" (Von/Bis) – und die
+  Überschrift nennt das Fenster; bei „seit Beginn" steht dort weiterhin „seit
+  Aufzeichnungsbeginn". Gefiltert wird im Client aus dem ohnehin geladenen
+  `/api/tokens`-Payload, den das kumulierte Diagramm darunter unverändert in
+  voller Länge braucht – also kein zusätzlicher Abruf. Gemessen: 7 Tage → 8
+  Balken (21.–28.09.), 24 h → 2, seit Beginn → 31, Von/Bis 20.–23.09. → genau
+  diese 4 Tage, kumuliert durchweg 31.
+- Modelle ohne generierte Tokens im Fenster stehen nicht mehr als
+  Null-Balken in der Legende.
+
 ## [0.29.0] – 2026-09-28
 
 ### Hinzugefügt

@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.29.0"
+__version__ = "0.29.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -2929,7 +2929,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="tokbox"><div><canvas id="rangetokchart"></canvas></div></div>
     </div>
     <div>
-      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Generierte Tokens pro Tag – seit Aufzeichnungsbeginn (je Modell gestapelt)</div>
+      <div id="tokdayhead" style="font-size:12px;color:var(--muted);margin-bottom:6px">Generierte Tokens pro Tag (je Modell gestapelt)</div>
       <div class="tokbox"><div><canvas id="tokchart"></canvas></div></div>
     </div>
     <div>
@@ -4363,7 +4363,7 @@ document.getElementById("an_copy").onclick=()=>{
   if(navigator.clipboard)navigator.clipboard.writeText(txt).catch(()=>{});
 };
 
-let tokChart=null, rangeTokChart=null, cumTokChart=null, lastTokens=null, _tokTs=0;   // früh deklariert (applyTheme greift darauf zu)
+let tokChart=null, rangeTokChart=null, cumTokChart=null, lastTokens=null, _tokTs=0, _tokWin="";   // früh deklariert (applyTheme greift darauf zu)
 let energyChart=null, lastEnergy=null;                              // dito – applyTheme läuft vor renderEnergy
 let tokTileChart=null, lastTokenTile=null;                          // Token-Zähler-Kachel (analog energyChart)
 buildGrid();
@@ -4886,14 +4886,47 @@ function renderRangeTokenChart(){
 // Balkendiagramm: generierte Tokens pro Tag seit Aufzeichnungsbeginn (je Modell gestapelt)
 async function fetchTokens(force){
   const now=Date.now();
-  if(!force && now-_tokTs<55000) return;   // deckt sich mit dem 60-s-Server-Cache
+  if(!force && now-_tokTs<55000){
+    // Der Server cacht ohnehin 60 s – aber der Zeitraum kann sich geändert
+    // haben, und den filtert erst renderTokenChart(). Nur dann neu zeichnen,
+    // sonst liefe das Balkendiagramm bei jedem Live-Push mit.
+    if(lastTokens && tokWinKey()!==_tokWin) renderTokenChart(lastTokens);
+    return;
+  }
   _tokTs=now;
   try{ lastTokens=await(await fetch("/api/tokens")).json();
        renderTokenChart(lastTokens); renderCumTokenChart(lastTokens); }catch(e){}
 }
+// Kalendertage des gewählten Zeitfensters. Gefiltert wird im Client: /api/tokens
+// liefert ohnehin alle Tage (die das kumulierte Diagramm vollständig braucht),
+// ein zweiter Abruf wäre reine Verdopplung. Die Grenzen spiegeln die
+// Server-Logik aus build_tokens(): ganze Tage, die das Fenster berührt.
+function tokenWindow(){
+  if(isAbs()){ const w=absWindow(); return w?{from:w.from*1000,to:w.to*1000}:null; }
+  if(rangeSel()==="all") return null;                  // „seit Beginn": alle Tage
+  const sp=parseInt(rangeVal(),10)||0; if(!sp) return null;
+  const to=Date.now(); return {from:to-sp*1000, to};
+}
+function daysInWindow(days){
+  const w=tokenWindow(); if(!w) return days;
+  const a=isoDay(new Date(w.from)), b=isoDay(new Date(w.to));
+  return days.filter(d=>d.date>=a && d.date<=b);
+}
+// Kennung des Fensters in Tagen – ändert sie sich nicht, ändert sich auch das
+// Diagramm nicht.
+function tokWinKey(){ const w=tokenWindow();
+  return w ? isoDay(new Date(w.from))+"|"+isoDay(new Date(w.to)) : "all"; }
 function renderTokenChart(data){
   const cv=document.getElementById("tokchart"); if(!cv||!data)return;
-  const days=data.days||[], models=data.models||[];
+  _tokWin=tokWinKey();
+  const days=daysInWindow(data.days||[]);
+  // Nur Modelle zeigen, die im Fenster auch etwas erzeugt haben – sonst steht in
+  // der Legende ein Modell, dessen Balken überall 0 ist.
+  const models=(data.models||[]).filter(m=>days.some(d=>(d.models[m]||0)>0));
+  const head=document.getElementById("tokdayhead");
+  if(head) head.textContent="Generierte Tokens pro Tag – "
+    +(tokenWindow()?"ganze Kalendertage im gewählten Zeitraum":"seit Aufzeichnungsbeginn")
+    +" (je Modell gestapelt)"+(days.length?"":" – keine Daten im Zeitraum");
   const labels=days.map(d=>d.date);
   const dsets=(models.length?models:["gen"]).map(m=>({
     label: models.length?shortModel(m):"Tokens",
