@@ -83,20 +83,24 @@ as a bar chart in the selected range, with an Ø/day line. Its preview shows the
 **total** as the large figure (the "counter", `fmtBig`). Data comes from the
 range-aware `build_tokens(range_s|start,end)` via `GET /api/tokens?range=…` —
 **without** params `build_tokens()` returns all days since recording
-(`_tokens_all()`, 60 s cached); that is what the Effizienz section fetches.
+(`_tokens_all()`, 60 s cached); that is what the cumulative Effizienz chart
+fetches (`fetchTokens()` → `lastTokens`).
 
-Both Effizienz token charts share that one full payload. The **daily** chart
-(`tokchart`) is filtered **client-side** to the selected window
-(`tokenWindow()`/`daysInWindow()`, mirroring the server's date filter in
-`build_tokens()`), because a second range-aware request would only re-send a
-subset of what `lastTokens` already holds — and the cumulative chart below needs
-the *full* history at the same time. The heading `#tokdayhead` is written by
-`renderTokenChart()` and names the window ("ganze Kalendertage im gewählten
-Zeitraum" vs. "seit Aufzeichnungsbeginn" for `range=all`); the bars are whole
-calendar days, so a 15-min window shows today's full-day bar — same semantics as
-the Token-Zähler tile. Since `fetchTokens()` is throttled to the 60 s server
-cache, its early return still re-renders when `tokWinKey()` (the window in *days*)
-changed — otherwise a range switch would leave the old bars standing.
+The Effizienz **daily** chart (`tokchart`, `renderTokenChart()`) does **not**
+filter anything itself: it renders the very same server-filtered payload as the
+Token-Zähler tile (`lastTokenTile`). `fetchTokensTile()` builds its query with
+`seriesQuery()` and redraws **both** the tile and the daily chart, and every
+range switch / `applyAbs()` calls it directly — so the day boundaries are always
+the **server's** time zone, and tile and chart cannot drift apart. (0.29.1
+mirrored the filter in JS; that broke as soon as browser and server time zones
+differed — don't reintroduce it.) A sequence counter (`_tokTileSeq`) drops late
+responses from an earlier range. The heading `#tokdayhead` names the window
+("ganze Kalendertage im gewählten Zeitraum", or "seit Aufzeichnungsbeginn" when
+the payload was fetched with `range=all`, flag `all` set client-side); the bars
+are whole calendar days, so a 15-min window shows today's full-day bar. With an
+**invalid custom window** (Von/Bis empty or reversed) `fetchTokensTile()` and
+`fetchEnergy()` return early, just like `startRefresh()` — all views keep the
+last valid window instead of the server's `range=custom` → 1 h fallback.
 
 The Effizienz section carries a third chart, **"… seit Aufzeichnungsbeginn
 (kumuliert)"** (`cumtokchart`/`cumTokChart`), fed from the very same

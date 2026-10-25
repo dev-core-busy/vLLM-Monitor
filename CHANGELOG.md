@@ -4,6 +4,27 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.29.2] – 2026-10-25
+
+### Behoben
+- **„Generierte Tokens pro Tag" und die Token-Zähler-Kachel zeigen wieder
+  dieselben Tage.** 0.29.1 filterte das Tagesdiagramm im Browser und damit in
+  dessen Zeitzone, die Tageslabels entstehen aber in der Zeitzone des Servers.
+  Weichen beide ab, fehlten Randtage oder es waren zu viele drin (z. B. „keine
+  Daten im Zeitraum" kurz nach Mitternacht). Das Diagramm nutzt jetzt die schon
+  geladenen, serverseitig gefilterten Daten der Kachel. Die doppelte
+  Fensterlogik im Client (`tokenWindow()`/`daysInWindow()`/`tokWinKey()`)
+  entfällt.
+- Ein Zeitraumwechsel zeichnet das Tagesdiagramm direkt neu. Bisher lief das
+  nur über den Serien-Abruf, sodass bei einem Fehler von `/api/series` die
+  alten Balken stehen blieben. Späte Antworten eines vorherigen Zeitraums
+  werden verworfen.
+- Ungültiges „benutzerdefiniert" (Von/Bis leer oder vertauscht): Das
+  Tagesdiagramm zeigte die ganze Historie mit der Überschrift „seit
+  Aufzeichnungsbeginn", Token- und Energie-Kachel sprangen auf 1 h. Jetzt
+  bleiben alle Ansichten wie die Diagramme oben auf dem letzten gültigen
+  Fenster stehen.
+
 ## [0.29.1] – 2026-09-28
 
 ### Behoben

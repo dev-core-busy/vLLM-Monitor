@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.29.1"
+__version__ = "0.29.2"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -4069,7 +4069,7 @@ function applyTheme(t){document.body.dataset.theme=t;store.set("vllm_theme",t);
   if(tokChart){ tokChart.options.scales.x.ticks.color=css("--muted");
     tokChart.options.scales.y.ticks.color=css("--muted"); tokChart.options.scales.y.grid.color=css("--grid");
     if(tokChart.options.plugins.legend.labels) tokChart.options.plugins.legend.labels.color=css("--muted");
-    if(lastTokens) renderTokenChart(lastTokens); else tokChart.update(); }
+    renderTokenChart(lastTokenTile); }
   if(rangeTokChart){ rangeTokChart.options.scales.x.ticks.color=css("--muted");
     rangeTokChart.options.scales.y.ticks.color=css("--muted"); rangeTokChart.options.scales.y.grid.color=css("--grid");
     renderRangeTokenChart(); }
@@ -4363,9 +4363,9 @@ document.getElementById("an_copy").onclick=()=>{
   if(navigator.clipboard)navigator.clipboard.writeText(txt).catch(()=>{});
 };
 
-let tokChart=null, rangeTokChart=null, cumTokChart=null, lastTokens=null, _tokTs=0, _tokWin="";   // früh deklariert (applyTheme greift darauf zu)
+let tokChart=null, rangeTokChart=null, cumTokChart=null, lastTokens=null, _tokTs=0;   // früh deklariert (applyTheme greift darauf zu)
 let energyChart=null, lastEnergy=null;                              // dito – applyTheme läuft vor renderEnergy
-let tokTileChart=null, lastTokenTile=null;                          // Token-Zähler-Kachel (analog energyChart)
+let tokTileChart=null, lastTokenTile=null, _tokTileSeq=0;           // Token-Zähler-Kachel (analog energyChart)
 buildGrid();
 applyTheme(store.get("vllm_theme")||"dark");
 // Anomalie-Marker in allen Diagrammen (Umschalter, Zustand im Cookie)
@@ -4653,8 +4653,8 @@ const avgline={id:"avgline",afterDatasetsDraw(c){
 }};
 async function fetchEnergy(){
   if(!document.getElementById("energyhead"))return;
-  try{ const q=isAbs()?(()=>{const w=absWindow();return w?"from="+w.from+"&to="+w.to:"range="+rangeVal();})():"range="+rangeVal();
-    lastEnergy=await(await fetch("/api/energy?"+q)).json(); }catch(e){ lastEnergy=null; }
+  if(isAbs()&&!absWindow())return;      // Von/Bis ungültig: wie startRefresh() das letzte Fenster stehen lassen
+  try{ lastEnergy=await(await fetch("/api/energy?"+seriesQuery())).json(); }catch(e){ lastEnergy=null; }
   renderEnergy();
 }
 function renderEnergy(){
@@ -4754,11 +4754,19 @@ const tokavgline={id:"tokavgline",afterDatasetsDraw(c){
   ctx.fillStyle=col; ctx.fillText(txt,a.right-9,ty);
   ctx.restore();
 }};
+// Tages-Token-Daten für den gewählten Zeitraum, serverseitig gefiltert
+// (build_tokens). Speist die Token-Zähler-Kachel *und* das Tagesdiagramm in
+// „Effizienz & Kapazität" – so gibt es nur eine Fensterlogik, und beide zeigen
+// immer dieselben Tage.
 async function fetchTokensTile(){
-  if(!document.getElementById("tokenshead"))return;
-  try{ const q=isAbs()?(()=>{const w=absWindow();return w?"from="+w.from+"&to="+w.to:"range="+rangeVal();})():"range="+rangeVal();
-    lastTokenTile=await(await fetch("/api/tokens?"+q)).json(); }catch(e){ lastTokenTile=null; }
-  renderTokensTile();
+  if(!document.getElementById("tokenshead")&&!document.getElementById("tokchart"))return;
+  if(isAbs()&&!absWindow())return;      // Von/Bis ungültig: wie startRefresh() das letzte Fenster stehen lassen
+  const q=seriesQuery(), seq=++_tokTileSeq; let j=null;
+  try{ j=await(await fetch("/api/tokens?"+q)).json(); }catch(e){}
+  if(seq!==_tokTileSeq)return;          // ein späterer Zeitraumwechsel hat schon neu angefragt
+  if(j&&!j.error) j.all=(q==="range=all");
+  lastTokenTile=j;
+  renderTokensTile(); renderTokenChart(lastTokenTile);
 }
 function renderTokensTile(){
   const head=document.getElementById("tokenshead"), cv=document.getElementById("c_tokens");
@@ -4826,7 +4834,7 @@ async function delAnnotation(id){
   if(store.get("vllm_eff_collapsed")!=="0") ec.classList.add("collapsed"); else ec.classList.remove("collapsed");
   sync();
   et.onclick=()=>{ const collapsed=ec.classList.toggle("collapsed"); store.set("vllm_eff_collapsed", collapsed?"1":"0"); sync();
-    if(!collapsed){ fetchTokens(true); renderRangeTokenChart();
+    if(!collapsed){ fetchTokens(true); renderRangeTokenChart(); renderTokenChart(lastTokenTile);
       setTimeout(()=>{ try{ tokChart&&tokChart.resize(); rangeTokChart&&rangeTokChart.resize();
                             cumTokChart&&cumTokChart.resize(); }catch(e){} },60); } };
 })();
@@ -4883,49 +4891,27 @@ function renderRangeTokenChart(){
     rangeTokChart.data.datasets[0].backgroundColor=colors; rangeTokChart.update();
   }
 }
-// Balkendiagramm: generierte Tokens pro Tag seit Aufzeichnungsbeginn (je Modell gestapelt)
+// Volle Tageshistorie seit Aufzeichnungsbeginn für das kumulierte Diagramm.
+// Der Server cacht 60 s, öfter abzufragen bringt nichts.
 async function fetchTokens(force){
   const now=Date.now();
-  if(!force && now-_tokTs<55000){
-    // Der Server cacht ohnehin 60 s – aber der Zeitraum kann sich geändert
-    // haben, und den filtert erst renderTokenChart(). Nur dann neu zeichnen,
-    // sonst liefe das Balkendiagramm bei jedem Live-Push mit.
-    if(lastTokens && tokWinKey()!==_tokWin) renderTokenChart(lastTokens);
-    return;
-  }
+  if(!force && now-_tokTs<55000) return;
   _tokTs=now;
   try{ lastTokens=await(await fetch("/api/tokens")).json();
-       renderTokenChart(lastTokens); renderCumTokenChart(lastTokens); }catch(e){}
+       renderCumTokenChart(lastTokens); }catch(e){}
 }
-// Kalendertage des gewählten Zeitfensters. Gefiltert wird im Client: /api/tokens
-// liefert ohnehin alle Tage (die das kumulierte Diagramm vollständig braucht),
-// ein zweiter Abruf wäre reine Verdopplung. Die Grenzen spiegeln die
-// Server-Logik aus build_tokens(): ganze Tage, die das Fenster berührt.
-function tokenWindow(){
-  if(isAbs()){ const w=absWindow(); return w?{from:w.from*1000,to:w.to*1000}:null; }
-  if(rangeSel()==="all") return null;                  // „seit Beginn": alle Tage
-  const sp=parseInt(rangeVal(),10)||0; if(!sp) return null;
-  const to=Date.now(); return {from:to-sp*1000, to};
-}
-function daysInWindow(days){
-  const w=tokenWindow(); if(!w) return days;
-  const a=isoDay(new Date(w.from)), b=isoDay(new Date(w.to));
-  return days.filter(d=>d.date>=a && d.date<=b);
-}
-// Kennung des Fensters in Tagen – ändert sie sich nicht, ändert sich auch das
-// Diagramm nicht.
-function tokWinKey(){ const w=tokenWindow();
-  return w ? isoDay(new Date(w.from))+"|"+isoDay(new Date(w.to)) : "all"; }
+// Balkendiagramm: generierte Tokens pro Tag im gewählten Zeitraum (je Modell
+// gestapelt). data = lastTokenTile, also bereits vom Server auf ganze
+// Kalendertage des Fensters gefiltert.
 function renderTokenChart(data){
-  const cv=document.getElementById("tokchart"); if(!cv||!data)return;
-  _tokWin=tokWinKey();
-  const days=daysInWindow(data.days||[]);
+  const cv=document.getElementById("tokchart"); if(!cv)return;
+  const ok=data&&!data.error, days=(ok&&data.days)||[];
   // Nur Modelle zeigen, die im Fenster auch etwas erzeugt haben – sonst steht in
   // der Legende ein Modell, dessen Balken überall 0 ist.
-  const models=(data.models||[]).filter(m=>days.some(d=>(d.models[m]||0)>0));
+  const models=((ok&&data.models)||[]).filter(m=>days.some(d=>(d.models[m]||0)>0));
   const head=document.getElementById("tokdayhead");
   if(head) head.textContent="Generierte Tokens pro Tag – "
-    +(tokenWindow()?"ganze Kalendertage im gewählten Zeitraum":"seit Aufzeichnungsbeginn")
+    +(ok&&data.all?"seit Aufzeichnungsbeginn":"ganze Kalendertage im gewählten Zeitraum")
     +" (je Modell gestapelt)"+(days.length?"":" – keine Daten im Zeitraum");
   const labels=days.map(d=>d.date);
   const dsets=(models.length?models:["gen"]).map(m=>({
