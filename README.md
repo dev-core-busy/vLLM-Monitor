@@ -227,7 +227,7 @@ Dashboard:
 | `VLLM_REPORT_DIR` | `reports/` | Zielordner für geplante KI-Schicht-Reports |
 | `VLLM_REPORT_RANGE` | `28800` | Zeitfenster des Reports in Sekunden (Default 8 h) |
 | `VLLM_AUTH_FILE` | `auth.json` (neben der DB) | Speicherort für Benutzer, Rollen und LDAP-Konfiguration (Passwörter PBKDF2-gehasht, 0600, nicht ins Git). Verwaltung im UI unter ⚙ → 👥 *Benutzer & Zugriff*. |
-| `VLLM_LDAP_*` | *(leer)* | **Nur Erst-Seed:** `VLLM_LDAP_HOST`/`_DOMAIN`/`_TLS`/`_PORT`/`_PORT_TLS`/`_BASE_DN` befüllen beim allerersten Start die LDAP-Config in `auth.json`; danach wird alles im UI gepflegt. `setup.sh` fragt LDAP nicht mehr ab. |
+| `VLLM_LDAP_*` | *(leer)* | **Nur Erst-Seed:** `VLLM_LDAP_HOST`/`_DOMAIN`/`_TLS`/`_PORT`/`_PORT_TLS`/`_BASE_DN`/`_BIND_USER`/`_BIND_PASSWORD` befüllen beim allerersten Start die LDAP-Config in `auth.json`; danach wird alles im UI gepflegt. `setup.sh` fragt LDAP nicht mehr ab. |
 | `VLLM_PBKDF2_ITER` | `200000` | Iterationen fürs Passwort-Hashing (PBKDF2-HMAC-SHA256) lokaler Nutzer. |
 | `VLLM_AUTH_TTL` | `300` | Sekunden, wie lange eine erfolgreiche Basic-Auth-Prüfung (Scraper) server-seitig gecacht wird. |
 | `VLLM_AUTH_COOKIE_DAYS` | `7` | Gültigkeit des persistenten Session-Cookies (gleitend verlängert) – kein wiederholtes Login. |
@@ -397,6 +397,11 @@ CORS/OPTIONS, Embeddings/Rerank …) und stellt sie je nach erkanntem Servertyp
   Active-Directory-Nutzer (einzeln oder per **AD-Gruppe** → Rolle, via LDAP
   Simple Bind + `memberOf`-Suche) werden unter ⚙ → 👥 *Benutzer & Zugriff*
   gepflegt und in `auth.json` (0600, nicht ins Git) gespeichert.
+- **AD-Dienstkonto:** Verbindungstest und Verzeichnissuche binden mit einem fest
+  hinterlegten Dienstkonto (nur Leserechte nötig) statt mit einem Testbenutzer.
+  Das Passwort liegt in `auth.json`, die API meldet nur, *ob* eines gesetzt ist;
+  nach einem Wechsel des DC-Hosts wird es verworfen und muss neu eingegeben
+  werden, damit es nicht an einen anderen Server geht.
 - **API-Keys der überwachten Server** liegen in `targets.json` (0600, nicht ins
   Git) und werden von der API nie ausgeliefert – das UI erfährt nur, *ob* ein Key
   gesetzt ist. Die CLI-Tools merken ihre Keys in `~/.monitor_api_key` bzw.

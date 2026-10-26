@@ -4,6 +4,23 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.30.0] – 2026-10-26
+
+### Geändert
+- **AD-Dienstkonto statt Testbenutzer.** Unter ⚙ → 👥 *Benutzer & Zugriff* →
+  *LDAP-/AD-Anbindung* wird jetzt ein festes Dienstkonto hinterlegt
+  (Bind-Benutzer als Name, UPN, `DOMÄNE\name` oder DN + Passwort). Die Felder
+  „Test-Benutzer"/„Test-Passwort" entfallen; *Verbindung testen* und die
+  *Verzeichnissuche* binden mit dem Dienstkonto. Der Test sucht das Dienstkonto
+  zusätzlich unter dem Basis-DN und belegt damit, dass es im Verzeichnis lesen
+  darf. Die Anmeldung der Nutzer selbst bindet weiterhin mit deren eigenen
+  Zugangsdaten.
+- Das Dienstkonto-Passwort liegt in `auth.json` (0600) und wird nie an den
+  Browser ausgeliefert (`bind_pw_set`). Fehlendes Feld = unverändert, leer =
+  löschen. Nach einem Wechsel des DC-Hosts wird es verworfen, damit ein
+  geänderter Host das gespeicherte Passwort nicht abgreifen kann.
+- Erst-Seed per `VLLM_LDAP_BIND_USER`/`VLLM_LDAP_BIND_PASSWORD`.
+
 ## [0.29.2] – 2026-10-25
 
 ### Behoben

@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.29.2"
+__version__ = "0.30.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -1230,6 +1230,10 @@ def _default_ldap_cfg():
         "port_tls": int(os.environ.get("VLLM_LDAP_PORT_TLS", "636")),
         "tls": os.environ.get("VLLM_LDAP_TLS", "auto").strip().lower(),
         "base_dn": os.environ.get("VLLM_LDAP_BASE_DN", "").strip(),
+        # festes Dienstkonto für Verbindungstest und Verzeichnissuche
+        # (UPN, DOMÄNE\name oder DN); das Passwort verlässt den Server nie
+        "bind_user": os.environ.get("VLLM_LDAP_BIND_USER", "").strip(),
+        "bind_password": os.environ.get("VLLM_LDAP_BIND_PASSWORD", ""),
         "group_admin": "",
         "group_readonly": "",
         "default_role": "",   # "" = kein Zugriff ohne Gruppen-/Einzelfreigabe
@@ -1577,34 +1581,37 @@ def _ldap_search(sock, base, filt, attrs, sizelimit=25, msgid=2, scope=2, binary
     return out
 
 
-def ldap_directory_search(cfg, kind, q, user, password, limit=25):
-    """Durchsucht das AD nach Benutzern oder Gruppen (Substring). Bindet mit den
-    übergebenen Anmeldedaten (kein gespeichertes Dienstkonto)."""
-    q = (q or "").strip()
+def _ldap_bind_name(cfg, user):
+    """Bind-Name: UPN, DOMÄNE\\name oder DN unverändert, sonst name@domäne."""
+    user = (user or "").strip()
+    domain = (cfg.get("domain") or "").strip()
+    if "@" in user or "\\" in user or "=" in user or not domain:
+        return user
+    return "%s@%s" % (user, domain)
+
+
+def ldap_public(ld):
+    """LDAP-Config für den Browser – das Dienstkonto-Passwort wird NIE
+    ausgeliefert, nur ob eines hinterlegt ist."""
+    out = {k: v for k, v in ld.items() if k != "bind_password"}
+    out["bind_pw_set"] = bool(ld.get("bind_password"))
+    return out
+
+
+def _ldap_service_session(cfg, fn):
+    """Bindet mit dem hinterlegten Dienstkonto und ruft fn(sock, base) auf.
+    Gibt dessen Ergebnis zurück oder {"error": …}."""
     if not cfg.get("host"):
         return {"error": "Kein LDAP-Host konfiguriert."}
+    user = (cfg.get("bind_user") or "").strip()
+    password = cfg.get("bind_password") or ""
     if not user or not password:
-        return {"error": "Für die Suche Test-Benutzer/-Passwort angeben."}
-    if not q:
-        return {"error": "Suchbegriff angeben."}
-    domain = (cfg.get("domain") or "").strip()
-
-    def _dn(u):
-        return u if ("@" in u or "\\" in u or "=" in u) else ("%s@%s" % (u, domain) if domain else u)
-
-    base = (cfg.get("base_dn") or "").strip() or _domain_to_base(domain)
+        if cfg.get("_pw_host_changed"):
+            return {"error": "Host geändert – das Dienstkonto-Passwort bitte erneut eingeben."}
+        return {"error": "Kein Dienstkonto hinterlegt (Bind-Benutzer und -Passwort)."}
+    base = (cfg.get("base_dn") or "").strip() or _domain_to_base(cfg.get("domain"))
     if not base:
         return {"error": "Basis-DN bzw. Domäne fehlt."}
-    qe = _ldap_escape(q)
-    if kind == "group":
-        filt = _f_and(_f_eq("objectClass", "group"),
-                      _f_or(_f_sub("cn", qe), _f_sub("sAMAccountName", qe)))
-        attrs = ["cn", "distinguishedName", "sAMAccountName"]
-    else:
-        filt = _f_and(_f_eq("objectClass", "user"), _f_eq("objectCategory", "person"),
-                      _f_or(_f_sub("sAMAccountName", qe), _f_sub("displayName", qe),
-                            _f_sub("userPrincipalName", qe)))
-        attrs = ["sAMAccountName", "displayName", "userPrincipalName", "distinguishedName"]
     tls = (cfg.get("tls") or "auto").lower()
     port = int(cfg.get("port", 389)); port_tls = int(cfg.get("port_tls", 636))
     if tls in ("1", "require", "yes", "on", "ldaps"):
@@ -1617,26 +1624,15 @@ def ldap_directory_search(cfg, kind, q, user, password, limit=25):
         sock = raw = None
         try:
             sock, raw = _ldap_connect(cfg["host"], p, use_tls)
-            rc = _ldap_do_bind(sock, _dn(user), password)
+            rc = _ldap_do_bind(sock, _ldap_bind_name(cfg, user), password)
             if rc is None:
                 continue
             if rc != 0:
-                return {"error": "Bind fehlgeschlagen (Anmeldedaten prüfen)."}
-            entries = _ldap_search(sock, base, filt, attrs, limit)
-            res = []
-            for e in entries:
-                if kind == "group":
-                    cn = (e.get("cn") or [""])[0]
-                    dn = (e.get("distinguishedname") or e.get("dn") or [""])[0]
-                    if cn or dn:
-                        res.append({"name": cn or dn, "dn": dn})
-                else:
-                    sam = (e.get("samaccountname") or [""])[0]
-                    if sam:
-                        res.append({"name": sam,
-                                    "display": (e.get("displayname") or [""])[0],
-                                    "upn": (e.get("userprincipalname") or [""])[0]})
-            return {"ok": True, "results": res}
+                return {"error": "Bind mit dem Dienstkonto fehlgeschlagen (Benutzer/Passwort prüfen)."}
+            res = fn(sock, base)
+            if isinstance(res, dict):
+                res.setdefault("tls", use_tls)
+            return res
         except Exception:
             continue
         finally:
@@ -1649,12 +1645,15 @@ def ldap_directory_search(cfg, kind, q, user, password, limit=25):
     return {"error": "Verbindung zum Domain-Controller fehlgeschlagen."}
 
 
-def ldap_search_api(body):
-    if not isinstance(body, dict):
-        return {"error": "ungültige Anfrage"}
+def _ldap_form_cfg(body):
+    """Gespeicherte LDAP-Config, überlagert mit den (noch ungespeicherten)
+    Formularwerten. Das gespeicherte Dienstkonto-Passwort wird nur an den
+    gespeicherten Host geschickt – sonst könnte man es mit einem anderen Host
+    im Formular an einen fremden Server umleiten."""
     au = load_auth()
     ld = dict(au["ldap"])
-    for k in ("host", "domain", "base_dn", "tls"):
+    stored_host = (ld.get("host") or "").strip().lower()
+    for k in ("host", "domain", "base_dn", "tls", "bind_user"):
         if k in body and body[k] is not None:
             ld[k] = str(body[k]).strip()
     for k in ("port", "port_tls"):
@@ -1663,8 +1662,55 @@ def ldap_search_api(body):
                 ld[k] = int(body[k])
             except (ValueError, TypeError):
                 pass
-    return ldap_directory_search(ld, body.get("kind", "user"), body.get("q", ""),
-                                 (body.get("username") or "").strip(), body.get("password") or "")
+    if "bind_password" in body:
+        ld["bind_password"] = body.get("bind_password") or ""
+    elif (ld.get("host") or "").strip().lower() != stored_host and ld.get("bind_password"):
+        ld["bind_password"] = ""
+        ld["_pw_host_changed"] = True
+    return au, ld
+
+
+def ldap_directory_search(cfg, kind, q, limit=25):
+    """Durchsucht das AD nach Benutzern oder Gruppen (Substring). Bindet mit dem
+    hinterlegten Dienstkonto."""
+    q = (q or "").strip()
+    if not q:
+        return {"error": "Suchbegriff angeben."}
+    qe = _ldap_escape(q)
+    if kind == "group":
+        filt = _f_and(_f_eq("objectClass", "group"),
+                      _f_or(_f_sub("cn", qe), _f_sub("sAMAccountName", qe)))
+        attrs = ["cn", "distinguishedName", "sAMAccountName"]
+    else:
+        filt = _f_and(_f_eq("objectClass", "user"), _f_eq("objectCategory", "person"),
+                      _f_or(_f_sub("sAMAccountName", qe), _f_sub("displayName", qe),
+                            _f_sub("userPrincipalName", qe)))
+        attrs = ["sAMAccountName", "displayName", "userPrincipalName", "distinguishedName"]
+
+    def _run(sock, base):
+        res = []
+        for e in _ldap_search(sock, base, filt, attrs, limit):
+            if kind == "group":
+                cn = (e.get("cn") or [""])[0]
+                dn = (e.get("distinguishedname") or e.get("dn") or [""])[0]
+                if cn or dn:
+                    res.append({"name": cn or dn, "dn": dn})
+            else:
+                sam = (e.get("samaccountname") or [""])[0]
+                if sam:
+                    res.append({"name": sam,
+                                "display": (e.get("displayname") or [""])[0],
+                                "upn": (e.get("userprincipalname") or [""])[0]})
+        return {"ok": True, "results": res}
+
+    return _ldap_service_session(cfg, _run)
+
+
+def ldap_search_api(body):
+    if not isinstance(body, dict):
+        return {"error": "ungültige Anfrage"}
+    _, ld = _ldap_form_cfg(body)
+    return ldap_directory_search(ld, body.get("kind", "user"), body.get("q", ""))
 
 
 def ldap_login(cfg, username, password):
@@ -1822,7 +1868,7 @@ def build_users():
     users = [{"username": u["username"], "role": u.get("role", "admin"),
               "must_change": bool(u.get("must_change"))} for u in au.get("users", [])]
     return {"users": users, "ad_users": au.get("ad_users", []),
-            "ad_groups": au.get("ad_groups", []), "ldap": au.get("ldap", {})}
+            "ad_groups": au.get("ad_groups", []), "ldap": ldap_public(au.get("ldap", {}))}
 
 
 def users_upsert(body):
@@ -1906,9 +1952,16 @@ def ldap_update(body):
         return {"error": "ungültige Anfrage"}
     au = load_auth()
     ld = au["ldap"]
-    for k in ("host", "domain", "base_dn", "group_admin", "group_readonly"):
+    stored_host = (ld.get("host") or "").strip().lower()
+    for k in ("host", "domain", "base_dn", "group_admin", "group_readonly", "bind_user"):
         if k in body:
             ld[k] = (body.get(k) or "").strip()
+    # Dienstkonto-Passwort: fehlendes Feld = unverändert, "" = löschen. Ein
+    # Hostwechsel ohne neues Passwort verwirft das alte (s. _ldap_form_cfg).
+    if "bind_password" in body:
+        ld["bind_password"] = body.get("bind_password") or ""
+    elif (ld.get("host") or "").strip().lower() != stored_host:
+        ld["bind_password"] = ""
     if "tls" in body:
         ld["tls"] = (body.get("tls") or "auto").strip().lower()
     if "enabled" in body:
@@ -1923,39 +1976,34 @@ def ldap_update(body):
         dr = (body.get("default_role") or "").strip()
         ld["default_role"] = dr if dr in ROLES else ""
     save_auth(au)
-    return {"ok": True, "ldap": ld}
+    return {"ok": True, "ldap": ldap_public(ld)}
 
 
 def ldap_test(body):
-    """Test-Bind mit übergebenen Zugangsdaten (Formularwerte überschreiben die
-    gespeicherte Config, damit man vor dem Speichern prüfen kann)."""
+    """Verbindungstest mit dem Dienstkonto (Formularwerte überschreiben die
+    gespeicherte Config, damit man vor dem Speichern prüfen kann): Bind und
+    anschließend das Dienstkonto selbst unter dem Basis-DN suchen – das belegt
+    zugleich, dass das Konto im Verzeichnis lesen darf."""
     if not isinstance(body, dict):
         return {"error": "ungültige Anfrage"}
-    au = load_auth()
-    ld = dict(au["ldap"])
-    for k in ("host", "domain", "base_dn", "tls", "group_admin", "group_readonly"):
-        if k in body and body[k] is not None:
-            ld[k] = str(body[k]).strip()
-    for k in ("port", "port_tls"):
-        if k in body:
-            try:
-                ld[k] = int(body[k])
-            except (ValueError, TypeError):
-                pass
-    ld["enabled"] = True
-    user = (body.get("username") or "").strip()
-    pw = body.get("password") or ""
-    if not user or not pw:
-        return {"error": "Test-Benutzer und -Passwort angeben."}
+    _, ld = _ldap_form_cfg(body)
+    user = (ld.get("bind_user") or "").strip()
+    short = user.split("@")[0].split("\\")[-1]
+    if "=" in user:
+        filt = _f_eq("distinguishedName", user)
+    else:
+        filt = _f_or(_f_eq("sAMAccountName", short),
+                     _f_eq("userPrincipalName", _ldap_bind_name(ld, user)))
+
+    def _run(sock, base):
+        ent = _ldap_search(sock, base, filt, ["distinguishedName", "displayName"], 1)
+        dn = ((ent[0].get("distinguishedname") or ent[0].get("dn") or [""])[0]) if ent else ""
+        return {"ok": True, "base": base, "dn": dn}
+
     try:
-        ok, groups = ldap_login(ld, user, pw)
+        return _ldap_service_session(ld, _run)
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    if not ok:
-        return {"ok": False, "error": "Bind fehlgeschlagen (Host/Port/Benutzer/Passwort prüfen)."}
-    role = resolve_ad_role(au, user, groups)
-    return {"ok": True, "groups": groups,
-            "role": role or "(keine Rolle – Gruppen-Mapping oder Einzelfreigabe fehlt)"}
 
 
 def _cookie_sign(payload):
@@ -3138,12 +3186,16 @@ sudo update-ca-certificates</pre>
       <label style="font-size:12px;color:var(--muted)">Admin-Gruppe (CN oder DN)<input id="ld-gadmin" class="uinput" style="width:100%;box-sizing:border-box" placeholder="z. B. vllm-admins"></label>
       <label style="font-size:12px;color:var(--muted)">Read-only-Gruppe<input id="ld-gro" class="uinput" style="width:100%;box-sizing:border-box" placeholder="z. B. vllm-viewer"></label>
       <label style="font-size:12px;color:var(--muted)">Standardrolle (ohne Gruppe/Freigabe)<select id="ld-defrole" class="uinput" style="width:100%"><option value="">kein Zugriff</option><option value="readonly">Read-only</option><option value="admin">Admin</option></select></label>
+      <span></span>
+      <label style="font-size:12px;color:var(--muted)">Dienstkonto (Bind-Benutzer)<input id="ld-buser" class="uinput" autocomplete="off" style="width:100%;box-sizing:border-box" placeholder="z. B. svc-llmmon@firma.int"></label>
+      <label style="font-size:12px;color:var(--muted)">Dienstkonto-Passwort<input id="ld-bpass" class="uinput" type="password" autocomplete="new-password" style="width:100%;box-sizing:border-box"></label>
     </div>
+    <p style="font-size:11px;margin:4px 0 0">Das Dienstkonto (UPN, <code>DOMÄNE\name</code> oder DN) braucht nur
+       Leserechte im Verzeichnis. Es wird für den Verbindungstest und die Verzeichnissuche verwendet;
+       das Passwort bleibt auf dem Server (<code>auth.json</code>, 0600) und wird nach einem Hostwechsel verworfen.</p>
     <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:10px">
       <button class="abtn" id="ld-save">LDAP speichern</button>
       <span style="flex:1"></span>
-      <input id="ld-tuser" class="uinput" placeholder="Test-Benutzer" style="width:130px">
-      <input id="ld-tpass" class="uinput" type="password" placeholder="Test-Passwort" style="width:130px">
       <button class="abtn" id="ld-test">Verbindung testen</button>
     </div>
 
@@ -3152,7 +3204,7 @@ sudo update-ca-certificates</pre>
       <select id="ds-kind" class="uinput"><option value="user">Benutzer</option><option value="group">Gruppe</option></select>
       <input id="ds-q" class="uinput" placeholder="Name/Teil eingeben…" style="flex:1;min-width:150px">
       <button class="abtn" id="ds-go">🔍 Suchen</button>
-      <span style="font-size:11px;color:var(--muted)">nutzt die Test-Anmeldedaten oben</span>
+      <span style="font-size:11px;color:var(--muted)">nutzt das Dienstkonto oben</span>
     </div>
     <div id="ds-results"></div>
 
@@ -5275,6 +5327,8 @@ async function loadUsers(){
   document.getElementById("ld-gadmin").value=L.group_admin||"";
   document.getElementById("ld-gro").value=L.group_readonly||"";
   document.getElementById("ld-defrole").value=L.default_role||"";
+  document.getElementById("ld-buser").value=L.bind_user||"";
+  setBindPw(!!L.bind_pw_set);
   umsg("");
 }
 async function postUsers(body){
@@ -5313,7 +5367,14 @@ document.getElementById("ng-add").onclick=()=>addGroup(document.getElementById("
                                                        document.getElementById("ng-role").value);
 document.getElementById("ng-name").addEventListener("keydown",e=>{
   if(e.key==="Enter")addGroup(e.target.value,document.getElementById("ng-role").value);});
-function ldapFormBody(){ return {
+let ldBindPwDirty=false;                   // Passwort nur senden, wenn es angefasst wurde
+function setBindPw(isSet){
+  const p=document.getElementById("ld-bpass");
+  p.value=""; ldBindPwDirty=false;
+  p.placeholder=isSet?"gespeichert – leer lassen = unverändert":"nicht hinterlegt";
+}
+document.getElementById("ld-bpass").addEventListener("input",()=>{ldBindPwDirty=true;});
+function ldapFormBody(){ const b={
   enabled:document.getElementById("ld-enabled").checked,
   host:document.getElementById("ld-host").value.trim(),
   domain:document.getElementById("ld-domain").value.trim(),
@@ -5321,21 +5382,25 @@ function ldapFormBody(){ return {
   base_dn:document.getElementById("ld-base").value.trim(),
   group_admin:document.getElementById("ld-gadmin").value.trim(),
   group_readonly:document.getElementById("ld-gro").value.trim(),
-  default_role:document.getElementById("ld-defrole").value }; }
+  default_role:document.getElementById("ld-defrole").value,
+  bind_user:document.getElementById("ld-buser").value.trim() };
+  if(ldBindPwDirty) b.bind_password=document.getElementById("ld-bpass").value;   // fehlt = unverändert
+  return b; }
 document.getElementById("ld-save").onclick=async()=>{
   const j=await(await fetch("/api/ldap",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(ldapFormBody())})).json();
-  if(j.error)umsg(j.error); else umsg("LDAP-Konfiguration gespeichert.",true);
+  if(j.error){ umsg(j.error); return; }
+  setBindPw(!!(j.ldap&&j.ldap.bind_pw_set));
+  umsg("LDAP-Konfiguration gespeichert.",true);
 };
 document.getElementById("ld-test").onclick=async()=>{
-  const b=ldapFormBody(); b.username=document.getElementById("ld-tuser").value.trim();
-  b.password=document.getElementById("ld-tpass").value;
-  if(!b.username||!b.password){ umsg("Test-Benutzer und -Passwort angeben."); return; }
   umsg("Teste Verbindung …"); document.getElementById("usr-msg").style.color="var(--muted)";
   let j; try{ j=await(await fetch("/api/ldap/test",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(b)})).json(); }catch(e){ umsg("Netzwerkfehler."); return; }
-  if(j.ok){ umsg("✓ Bind erfolgreich – Rolle: "+j.role+((j.groups&&j.groups.length)?(" · "+j.groups.length+" Gruppe(n)"):""),true); }
-  else umsg("✗ "+(j.error||"Test fehlgeschlagen."));
+    body:JSON.stringify(ldapFormBody())})).json(); }catch(e){ umsg("Netzwerkfehler."); return; }
+  if(!j.ok){ umsg("✗ "+(j.error||"Test fehlgeschlagen.")); return; }
+  const via=j.tls?"LDAPS":"Klartext";
+  if(j.dn) umsg("✓ Dienstkonto-Bind erfolgreich ("+via+") – Lesezugriff OK: "+j.dn,true);
+  else umsg("⚠ Bind erfolgreich ("+via+"), aber das Dienstkonto wurde unter "+j.base+" nicht gefunden – Basis-DN bzw. Leserechte prüfen.");
 };
 // ---- Verzeichnissuche (AD-Benutzer/-Gruppen) ----
 async function doDirSearch(){
@@ -5343,9 +5408,6 @@ async function doDirSearch(){
   const q=document.getElementById("ds-q").value.trim();
   const box=document.getElementById("ds-results");
   const b=ldapFormBody(); b.kind=kind; b.q=q;
-  b.username=document.getElementById("ld-tuser").value.trim();
-  b.password=document.getElementById("ld-tpass").value;
-  if(!b.username||!b.password){ umsg("Für die Suche Test-Benutzer/-Passwort oben eingeben."); return; }
   if(!q){ umsg("Suchbegriff eingeben."); return; }
   box.innerHTML='<span style="color:var(--muted);font-size:12px">Suche …</span>';
   let j; try{ j=await(await fetch("/api/ldap/search",{method:"POST",headers:{"Content-Type":"application/json"},

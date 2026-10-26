@@ -306,7 +306,14 @@ WebSocket/CDP client, `save_test.py` = real login + internals log, `boot_test.py
 `ldap_login()` does a hand-rolled **simple bind** and then **always** resolves the
 user's groups via `_ldap_user_groups()` (BER `SearchRequest`, stdlib) — never
 conditionally, because the releases live in `auth.json.ad_groups`, not in the
-legacy `group_admin`/`group_readonly` fields. `memberOf` alone is **not enough**:
+legacy `group_admin`/`group_readonly` fields. Directory search and the connection test bind with a **fixed service account**
+(`auth.json.ldap.bind_user`/`bind_password`, seeded by `VLLM_LDAP_BIND_USER`/
+`_PASSWORD`) via `_ldap_service_session()`; there is no per-request test user any
+more. `ldap_public()` strips the password (`bind_pw_set` only), missing field =
+unchanged, `""` = delete, and a **host change without a new password drops it**
+(`ldap_update()` and the form overlay `_ldap_form_cfg()`), so the stored secret is
+never sent to a host it was not saved for. User logins still bind as the user.
+`memberOf` alone is **not enough**:
 it lists only *direct* groups and never the **primary group** (typically
 „Domänen-Benutzer"/„Domain Users"), so `_ldap_user_groups()` additionally reads the
 constructed AD attribute **`tokenGroups`** (SIDs of all groups incl. nested +
