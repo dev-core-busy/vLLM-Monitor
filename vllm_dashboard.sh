@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.30.0"
+__version__ = "0.30.1"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -2663,6 +2663,13 @@ PAGE = r"""<!DOCTYPE html>
   .kpi .row{display:flex;flex-wrap:wrap;gap:12px;}
   .metric{font-size:12px;color:var(--muted);} .metric b{display:block;font-size:17px;color:var(--fg);}
   .metric.warn b{color:var(--warn);} .metric.bad b{color:var(--bad);}
+  /* Ergebnis des LDAP-Verbindungstests direkt unter dem Button */
+  .tresult{display:none;margin-top:8px;padding:7px 10px;border-radius:6px;font-size:12.5px;
+    border:1px solid var(--border);border-left-width:4px;word-break:break-word;}
+  .tresult.run{display:block;color:var(--muted);}
+  .tresult.ok{display:block;color:var(--ok);border-color:var(--ok);background:rgba(63,185,80,.10);}
+  .tresult.warn{display:block;color:var(--warn);border-color:var(--warn);background:rgba(210,153,34,.10);}
+  .tresult.bad{display:block;color:var(--bad);border-color:var(--bad);background:rgba(248,81,73,.10);}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(var(--tile-min),1fr));gap:14px;padding:14px 16px;}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;
     position:relative;display:flex;flex-direction:column;}
@@ -3198,6 +3205,7 @@ sudo update-ca-certificates</pre>
       <span style="flex:1"></span>
       <button class="abtn" id="ld-test">Verbindung testen</button>
     </div>
+    <div id="ld-result" class="tresult" role="status"></div>
 
     <h4 style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">Verzeichnis durchsuchen</h4>
     <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
@@ -5272,7 +5280,7 @@ async function doLogout(){ flushPrefs(); try{ await fetch("/api/logout",{method:
 document.getElementById("logoutbtn").onclick=doLogout;
 
 // ---- Benutzer- & Zugriffsverwaltung (nur Admins) ----
-function umsg(t,ok){ const e=document.getElementById("usr-msg"); e.textContent=t||""; e.style.color=ok?"var(--good)":"var(--bad)"; }
+function umsg(t,ok){ const e=document.getElementById("usr-msg"); e.textContent=t||""; e.style.color=ok?"var(--ok)":"var(--bad)"; }
 function openUsers(){ document.getElementById("usermodal").style.display="flex"; loadUsers(); }
 document.getElementById("usersbtn").onclick=openUsers;
 document.getElementById("usr-close").onclick=()=>document.getElementById("usermodal").style.display="none";
@@ -5329,6 +5337,7 @@ async function loadUsers(){
   document.getElementById("ld-defrole").value=L.default_role||"";
   document.getElementById("ld-buser").value=L.bind_user||"";
   setBindPw(!!L.bind_pw_set);
+  ldResult("");
   umsg("");
 }
 async function postUsers(body){
@@ -5393,14 +5402,17 @@ document.getElementById("ld-save").onclick=async()=>{
   setBindPw(!!(j.ldap&&j.ldap.bind_pw_set));
   umsg("LDAP-Konfiguration gespeichert.",true);
 };
+function ldResult(cls,t){ const e=document.getElementById("ld-result"); e.className="tresult"+(cls?" "+cls:""); e.textContent=t||""; }
 document.getElementById("ld-test").onclick=async()=>{
-  umsg("Teste Verbindung …"); document.getElementById("usr-msg").style.color="var(--muted)";
+  const btn=document.getElementById("ld-test");
+  btn.disabled=true; ldResult("run","Teste Verbindung …");
   let j; try{ j=await(await fetch("/api/ldap/test",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(ldapFormBody())})).json(); }catch(e){ umsg("Netzwerkfehler."); return; }
-  if(!j.ok){ umsg("✗ "+(j.error||"Test fehlgeschlagen.")); return; }
+    body:JSON.stringify(ldapFormBody())})).json(); }catch(e){ j={error:"Netzwerkfehler."}; }
+  btn.disabled=false;
+  if(!j.ok){ ldResult("bad","✗ "+(j.error||"Test fehlgeschlagen.")); return; }
   const via=j.tls?"LDAPS":"Klartext";
-  if(j.dn) umsg("✓ Dienstkonto-Bind erfolgreich ("+via+") – Lesezugriff OK: "+j.dn,true);
-  else umsg("⚠ Bind erfolgreich ("+via+"), aber das Dienstkonto wurde unter "+j.base+" nicht gefunden – Basis-DN bzw. Leserechte prüfen.");
+  if(j.dn) ldResult("ok","✓ Dienstkonto-Bind erfolgreich ("+via+") – Lesezugriff OK: "+j.dn);
+  else ldResult("warn","⚠ Bind erfolgreich ("+via+"), aber das Dienstkonto wurde unter "+j.base+" nicht gefunden – Basis-DN bzw. Leserechte prüfen.");
 };
 // ---- Verzeichnissuche (AD-Benutzer/-Gruppen) ----
 async function doDirSearch(){
@@ -5463,7 +5475,7 @@ document.getElementById("th-save").onclick=async()=>{
   let j; try{ j=await(await fetch("/api/thresholds",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(body)})).json(); }catch(e){ msg.style.color="var(--bad)"; msg.textContent="Netzwerkfehler."; return; }
   if(j.error){ msg.style.color="var(--bad)"; msg.textContent=j.error; return; }
-  msg.style.color="var(--good)"; msg.textContent="Gespeichert – greift beim nächsten Scrape (≤ 15 s).";
+  msg.style.color="var(--ok)"; msg.textContent="Gespeichert – greift beim nächsten Scrape (≤ 15 s).";
   if(lastConfig) lastConfig.thresholds=j.thresholds;
   fetchConfig();
 };
@@ -5522,7 +5534,7 @@ document.getElementById("ai-test").onclick=async()=>{
   dl.innerHTML=(j.models||[]).map(m=>`<option value="${_esc(m)}">`).join("");
   if(j.error){ msg.style.color="var(--bad)";
     msg.textContent="⚠️ "+j.error+((j.models&&j.models.length)?" · verfügbar: "+j.models.join(", "):""); return; }
-  msg.style.color="var(--good)";
+  msg.style.color="var(--ok)";
   msg.textContent="Verbindung OK – "+(j.model||"")+" antwortete in "+((j.ms||0)/1000).toFixed(1)+" s.";
 };
 document.getElementById("ai-save").onclick=async()=>{
@@ -5536,7 +5548,7 @@ document.getElementById("ai-save").onclick=async()=>{
   document.getElementById("ai-key").value="";
   document.getElementById("ai-key").placeholder=j.ai.key_set?"gespeichert – leer lassen = unverändert":"leer = kein Key";
   document.getElementById("ai-url").value=j.ai.url||"";           // normalisierte URL zeigen
-  msg.style.color="var(--good)";
+  msg.style.color="var(--ok)";
   msg.textContent=j.ai.configured?"Gespeichert – gilt für alle Auswertungen.":"Gespeichert – für Auswertungen fehlt noch ein Modell.";
   fetchConfig();
 };

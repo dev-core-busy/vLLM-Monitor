@@ -4,6 +4,18 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.30.1] – 2026-10-26
+
+### Behoben
+- **Ergebnis von „Verbindung testen" ist jetzt unübersehbar.** Es erscheint
+  direkt unter dem Button als farbiger Kasten: grün bei Erfolg, gelb, wenn der
+  Bind klappt, das Dienstkonto unter dem Basis-DN aber nicht gefunden wird, und
+  rot bei einem Fehler. Bisher stand es klein am Dialogende. Während des Tests
+  ist der Button gesperrt.
+- Erfolgsmeldungen in allen Dialogen (Benutzer, Schwellwerte, KI-Verbindung)
+  waren nie grün: Sie nutzten die nicht definierte CSS-Variable `--good` statt
+  `--ok`.
+
 ## [0.30.0] – 2026-10-26
 
 ### Geändert
