@@ -29,6 +29,7 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
 - [Konfiguration](#konfiguration)
 - [Dashboard](#dashboard)
 - [Als Dienst betreiben (systemd)](#als-dienst-betreiben-systemd)
+- [Als Docker-Container betreiben (Debian 13)](#als-docker-container-betreiben-debian-13)
 - [Datenbank](#datenbank)
 - [Discovery- und Inspektions-Tools](#discovery--und-inspektions-tools)
 - [Einschränkungen & Roadmap](#einschränkungen--roadmap)
@@ -331,6 +332,47 @@ loginctl enable-linger "$USER"     # Start auch ohne aktive Sitzung / nach Reboo
 
 Das Dashboard analog mit `ExecStart=… vllm_dashboard.sh 8899 0.0.0.0` und
 `Environment=VLLM_LABEL=…`.
+
+## Als Docker-Container betreiben (Debian 13)
+
+Alternativ zu den systemd-User-Diensten läuft der Monitor als zwei Container
+(Collector + Dashboard) aus einem Image auf Basis von `debian:trixie-slim`:
+
+```bash
+sudo ./docker_setup.sh            # Menü: Installieren, Aktualisieren, Status, Logs, …
+sudo ./docker_setup.sh install    # oder direkt: install | update | status | logs | uninstall
+```
+
+Das Skript installiert bei Bedarf Docker (Debian-Paket `docker.io`), fragt
+dieselben Punkte ab wie `setup.sh` (Ziel-IP, Instanzen, Ollama/STT/LM Studio/DCGM,
+KI-Endpunkt, Bind/Port, HTTPS) und zusätzlich **Netzwerkmodus** und **Zeitzone**:
+
+- `bridge` (Standard) veröffentlicht nur den Dashboard-Port; Ziele auf demselben
+  Host erreicht der Container über deren LAN-IP oder `host.docker.internal`.
+  `host` ist nötig, wenn ein Ziel nur auf `127.0.0.1` des Hosts lauscht.
+- Die Zeitzone (`TZ`, Vorgabe = die des Hosts) bestimmt die Tagesgrenzen für
+  kWh/Tag und Tokens/Tag – ohne sie würde der Container in UTC schneiden.
+
+Alle Laufzeitdaten liegen im Datenverzeichnis (Standard
+`/opt/vllm-monitor/data`, als `/data` eingebunden, gehört UID 10001):
+`vllm_metrics.db`, `auth.json`, `settings.json`, `targets.json`, `prefs.json`,
+`.auth_secret`, TLS-Zertifikat und `reports/`. Liegen im Projektverzeichnis
+Daten eines bisherigen systemd-Betriebs, bietet die Installation an, sie zu
+übernehmen (die DB per SQLite-Backup, also auch bei laufendem Collector
+konsistent – den alten Collector danach mit `./setup.sh` deinstallieren, sonst
+wird doppelt gesammelt). Antworten und Container-Env liegen in
+`/opt/vllm-monitor/setup.conf` bzw. `monitor.env` (beide 0600).
+
+Beide Container laufen mit `--restart unless-stopped` und einem Healthcheck
+(Dashboard antwortet / Collector-Heartbeat frisch). Der geplante KI-Report wird
+auf dem Host als systemd-Timer `vllm-monitor-report.timer` angelegt, der
+`docker exec … report` aufruft. Nützlich im Betrieb:
+
+```bash
+docker logs -f vllm-monitor-collector
+docker exec vllm-monitor-dashboard /app/docker-entrypoint.sh annotate "Deploy v2"
+docker exec -it vllm-monitor-dashboard python3 /app/monitor.sh 192.168.1.10 8000
+```
 
 ## Datenbank
 

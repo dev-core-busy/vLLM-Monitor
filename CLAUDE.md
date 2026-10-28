@@ -387,6 +387,17 @@ and a GPU KPI card. vLLM's own `/metrics` only exposes engine-level data, so thi
 is a separate collector source. **TODO (deferred):** GPU→model attribution
 (which GPU runs which model) — only relevant once more than one GPU is present.
 
+**Docker (Debian 13):** `docker_setup.sh` is the container counterpart of
+`setup.sh` (root, installs `docker.io`, builds `Dockerfile` on
+`debian:trixie-slim`, runs two containers `vllm-monitor-collector`/
+`vllm-monitor-dashboard` from one image). `docker/entrypoint.sh` dispatches
+`dashboard | collector | report | annotate | health-*`. All runtime files live in
+`/data` via the `VLLM_*_FILE`/`VLLM_DB` env defaults in the Dockerfile (host:
+`/opt/vllm-monitor/data`, owned by UID 10001); answers in
+`/opt/vllm-monitor/setup.conf`, container env in `monitor.env`. `TZ` must be set
+(calendar-day buckets). `.dockerignore` is an allow-list — **new scripts that
+belong in the image must be added there and to the `COPY` line.**
+
 `session.sh` is not a tool — it is a one-line helper that resumes a specific
 Claude Code session (`claude --resume <uuid>`).
 

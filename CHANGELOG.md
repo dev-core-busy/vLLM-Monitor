@@ -4,6 +4,28 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.31.0] – 2026-10-28
+
+### Neu
+- **Betrieb als Docker-Container auf Debian 13.** `sudo ./docker_setup.sh`
+  (Menü oder `install | update | status | logs | uninstall`) installiert bei
+  Bedarf Docker (`docker.io`), baut ein Image auf Basis von
+  `debian:trixie-slim` und startet zwei Container – `vllm-monitor-collector`
+  und `vllm-monitor-dashboard` – mit `--restart unless-stopped` und
+  Healthcheck (Dashboard antwortet bzw. Collector-Heartbeat frisch).
+- Abgefragt wird dasselbe wie in `setup.sh`, zusätzlich der Netzwerkmodus
+  (`bridge` mit veröffentlichtem Port oder `host` für Ziele auf `127.0.0.1`)
+  und die Zeitzone. Sie bestimmt die Tagesgrenzen für kWh/Tag und Tokens/Tag;
+  ohne sie würde der Container in UTC schneiden.
+- Alle Laufzeitdaten liegen in einem Datenverzeichnis (Standard
+  `/opt/vllm-monitor/data`, im Container `/data`, UID 10001). Daten eines
+  bisherigen systemd-Betriebs lassen sich bei der Installation übernehmen, die
+  DB per SQLite-Backup (konsistent auch bei laufendem Collector).
+- Self-signed TLS-Zertifikat für alle Host-IPs, optionaler KI-Schicht-Report als
+  systemd-Timer `vllm-monitor-report.timer` auf dem Host (`docker exec … report`).
+- Neue Dateien: `Dockerfile`, `docker/entrypoint.sh`, `.dockerignore` (nur die
+  Skripte gelangen ins Image, keine DB, Benutzer oder Schlüssel).
+
 ## [0.30.1] – 2026-10-26
 
 ### Behoben

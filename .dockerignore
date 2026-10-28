@@ -1,0 +1,7 @@
+# Nur die Skripte gehören ins Image – keine Messdaten, Zugangsdaten oder Keys
+*
+!vllm_collector.sh
+!vllm_dashboard.sh
+!monitor.sh
+!scan_for_llms.sh
+!docker/entrypoint.sh
