@@ -4,6 +4,37 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.32.0] – 2026-10-31
+
+### Neu
+- **Tagesarchiv über die 30-Tage-Aufbewahrung hinaus.** Das Dashboard schreibt
+  jeden abgeschlossenen Kalendertag stündlich je Instanz in die neue Tabelle
+  `daily_totals` (generierte/Prompt-Tokens, kWh, Messsekunden). Der Collector
+  löscht dort nichts. Token-Zähler, GPU-Verbrauch und „Generierte Tokens pro
+  Tag – seit Aufzeichnungsbeginn (kumuliert)" reichen damit künftig bis zum
+  echten Aufzeichnungsbeginn, statt mit den Rohdaten nach 30 Tagen
+  abzuschneiden. Archivierte Tage gelten danach unverändert; neu berechnet
+  wären sie zu klein, sobald die Löschung sie anschneidet. Beim Löschen eines
+  Ziels werden seine Archivzeilen mit entfernt.
+- `/api/config` liefert unter `history` die Aufbewahrung sowie den Beginn von
+  Rohdaten und Tagesarchiv.
+
+### Geändert
+- **„seit Beginn" nennt sein Startdatum.** Im Zeitraum-Menü steht jetzt z. B.
+  „seit Beginn (ab 01.10.)". Der Tooltip erklärt, dass die Diagramme nur so weit
+  reichen wie die Rohdaten (Aufbewahrung 30 Tage), Tokens und Energie dagegen
+  über das Tagesarchiv weiter. Tagesdiagramm, kumulierte Kurve sowie die
+  Kacheln Token-Zähler und GPU-Verbrauch zeigen bei „seit Beginn" ihr
+  Startdatum („ab 01.10.2026"). Bisher sah „seit Beginn" wie „nur der aktuelle
+  Monat" aus, weil ältere Rohdaten bereits gelöscht waren.
+
+### Behoben
+- Ein Messintervall über Mitternacht zählte ganz zum Vortag: `_next_day_start()`
+  rechnete +26 h ab dem Zeitpunkt statt ab dem Tagesbeginn und übersprang nach
+  22 Uhr einen Tag. Die Tageswerte für kWh und Messdauer verschieben sich
+  dadurch um wenige Sekunden je Tag. Ein Tag zeigte so z. B. 86 406 statt
+  höchstens 86 400 Messsekunden. Die Summe blieb stimmig.
+
 ## [0.31.0] – 2026-10-28
 
 ### Neu

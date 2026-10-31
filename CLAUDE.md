@@ -102,6 +102,27 @@ are whole calendar days, so a 15-min window shows today's full-day bar. With an
 `fetchEnergy()` return early, just like `startRefresh()` — all views keep the
 last valid window instead of the server's `range=custom` → 1 h fallback.
 
+**Daily archive (`daily_totals`).** The collector purges raw rows after
+`VLLM_RETENTION_DAYS` (30), so anything "since recording" would silently shrink
+to the last 30 days. `archive_days()` (dashboard background thread, hourly, plus
+`ARCHIVE_GRACE` of 10 min after midnight) freezes every completed calendar day
+per `(day, host, port, model)` — gen/prompt tokens from `_token_parts()`, kWh +
+measured seconds from `_energy_parts()` (read 1 h past midnight so the interval
+crossing it is split, not lost). A day is written **once** (skipped if any row
+for it exists) and afterwards the archive **wins over the raw rows** for that
+day: `_tokens_all()` skips raw parts of archived days, `build_energy()` replaces
+days that lie **fully** inside the window. Recomputing would be wrong once the
+purge cuts into the day. `range=all` resolves differently per endpoint:
+`/api/series` stays at the oldest raw row (`_range_from` → `db_span()`), while
+`/api/energy` and `/api/tokens` use `_is_all()` → `everything=True` →
+`history_start()` (oldest archived day or raw row). `/api/config.history`
+(`build_history()`) feeds `renderHistory()`, which labels the menu option
+„seit Beginn (ab TT.MM.)" and explains both horizons in its tooltip.
+`del_target()` purges the target's archive rows too. `_next_day_start()` must
+step from the **day start** (`_day_start(_day_start(ts) + 26 h)`); stepping from
+`ts` skipped a day after 22:00 and booked cross-midnight intervals to the
+previous day.
+
 The Effizienz section carries a third chart, **"… seit Aufzeichnungsbeginn
 (kumuliert)"** (`cumtokchart`/`cumTokChart`), fed from the very same
 `lastTokens` payload — no extra request. `cumTokenSeries()` fills the **missing

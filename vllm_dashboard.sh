@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.31.0"
+__version__ = "0.32.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -361,46 +361,85 @@ def _day_start(ts):
 
 
 def _next_day_start(ts):
-    # +26 h statt +24 h: überspringt auch bei Sommer-/Winterzeitwechsel sicher
-    # genau einen Tag (23- und 25-Stunden-Tage inklusive).
-    return _day_start(ts + 93600)
+    # Vom Tagesbeginn aus +26 h statt +24 h: überspringt auch bei Sommer-/
+    # Winterzeitwechsel sicher genau einen Tag (23- und 25-Stunden-Tage
+    # inklusive). Ab ts selbst gerechnet landete ein Zeitpunkt nach 22 Uhr
+    # zwei Tage weiter – Intervalle über Mitternacht zählten dann ganz zum Vortag.
+    return _day_start(_day_start(ts) + 93600)
 
 
 def _day_key(ts):
     return time.strftime("%Y-%m-%d", time.localtime(ts))
 
 
-def build_energy(range_s=None, start=None, end=None):
-    """Energieverbrauch je Kalendertag aus den GPU-Leistungswerten (DCGM).
+# ---------------------------------------------------------------------------
+# Tagesarchiv: Tagessummen, die die Rohdaten-Aufbewahrung überdauern
+# ---------------------------------------------------------------------------
+# Der Collector löscht Rohdaten nach VLLM_RETENTION_DAYS (Default 30). Damit
+# Token-Zähler, GPU-Verbrauch und die kumulierte Token-Kurve trotzdem bis zum
+# Aufzeichnungsbeginn reichen, schreibt archive_days() jeden abgeschlossenen
+# Kalendertag je Instanz in daily_totals fest. Ein archivierter Tag wird nie
+# neu berechnet: sobald die Löschung ihn anschneidet, wären die Werte zu klein.
+# Deshalb gilt für archivierte Tage immer das Archiv, nicht die Rohdaten.
 
-    Integriert die gemessene Leistung (W) über die Zeit (Trapezregel) zu kWh –
-    bewusst auf den Rohdaten, nicht auf den fürs Diagramm verdichteten Punkten.
-    Messlücken (Collector/GPU offline) werden übersprungen statt hochgerechnet;
-    'coverage' weist aus, wie viel des Tages tatsächlich abgedeckt ist."""
-    if not os.path.exists(DB_PATH):
-        return {"error": "Keine Datenbank – läuft der Collector?", "days": []}
+RETENTION_DAYS = int(os.environ.get("VLLM_RETENTION_DAYS", "30"))
+ARCHIVE_EVERY = 3600        # Sekunden zwischen zwei Archivläufen
+ARCHIVE_GRACE = 600         # ein Tag gilt erst 10 min nach Mitternacht als abgeschlossen
+_archive_lock = threading.Lock()
 
-    now = int(time.time())
-    if start is not None and end is not None:
-        since, until = start, end
-    else:
-        until = now
-        since = until - (range_s or 86400)
 
-    conn = _connect()
+def _ensure_daily(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS daily_totals (
+        day TEXT NOT NULL, host TEXT, port INTEGER, model TEXT,
+        gen INTEGER, prompt INTEGER, kwh REAL, esec INTEGER,
+        PRIMARY KEY (day, host, port, model))""")
+
+
+def _day_ts(day):
+    """'YYYY-MM-DD' -> Epoch-Sekunden des lokalen Tagesbeginns."""
+    return int(time.mktime(time.strptime(day, "%Y-%m-%d")))
+
+
+def _token_parts(conn):
+    """Generierte/Prompt-Tokens je (Tag, host, port, model) aus den kumulativen
+    Countern über positive Deltas (Counter-Resets beim Neustart verworfen).
+    Ein Delta zählt zum Tag der späteren Messung."""
+    rows = conn.execute(
+        "SELECT ts, host, port, model, generation_tokens_total AS g, prompt_tokens_total AS p "
+        "FROM samples WHERE generation_tokens_total IS NOT NULL "
+        "ORDER BY host, port, model, ts").fetchall()
+    parts = {}
+    prev = None
+    prevkey = None
+    for r in rows:
+        key = (r["host"], r["port"], r["model"])
+        if key == prevkey and prev is not None:
+            dg = max(0, (r["g"] or 0) - (prev["g"] or 0))
+            dp = max(0, (r["p"] or 0) - (prev["p"] or 0))
+            if dg or dp:
+                part = parts.setdefault((_day_key(r["ts"]),) + key, [0, 0])
+                part[0] += dg
+                part[1] += dp
+        prev = r
+        prevkey = key
+    return parts
+
+
+def _energy_parts(conn, since, until):
+    """kWh und Messsekunden je (Tag, host, port, model) aus der GPU-Leistung (DCGM).
+
+    Trapezregel auf den Rohdaten; Messlücken (deutlich über dem üblichen
+    Messintervall) werden übersprungen statt hochgerechnet, Intervalle an
+    Tagesgrenzen aufgeteilt."""
     rows = conn.execute(
         "SELECT ts, host, port, model, gpu_power FROM samples "
         "WHERE gpu_power IS NOT NULL AND ts >= ? AND ts < ? "
         "ORDER BY host, port, model, ts", (since, until)).fetchall()
-    conn.close()
-
     series = {}
     for r in rows:
         series.setdefault((r["host"], r["port"], r["model"]), []).append((r["ts"], r["gpu_power"]))
-
-    days = {}          # Tag -> {"kwh": …, "seconds": …}
-    per_gpu = {}       # GPU  -> {"kwh": …, "seconds": …}
-    for (host, port, model), pts in series.items():
+    parts = {}
+    for key, pts in series.items():
         if len(pts) < 2:
             continue
         # Erwartetes Messintervall aus den Abständen; alles deutlich darüber
@@ -408,30 +447,129 @@ def build_energy(range_s=None, start=None, end=None):
         deltas = sorted(pts[i + 1][0] - pts[i][0] for i in range(len(pts) - 1))
         step = deltas[len(deltas) // 2] or 15
         max_gap = max(60, step * 4)
-        gpu = per_gpu.setdefault("%s:%s %s" % (host, port, model),
-                                 {"host": host, "port": port, "model": model,
-                                  "kwh": 0.0, "seconds": 0})
         for (t1, p1), (t2, p2) in zip(pts, pts[1:]):
             dt = t2 - t1
             if dt <= 0 or dt > max_gap:
                 continue
             avg_w = ((p1 or 0.0) + (p2 or 0.0)) / 2.0
-            gpu["kwh"] += avg_w * dt / 3.6e6
-            gpu["seconds"] += dt
-            # Intervall an Tagesgrenzen aufteilen, damit die Tageswerte stimmen
             a = t1
             while a < t2:
                 b = min(t2, _next_day_start(a))
-                d = days.setdefault(_day_key(a), {"kwh": 0.0, "seconds": 0})
-                d["kwh"] += avg_w * (b - a) / 3.6e6
-                d["seconds"] += b - a
+                part = parts.setdefault((_day_key(a),) + key, [0.0, 0])
+                part[0] += avg_w * (b - a) / 3.6e6
+                part[1] += b - a
                 a = b
+    return parts
+
+
+def archive_days():
+    """Abgeschlossene, noch nicht archivierte Kalendertage in daily_totals
+    festschreiben. Gibt die Zahl neu archivierter Tage zurück."""
+    if not os.path.exists(DB_PATH):
+        return 0
+    with _archive_lock:
+        conn = _connect()
+        try:
+            _ensure_daily(conn)
+            limit = _day_key(int(time.time()) - ARCHIVE_GRACE)   # dieser Tag und später: offen
+            done = {r[0] for r in conn.execute("SELECT DISTINCT day FROM daily_totals")}
+            rows = {}
+            for k, (g, pr) in _token_parts(conn).items():
+                if k[0] < limit and k[0] not in done:
+                    rows[k] = [g, pr, 0.0, 0]
+            # bis 1 h über Mitternacht lesen: das letzte Intervall des Tages
+            # reicht in den nächsten hinein und wird an der Grenze geteilt
+            for k, (kwh, sec) in _energy_parts(conn, 0, _day_ts(limit) + 3600).items():
+                if k[0] < limit and k[0] not in done:
+                    r = rows.setdefault(k, [0, 0, 0.0, 0])
+                    r[2], r[3] = kwh, sec
+            conn.executemany(
+                "INSERT OR IGNORE INTO daily_totals "
+                "(day, host, port, model, gen, prompt, kwh, esec) VALUES (?,?,?,?,?,?,?,?)",
+                [k + (round(v[0]), round(v[1]), round(v[2], 6), int(v[3])) for k, v in rows.items()])
+            conn.commit()
+            return len({k[0] for k in rows})
+        finally:
+            conn.close()
+
+
+def history_start(conn=None):
+    """Beginn der Aufzeichnung (Epoch-Sekunden): ältester archivierter Tag oder
+    älteste Rohmessung, je nachdem, was früher liegt. None ohne Daten."""
+    own = conn is None
+    if own:
+        if not os.path.exists(DB_PATH):
+            return None
+        conn = _connect()
+    try:
+        _ensure_daily(conn)
+        day = conn.execute("SELECT MIN(day) FROM daily_totals").fetchone()[0]
+        raw = conn.execute("SELECT MIN(ts) FROM samples").fetchone()[0]
+    except sqlite3.Error:
+        return None
+    finally:
+        if own:
+            conn.close()
+    cands = [x for x in (_day_ts(day) if day else None, raw) if x is not None]
+    return min(cands) if cands else None
+
+
+def build_energy(range_s=None, start=None, end=None, everything=False):
+    """Energieverbrauch je Kalendertag aus den GPU-Leistungswerten (DCGM).
+
+    Integriert die gemessene Leistung (W) über die Zeit (Trapezregel) zu kWh –
+    bewusst auf den Rohdaten, nicht auf den fürs Diagramm verdichteten Punkten.
+    Messlücken (Collector/GPU offline) werden übersprungen statt hochgerechnet;
+    'coverage' weist aus, wie viel des Tages tatsächlich abgedeckt ist. Ganz im
+    Fenster liegende Tage kommen aus dem Tagesarchiv, sobald sie dort stehen;
+    everything=True reicht bis zum Aufzeichnungsbeginn („seit Beginn")."""
+    if not os.path.exists(DB_PATH):
+        return {"error": "Keine Datenbank – läuft der Collector?", "days": []}
+
+    now = int(time.time())
+    conn = _connect()
+    _ensure_daily(conn)
+    if start is not None and end is not None:
+        since, until = start, end
+    else:
+        until = now
+        since = until - (range_s or 86400)
+        if everything:
+            since = history_start(conn) or since
+
+    parts = _energy_parts(conn, since, until)
+    # Tage, die vollständig im Fenster liegen und archiviert sind: Archiv gilt
+    d_since, d_until = _day_key(since), _day_key(until)
+    full = [d for (d,) in conn.execute(
+        "SELECT DISTINCT day FROM daily_totals WHERE day >= ? AND day <= ?", (d_since, d_until))
+        if _day_ts(d) >= since and _next_day_start(_day_ts(d)) <= until]
+    if full:
+        fullset = set(full)
+        parts = {k: v for k, v in parts.items() if k[0] not in fullset}
+        q = ",".join("?" * len(full))
+        for r in conn.execute(
+                "SELECT day, host, port, model, kwh, esec FROM daily_totals "
+                "WHERE day IN (%s) AND (kwh > 0 OR esec > 0)" % q, full):
+            parts[(r["day"], r["host"], r["port"], r["model"])] = [r["kwh"] or 0.0, r["esec"] or 0]
+    conn.close()
+
+    days = {}          # Tag -> {"kwh": …, "seconds": …}
+    per_gpu = {}       # GPU  -> {"kwh": …, "seconds": …}
+    for (day, host, port, model), (kwh, sec) in parts.items():
+        d = days.setdefault(day, {"kwh": 0.0, "seconds": 0})
+        d["kwh"] += kwh
+        d["seconds"] += sec
+        gpu = per_gpu.setdefault("%s:%s %s" % (host, port, model),
+                                 {"host": host, "port": port, "model": model,
+                                  "kwh": 0.0, "seconds": 0})
+        gpu["kwh"] += kwh
+        gpu["seconds"] += sec
 
     out = []
     for key in sorted(days):
         d = days[key]
         # Anteil des Tages, der im Fenster liegt (Rand-Tage sind angeschnitten)
-        d0 = _day_start(int(time.mktime(time.strptime(key, "%Y-%m-%d"))))
+        d0 = _day_ts(key)
         span = max(1, min(until, _next_day_start(d0)) - max(since, d0))
         gpus = max(1, len(per_gpu))
         # d["seconds"] summiert über alle GPUs -> echte Messdauer des Tages
@@ -533,7 +671,28 @@ def build_config():
     # Zentrale KI-Config (gilt für alle Frontends). Der Key selbst wird NIE
     # ausgeliefert – nur, ob einer gesetzt ist.
     return {"now": now * 1000, "instances": inst, "ai": ai_public(),
-            "thresholds": load_thresholds(), "collector": collector}
+            "thresholds": load_thresholds(), "collector": collector,
+            "history": build_history()}
+
+
+def build_history():
+    """Wie weit die Daten zurückreichen: Rohdaten (Zeitreihen, begrenzt durch die
+    Aufbewahrung) und Tagesarchiv (Tokens/Energie je Tag, unbegrenzt)."""
+    res = {"retention_days": RETENTION_DAYS, "raw_since": None, "daily_since": None}
+    if not os.path.exists(DB_PATH):
+        return res
+    conn = _connect()
+    try:
+        _ensure_daily(conn)
+        raw = conn.execute("SELECT MIN(ts) FROM samples").fetchone()[0]
+        res["raw_since"] = raw * 1000 if raw else None
+        start = history_start(conn)
+        res["daily_since"] = _day_key(start) if start else None
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return res
 
 
 _tokens_cache = None      # (erzeugt_ts, ergebnis) – teure Volltabellen-Aggregation cachen
@@ -541,8 +700,8 @@ _tokens_cache = None      # (erzeugt_ts, ergebnis) – teure Volltabellen-Aggreg
 
 def _tokens_all():
     """Generierte Tokens **pro Kalendertag** seit Aufzeichnungsbeginn, je Modell.
-    Aus den kumulativen Countern über positive Deltas gebildet (Counter-Resets
-    beim Server-Neustart werden verworfen). Ergebnis 60 s gecacht."""
+    Archivierte Tage aus daily_totals, die übrigen (heute, noch nicht
+    archiviert) aus den Rohdaten. Ergebnis 60 s gecacht."""
     global _tokens_cache
     now = time.time()
     if _tokens_cache and now - _tokens_cache[0] < 60:
@@ -550,35 +709,29 @@ def _tokens_all():
     if not os.path.exists(DB_PATH):
         return {"days": [], "models": []}
     conn = _connect()
-    rows = conn.execute(
-        "SELECT ts, host, port, model, generation_tokens_total AS g, prompt_tokens_total AS p "
-        "FROM samples WHERE generation_tokens_total IS NOT NULL "
-        "ORDER BY host, port, model, ts").fetchall()
+    _ensure_daily(conn)
+    parts = _token_parts(conn)
+    arch = conn.execute("SELECT day, host, port, model, gen, prompt FROM daily_totals").fetchall()
     conn.close()
+    archived = {r["day"] for r in arch}
 
-    import datetime
-    days = {}                 # 'YYYY-MM-DD' -> {model: gen, '_prompt': prompt}
+    days = {}                 # 'YYYY-MM-DD' -> {"models": {model: gen}, "prompt": prompt}
     models = set()
-    prev = None
-    prevkey = None
-    for r in rows:
-        key = (r["host"], r["port"], r["model"])
-        if key == prevkey and prev is not None:
-            dg = (r["g"] or 0) - (prev["g"] or 0)
-            dp = (r["p"] or 0) - (prev["p"] or 0)
-            if dg < 0:
-                dg = 0        # Counter-Reset (Neustart)
-            if dp < 0:
-                dp = 0
-            if dg or dp:
-                d = datetime.date.fromtimestamp(r["ts"]).isoformat()
-                b = days.setdefault(d, {"models": {}, "prompt": 0})
-                if dg:
-                    b["models"][r["model"]] = b["models"].get(r["model"], 0) + dg
-                    models.add(r["model"])
-                b["prompt"] += dp
-        prev = r
-        prevkey = key
+
+    def add(day, model, g, p):
+        if not (g or p):
+            return
+        b = days.setdefault(day, {"models": {}, "prompt": 0})
+        if g:
+            b["models"][model] = b["models"].get(model, 0) + g
+            models.add(model)
+        b["prompt"] += p
+
+    for (day, _host, _port, model), (g, p) in parts.items():
+        if day not in archived:   # archivierter Tag: Rohdaten evtl. schon angeschnitten
+            add(day, model, g, p)
+    for r in arch:
+        add(r["day"], r["model"], r["gen"] or 0, r["prompt"] or 0)
 
     out = []
     for d in sorted(days.keys()):
@@ -591,23 +744,24 @@ def _tokens_all():
     return res
 
 
-def build_tokens(range_s=None, start=None, end=None):
+def build_tokens(range_s=None, start=None, end=None, everything=False):
     """Tages-Token-Daten. Ohne Zeitraum: alle Tage seit Aufzeichnungsbeginn
     (für den „seit Aufzeichnung"-Chart). Mit Zeitraum (range_s bzw. start/end in
-    Sekunden): auf das Fenster gefilterte Tage plus Summen/Ø – für die
-    Token-Zähler-Kachel (analog build_energy)."""
+    Sekunden) oder everything=True („seit Beginn"): auf das Fenster gefilterte
+    Tage plus Summen/Ø – für die Token-Zähler-Kachel (analog build_energy)."""
     base = _tokens_all()
-    if range_s is None and start is None:
+    if range_s is None and start is None and not everything:
         return base
-    import datetime
     now = int(time.time())
     if start is not None and end is not None:
         since, until = start, end
     else:
         until = now
         since = until - (range_s or 86400)
-    d_since = datetime.date.fromtimestamp(since).isoformat()
-    d_until = datetime.date.fromtimestamp(until).isoformat()
+        if everything:
+            since = history_start() or since
+    d_since = _day_key(since)
+    d_until = _day_key(until)
     days = [d for d in base["days"] if d_since <= d["date"] <= d_until]
     gen = sum(d["gen"] for d in days)
     prompt = sum(d["prompt"] for d in days)
@@ -829,8 +983,10 @@ def del_target(tid):
     if host is not None and port is not None and os.path.exists(DB_PATH):
         try:
             conn = _connect()
+            _ensure_daily(conn)
             conn.execute("DELETE FROM config WHERE host=? AND port=?", (host, port))
             conn.execute("DELETE FROM samples WHERE host=? AND port=?", (host, port))
+            conn.execute("DELETE FROM daily_totals WHERE host=? AND port=?", (host, port))
             conn.commit()
             conn.close()
         except sqlite3.OperationalError:
@@ -2053,6 +2209,13 @@ def _range_from(qs):
     return max(60, min(r, 30 * 86400))
 
 
+def _is_all(qs):
+    """range=all („seit Beginn")? Energie und Tokens reichen dann über das
+    Tagesarchiv bis zum Aufzeichnungsbeginn, die Zeitreihen nur so weit wie die
+    Rohdaten (_range_from)."""
+    return (qs.get("range", [""])[0] or "").strip().lower() == "all"
+
+
 def _abs_window(qs):
     """Optionales absolutes Zeitfenster (from/to in Sekunden). Gibt (from, to)
     zurück oder (None, None), wenn nicht/ungültig angegeben. Deckelt auf 30 Tage."""
@@ -2337,6 +2500,8 @@ class Handler(BaseHTTPRequestHandler):
             fr, to = _abs_window(qs)
             if fr is not None:
                 self._json(build_energy(start=fr, end=to))
+            elif _is_all(qs):
+                self._json(build_energy(everything=True))
             else:
                 self._json(build_energy(_range_from(qs)))
         elif parsed.path == "/api/config":
@@ -2345,6 +2510,8 @@ class Handler(BaseHTTPRequestHandler):
             fr, to = _abs_window(qs)
             if fr is not None:
                 self._json(build_tokens(start=fr, end=to))
+            elif _is_all(qs):
+                self._json(build_tokens(everything=True))
             elif "range" in qs:
                 self._json(build_tokens(_range_from(qs)))
             else:
@@ -2866,7 +3033,7 @@ PAGE = r"""<!DOCTYPE html>
   <span style="font-size:11px;color:var(--muted)">v__VERSION__</span>
   <span id="collstat" title="Status des Metrik-Collectors (Self-Monitoring)" style="font-size:11px"></span>
   <label class="ctl" title="Zeitfenster, das in allen Diagrammen dargestellt wird. Bei großen Fenstern werden die Daten automatisch verdichtet (Downsampling).">Zeitraum
-    <select id="range" title="Zeitfenster der Diagramme (15 min bis 7 Tage; „heute“ = seit Mitternacht, „seit Beginn“ = älteste gespeicherte Messung)">
+    <select id="range" title="Zeitfenster der Diagramme (15 min bis 7 Tage; „heute“ = seit Mitternacht, „seit Beginn“ = älteste noch gespeicherte Messung)">
       <option value="900">15 min</option>
       <option value="3600">1 h</option>
       <option value="21600">6 h</option>
@@ -2988,7 +3155,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="tokbox"><div><canvas id="tokchart"></canvas></div></div>
     </div>
     <div>
-      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Generierte Tokens pro Tag – seit Aufzeichnungsbeginn (kumuliert)
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Generierte Tokens pro Tag – seit Aufzeichnungsbeginn<span id="cumtoksince"></span> (kumuliert)
         <label style="margin-left:10px;cursor:pointer" title="Logarithmische y-Achse: exponentielles Wachstum wird zur Geraden">
           <input type="checkbox" id="cumtoklog" style="vertical-align:-1px"> log. Achse</label>
         <span id="cumtokrate" style="margin-left:10px"></span></div>
@@ -4022,7 +4189,23 @@ function renderCollector(){
     +(c.errors?(" · "+c.errors+" Fehler"):"");
   el.style.color="var(--bad)";
 }
-async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderHostFilter();renderInstances();renderKPIs();renderCollector();}catch(e){}}
+async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderHostFilter();renderInstances();renderKPIs();renderCollector();renderHistory();}catch(e){}}
+// 'YYYY-MM-DD' bzw. Epoch-ms -> „01.10.2026" (Mittag, damit keine Zeitzone den Tag verschiebt)
+function fmtDay(v){ const d=typeof v==="number"?new Date(v):new Date(v+"T12:00:00");
+  return d.toLocaleDateString("de-DE",{day:"2-digit",month:"2-digit",year:"numeric"}); }
+// „seit Beginn" ehrlich beschriften: Zeitreihen reichen nur so weit wie die
+// Rohdaten (Aufbewahrung), Tokens/Energie über das Tagesarchiv weiter zurück.
+function renderHistory(){
+  const h=lastConfig&&lastConfig.history, sel=document.getElementById("range"); if(!h||!sel)return;
+  const opt=[...sel.options].find(o=>o.value==="all"); if(!opt)return;
+  const raw=h.raw_since?fmtDay(h.raw_since):null, daily=h.daily_since?fmtDay(h.daily_since):null;
+  opt.textContent=raw?"seit Beginn (ab "+raw.slice(0,6)+")":"seit Beginn";
+  sel.title="Zeitfenster der Diagramme (15 min bis 7 Tage; „heute“ = seit Mitternacht). "
+    +"„seit Beginn“: Diagramme ab der ältesten Rohmessung"+(raw?" ("+raw+")":"")
+    +" – Rohdaten werden "+h.retention_days+" Tage aufbewahrt. "
+    +"Token-Zähler, GPU-Verbrauch und die kumulierte Token-Kurve kommen aus dem Tagesarchiv"
+    +(daily?" und reichen bis "+daily+" zurück.":".");
+}
 async function fetchOnce(){try{applySeries(await(await fetch("/api/series?"+seriesQuery())).json());}catch(e){document.getElementById("status").textContent="Fehler: "+e;}}
 
 // --- Refresh-Steuerung: Live (SSE) oder Intervall ---
@@ -4714,7 +4897,9 @@ const avgline={id:"avgline",afterDatasetsDraw(c){
 async function fetchEnergy(){
   if(!document.getElementById("energyhead"))return;
   if(isAbs()&&!absWindow())return;      // Von/Bis ungültig: wie startRefresh() das letzte Fenster stehen lassen
-  try{ lastEnergy=await(await fetch("/api/energy?"+seriesQuery())).json(); }catch(e){ lastEnergy=null; }
+  const q=seriesQuery();
+  try{ lastEnergy=await(await fetch("/api/energy?"+q)).json(); }catch(e){ lastEnergy=null; }
+  if(lastEnergy&&!lastEnergy.error) lastEnergy.all=(q==="range=all");
   renderEnergy();
 }
 function renderEnergy(){
@@ -4740,7 +4925,8 @@ function renderEnergy(){
   head.innerHTML=(j.avg_kwh_day!=null
       ? '<span class="eavg">Ø '+deZ(j.avg_kwh_day,2)+' kWh/Tag</span>' : '')
     +'<b>'+deZ(j.total_kwh,2)+' kWh gesamt</b>'
-    +'<span class="emeta">gemessen '+deZ(j.measured_seconds/3600,1)+' h'+gpuTxt+'</span>';
+    +'<span class="emeta">gemessen '+deZ(j.measured_seconds/3600,1)+' h'+gpuTxt
+    +(j.all?' · ab '+fmtDay(days[0].day):'')+'</span>';
 
   const labels=days.map(d=>new Date(d.day+"T12:00:00")
     .toLocaleDateString("de-DE",{day:"2-digit",month:"2-digit"}));
@@ -4846,7 +5032,8 @@ function renderTokensTile(){
   if(hint) hint.onclick=()=>{ const b=big.closest("[data-id]").querySelector(".cbtn.max"); if(b)b.click(); };
   head.innerHTML=(j.avg_gen_day!=null?'<span class="eavg">Ø '+fmtBig(j.avg_gen_day)+'/Tag</span>':'')
     +'<b>'+fmtBig(j.total_gen)+' generiert</b>'
-    +'<span class="emeta">'+fmtBig(j.total_prompt)+' Prompt-Tokens</span>';
+    +'<span class="emeta">'+fmtBig(j.total_prompt)+' Prompt-Tokens'
+    +(j.all?' · ab '+fmtDay(days[0].date):'')+'</span>';
 
   const labels=days.map(d=>new Date(d.date+"T12:00:00")
     .toLocaleDateString("de-DE",{day:"2-digit",month:"2-digit"}));
@@ -4971,7 +5158,8 @@ function renderTokenChart(data){
   const models=((ok&&data.models)||[]).filter(m=>days.some(d=>(d.models[m]||0)>0));
   const head=document.getElementById("tokdayhead");
   if(head) head.textContent="Generierte Tokens pro Tag – "
-    +(ok&&data.all?"seit Aufzeichnungsbeginn":"ganze Kalendertage im gewählten Zeitraum")
+    +(ok&&data.all?"seit Aufzeichnungsbeginn"+(days.length?" (ab "+fmtDay(days[0].date)+")":"")
+                  :"ganze Kalendertage im gewählten Zeitraum")
     +" (je Modell gestapelt)"+(days.length?"":" – keine Daten im Zeitraum");
   const labels=days.map(d=>d.date);
   const dsets=(models.length?models:["gen"]).map(m=>({
@@ -5036,6 +5224,8 @@ function fitInfo(vals){
 }
 function renderCumTokenChart(data){
   const cv=document.getElementById("cumtokchart"); if(!cv)return;
+  const since=document.getElementById("cumtoksince"), d0=data&&data.days&&data.days[0];
+  if(since) since.textContent=d0?" (ab "+fmtDay(d0.date)+")":"";
   const s=cumTokenSeries(data); if(!s)return;
   const log=document.getElementById("cumtoklog").checked;
   const clip=v=>(log && !(v>0)) ? null : v;   // log-Achse kann 0 nicht darstellen
@@ -5736,6 +5926,17 @@ def main():
     if scheme != "https":
         print("  [!] ACHTUNG: Login ohne HTTPS – Zugangsdaten gehen im Klartext übers Netz. TLS aktivieren!")
     print("DB: %s   (Strg+C zum Beenden)" % DB_PATH)
+
+    def _archiver():
+        while True:
+            try:
+                n = archive_days()
+                if n:
+                    print("  [i] Tagesarchiv: %d Tag(e) festgeschrieben." % n)
+            except Exception as e:      # Archiv darf das Dashboard nie stoppen
+                print("  [!] Tagesarchiv fehlgeschlagen: %s" % e)
+            time.sleep(ARCHIVE_EVERY)
+    threading.Thread(target=_archiver, name="tagesarchiv", daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -388,6 +388,17 @@ SQLite-Datei `vllm_metrics.db` (wird automatisch angelegt). Eine breite Tabelle
 Raten und Durchschnitte werden **nicht** vorberechnet, sondern bei der Abfrage
 aus den Deltas gebildet – so bleiben die Rohdaten flexibel auswertbar.
 
+Die Rohdaten löscht der Collector nach `VLLM_RETENTION_DAYS` (Standard 30 Tage).
+Damit Token-Zähler, GPU-Verbrauch und die kumulierte Token-Kurve trotzdem bis
+zum Aufzeichnungsbeginn zurückreichen, schreibt das Dashboard jeden
+abgeschlossenen Kalendertag stündlich in die Tabelle **`daily_totals`** fest
+(je Instanz: generierte und Prompt-Tokens, kWh, Messsekunden). Sie unterliegt
+keiner Löschung und bleibt klein (eine Zeile pro Tag und Instanz). Der Zeitraum
+„seit Beginn" nennt deshalb zwei Startpunkte: Die Zeitreihen beginnen bei der
+ältesten Rohmessung (im Menü als „seit Beginn (ab TT.MM.)"), Tokens und Energie
+beim ältesten archivierten Tag. Archiviert wird nur, solange das Dashboard läuft.
+Ein Tag, der vor dem ersten Archivlauf schon angeschnitten war, bleibt ein Teiltag.
+
 ## Discovery- und Inspektions-Tools
 
 ```bash
