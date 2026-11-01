@@ -427,7 +427,10 @@ with SSH `BatchMode`, falling back to the public HTTPS URL because a timer has n
 ssh-agent —, then **fast-forward only**. Auto mode only takes a higher
 `__version__` (not every commit) and refuses on dirty tracked files, local
 commits or another branch. Services are restarted / the image rebuilt only when
-files they contain changed (`UPD_RUNTIME` / `UPD_IMAGE`). `docker_setup.sh` runs
+files they contain changed (`UPD_RUNTIME` / `UPD_IMAGE`). A **new Docker
+install has auto-update on** (default `*-*-* 03:30`; an explicit
+`VLLM_AUTOUPDATE=''` in `setup.conf` stays off) and pulls in `git` if missing;
+`setup.sh` still defaults to off. `docker_setup.sh` runs
 as root, so every git call goes through `g()` → `runuser` as the checkout's owner
 (git's "dubious ownership" check, owner's SSH key). Both write
 `update_status.json` next to the DB (`upd_status key=value …`; `auto` = timer

@@ -97,6 +97,8 @@ install_deps() {
     command -v python3 >/dev/null 2>&1 || pkgs+=(python3)
     command -v openssl >/dev/null 2>&1 || pkgs+=(openssl)
     command -v docker  >/dev/null 2>&1 || pkgs+=(docker.io)
+    # git braucht das (automatische) Update – nur bei einem git-Checkout sinnvoll
+    [ -d "$DIR/.git" ] && ! command -v git >/dev/null 2>&1 && pkgs+=(git)
     if [ ${#pkgs[@]} -gt 0 ]; then
         echo "  Installiere: ${pkgs[*]}"
         if ! { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"; }; then
@@ -530,11 +532,12 @@ do_install() {
     echo "${B}== Installation (Docker) ==${N}"
     install_deps || { echo; bad "Abhängigkeiten fehlen – Installation abgebrochen."; return 1; }
 
-    # gemerkte Werte laden
+    # gemerkte Werte laden. Auto-Update ist bei einer neuen Installation an;
+    # ein bewusst abgeschaltetes (VLLM_AUTOUPDATE='' in $CONF) bleibt aus.
     local VLLM_HOST="" VLLM_TARGETS="9081:Qwen,9082:Gemma" VLLM_OLLAMA="" VLLM_STT="" \
           VLLM_LMSTUDIO="" VLLM_DCGM="" VLLM_AI_URL="" VLLM_AI_MODEL="" VLLM_REPORT="" \
           VLLM_BIND="0.0.0.0" VLLM_PORT="8899" VLLM_HTTPS="j" VLLM_NET="bridge" \
-          VLLM_TZ="" VLLM_DATA="$BASE/data" VLLM_AUTOUPDATE="" VLLM_UPDATE_CHECK="j"
+          VLLM_TZ="" VLLM_DATA="$BASE/data" VLLM_AUTOUPDATE="*-*-* 03:30" VLLM_UPDATE_CHECK="j"
     [ -f "$CONF" ] && . "$CONF"
     [ -z "$VLLM_TZ" ] && VLLM_TZ="$(host_tz)"
 
@@ -575,7 +578,7 @@ do_install() {
     updchk="$(ask "Update-Hinweis im Dashboard (prüft GitHub alle 6 h)? [j/n]" "$VLLM_UPDATE_CHECK")"
     is_yes "$updchk" && updchk="j" || updchk="n"
     if [ -d "$DIR/.git" ]; then
-        autoupd="$(ask_calendar "Automatisches Update von GitHub? systemd OnCalendar (z.B. '*-*-* 03:30', '-'=aus)" "$VLLM_AUTOUPDATE")"
+        autoupd="$(ask_calendar "Automatisches Update von GitHub? systemd OnCalendar ('-'=aus)" "$VLLM_AUTOUPDATE")"
     else
         warn "Kein git-Checkout – automatisches Update nicht möglich (git clone verwenden)."
     fi
