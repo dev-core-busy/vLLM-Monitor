@@ -3,9 +3,12 @@
 # setup.sh – Interaktives Installations-/Deinstallationsmenü für vLLM Monitor.
 #
 # Einfach ausführen:   ./setup.sh
+#   oder direkt:       ./setup.sh [install|update|auto-update|status|uninstall]
 #
 # Richtet die beiden systemd-User-Dienste (Collector + Dashboard) ein,
 # prüft die Abhängigkeiten und kann alles wieder vollständig entfernen.
+# „update" holt den neuen Stand von GitHub (git, nur Fast-Forward) und startet
+# die Dienste neu; „auto-update" ist dasselbe ohne Rückfragen für den Timer.
 #
 set -uo pipefail
 
@@ -17,6 +20,11 @@ DB="$DIR/vllm_metrics.db"
 CERT="$DIR/tls_cert.pem"
 KEY="$DIR/tls_key.pem"
 SERVICES=(vllm-collector.service vllm-dashboard.service)
+UPD_UNIT="vllm-update"
+UPD_REPO="${VLLM_UPDATE_REPO:-dev-core-busy/vLLM-Monitor}"
+UPD_BRANCH="${VLLM_UPDATE_BRANCH:-main}"
+UPD_STATUS="$DIR/update_status.json"       # liest das Dashboard (neben der DB)
+UPD_RUNTIME=(vllm_collector.sh vllm_dashboard.sh)   # Änderung -> Dienste neu starten
 
 # Farben (nur wenn Terminal)
 if [ -t 1 ]; then
@@ -153,6 +161,221 @@ gen_cert() {  # $1 = IP/Hostname für den Common Name
 }
 
 # ---------------------------------------------------------------------------
+# Gemerkte Einstellungen: eine Zeile in $CONF setzen
+# ---------------------------------------------------------------------------
+conf_set() {  # $1=Schlüssel  $2=Wert
+    touch "$CONF"
+    { grep -v "^$1=" "$CONF"; echo "$1='$2'"; } > "$CONF.tmp"
+    cat "$CONF.tmp" > "$CONF"; rm -f "$CONF.tmp"
+}
+
+# leer oder gültiger systemd-Kalenderausdruck?
+valid_calendar() {
+    [ -z "$1" ] && return 0
+    command -v systemd-analyze >/dev/null 2>&1 || return 0
+    systemd-analyze calendar "$1" >/dev/null 2>&1
+}
+
+ask_calendar() {  # $1=Prompt  $2=Default -> echo OnCalendar (leer = aus)
+    local v
+    while true; do
+        v="$(ask "$1" "$2")"
+        [ "$v" = "-" ] && v=""
+        valid_calendar "$v" && { echo "$v"; return; }
+        bad "Kein gültiger OnCalendar-Ausdruck (Beispiel: '*-*-* 03:30' oder 'Sun 04:00')." >&2
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Update von GitHub (git, nur Fast-Forward)
+# ---------------------------------------------------------------------------
+g() { GIT_TERMINAL_PROMPT=0 git -C "$DIR" "$@"; }
+ver_of() { sed -n 's/^__version__ = "\(.*\)"/\1/p' | head -1; }      # liest stdin
+ver_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+
+# Schlüssel=Wert-Paare in update_status.json mischen; ok=… setzt auch den Zeitstempel
+upd_status() {
+    [ -n "$PY" ] || return 0
+    "$PY" - "$UPD_STATUS" "$@" <<'EOF' 2>/dev/null || true
+import json, os, sys, time
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as f:
+        st = json.load(f)
+    if not isinstance(st, dict):
+        st = {}
+except (OSError, ValueError):
+    st = {}
+for arg in sys.argv[2:]:
+    k, _, v = arg.partition("=")
+    st[k] = (v == "1") if k == "ok" else v
+    if k == "ok":
+        st["ts"] = int(time.time())
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(st, f, ensure_ascii=False)
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+EOF
+}
+
+# Neuen Stand nach FETCH_HEAD holen: erst über origin – ohne Rückfragen, im
+# Timer gibt es weder Terminal noch ssh-agent –, sonst über die öffentliche
+# HTTPS-Adresse des Repos.
+git_fetch() {
+    g -c core.sshCommand="ssh -o BatchMode=yes -o ConnectTimeout=10" \
+        fetch -q origin "$UPD_BRANCH" 2>/dev/null && return 0
+    g fetch -q "https://github.com/$UPD_REPO.git" "$UPD_BRANCH"
+}
+
+upd_fail() { bad "$1"; upd_status ok=0 "message=$1" "mode=$UPD_MODE"; }
+
+# $1 = manual | auto.  Rückgabe 0 = aktualisiert oder nichts zu tun, 1 = Fehler.
+# Auto aktualisiert nur auf eine neue __version__, nicht auf jeden Commit.
+run_update() {
+    UPD_MODE="$1"
+    local cur new branch dirty changed n f restart=0
+
+    command -v git >/dev/null 2>&1 || { upd_fail "git ist nicht installiert"; return 1; }
+    [ -d "$DIR/.git" ] || { upd_fail "$DIR ist kein git-Checkout (Update nur für per git clone installierte Kopien)"; return 1; }
+    branch="$(g symbolic-ref --short -q HEAD)"
+    if [ "$branch" != "$UPD_BRANCH" ]; then
+        upd_fail "Arbeitskopie steht auf '${branch:-detached HEAD}', Updates kommen von '$UPD_BRANCH'"; return 1
+    fi
+    cur="$(ver_of < "$DIR/vllm_dashboard.sh")"
+    git_fetch || { upd_fail "GitHub nicht erreichbar (git fetch fehlgeschlagen)"; return 1; }
+    new="$(g show FETCH_HEAD:vllm_dashboard.sh 2>/dev/null | ver_of)"
+
+    if [ "$(g rev-parse HEAD)" = "$(g rev-parse FETCH_HEAD)" ]; then
+        ok "Bereits aktuell (${cur:-?})."
+        upd_status ok=1 "message=bereits aktuell (${cur:-?})" "from=$cur" "to=$cur" "mode=$UPD_MODE"
+        return 0
+    fi
+    if ! g merge-base --is-ancestor HEAD FETCH_HEAD; then
+        if g merge-base --is-ancestor FETCH_HEAD HEAD; then
+            ok "Arbeitskopie ist neuer als GitHub (${cur:-?}) – nichts zu tun."
+            upd_status ok=1 "message=lokal neuer als GitHub (${cur:-?})" "from=$cur" "to=$cur" "mode=$UPD_MODE"
+            return 0
+        fi
+        upd_fail "Lokale Commits, die nicht auf GitHub sind – kein Fast-Forward möglich"; return 1
+    fi
+    if [ "$UPD_MODE" = auto ] && ! ver_gt "$new" "$cur"; then
+        ok "Neue Commits, aber keine neue Version (${cur:-?}) – Auto-Update wartet auf die nächste."
+        upd_status ok=1 "message=keine neue Version (${cur:-?})" "from=$cur" "to=$cur" "mode=$UPD_MODE"
+        return 0
+    fi
+    dirty="$(g status --porcelain --untracked-files=no)"
+    n="$(g rev-list --count HEAD..FETCH_HEAD)"
+    if [ "$UPD_MODE" = manual ]; then
+        echo "  Installiert: ${B}${cur:-?}${N}   GitHub ($UPD_BRANCH): ${B}${new:-?}${N}   ($n neue Commits)"
+        g log --oneline --no-decorate -n 15 HEAD..FETCH_HEAD | sed 's/^/    /'
+        if [ -n "$dirty" ]; then
+            warn "Lokale Änderungen an versionierten Dateien:"
+            echo "$dirty" | sed 's/^/      /'
+            warn "git bricht ab, falls das Update dieselben Dateien betrifft."
+        fi
+        [[ "$(ask "Jetzt aktualisieren? [J/n]" "j")" =~ ^[jJyY] ]] || { echo "  ${DIM}Abgebrochen.${N}"; return 0; }
+    elif [ -n "$dirty" ]; then
+        upd_fail "Lokale Änderungen an versionierten Dateien ($(echo "$dirty" | awk '{print $2}' | paste -sd, -)) – Auto-Update ausgesetzt"
+        return 1
+    fi
+
+    changed="$(g diff --name-only HEAD FETCH_HEAD)"
+    if ! g merge -q --ff-only FETCH_HEAD; then
+        upd_fail "git merge --ff-only fehlgeschlagen"; return 1
+    fi
+    ok "Aktualisiert: ${cur:-?} → ${new:-?}"
+    upd_status ok=1 "message=aktualisiert ${cur:-?} → ${new:-?}" "from=$cur" "to=$new" "mode=$UPD_MODE"
+
+    for f in "${UPD_RUNTIME[@]}"; do
+        grep -qx "$f" <<<"$changed" && restart=1
+    done
+    if [ "$restart" = 1 ] && [ -f "$UNIT_DIR/vllm-collector.service" ]; then
+        if systemctl --user restart "${SERVICES[@]}" 2>/dev/null; then
+            ok "Dienste neu gestartet."
+        else
+            upd_fail "Aktualisiert auf ${new:-?}, aber Dienste konnten nicht neu gestartet werden"; return 1
+        fi
+    fi
+    grep -qx "setup.sh" <<<"$changed" && \
+        warn "setup.sh wurde geändert – Installieren (Punkt 1) erneut ausführen, damit neue Dienst-Optionen greifen."
+    return 0
+}
+
+do_update() {
+    echo "${B}== Aktualisieren (GitHub $UPD_REPO, $UPD_BRANCH) ==${N}"
+    run_update manual
+}
+
+# Für den Timer: keine Rückfragen, nie zwei Läufe gleichzeitig
+do_auto_update() {
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"${XDG_RUNTIME_DIR:-/tmp}/vllm-monitor-update.lock"
+        flock -n 9 || { echo "Update läuft bereits."; return 0; }
+    fi
+    run_update auto
+}
+
+# Timer für das automatische Update (User-Units neben den Diensten)
+write_update_timer() {  # $1 = OnCalendar (leer = entfernen)
+    local when="$1"
+    upd_status "auto=$when"
+    if [ -z "$when" ]; then
+        systemctl --user disable --now "$UPD_UNIT.timer" 2>/dev/null
+        rm -f "$UNIT_DIR/$UPD_UNIT.service" "$UNIT_DIR/$UPD_UNIT.timer"
+        systemctl --user daemon-reload 2>/dev/null
+        return 0
+    fi
+    mkdir -p "$UNIT_DIR"
+    cat > "$UNIT_DIR/$UPD_UNIT.service" <<EOF
+[Unit]
+Description=vLLM Monitor – automatisches Update von GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$DIR
+Environment=VLLM_UPDATE_REPO=$UPD_REPO
+Environment=VLLM_UPDATE_BRANCH=$UPD_BRANCH
+ExecStart=$(command -v bash) $DIR/setup.sh auto-update
+EOF
+    cat > "$UNIT_DIR/$UPD_UNIT.timer" <<EOF
+[Unit]
+Description=Zeitplan für das automatische Update von vLLM Monitor
+
+[Timer]
+OnCalendar=$when
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload
+    if systemctl --user enable --now "$UPD_UNIT.timer" 2>/dev/null; then
+        ok "Auto-Update aktiv: $when (Log: journalctl --user -u $UPD_UNIT)"
+    else
+        warn "Auto-Update-Timer konnte nicht aktiviert werden."
+    fi
+}
+
+do_autoupdate_cfg() {
+    echo "${B}== Automatisches Update ==${N}"
+    [ -f "$CONF" ] && . "$CONF" 2>/dev/null
+    if [ ! -d "$DIR/.git" ]; then
+        bad "$DIR ist kein git-Checkout – automatisches Update nicht möglich (git clone verwenden)."; return 1
+    fi
+    echo "  ${DIM}Holt nach Zeitplan neue Versionen von GitHub ($UPD_REPO, $UPD_BRANCH) und startet"
+    echo "  die Dienste neu. Lokale Änderungen oder eigene Commits setzen es aus – das Dashboard"
+    echo "  zeigt dann „Auto-Update fehlgeschlagen“. '-' schaltet es ab.${N}"
+    local when; when="$(ask_calendar "Zeitplan (systemd OnCalendar)" "${VLLM_AUTOUPDATE:-*-*-* 03:30}")"
+    conf_set VLLM_AUTOUPDATE "$when"
+    write_update_timer "$when"
+    [ -z "$when" ] && ok "Auto-Update aus."
+}
+
+# ---------------------------------------------------------------------------
 # Installation
 # ---------------------------------------------------------------------------
 do_install() {
@@ -177,9 +400,10 @@ do_install() {
     local D_AI_URL="${VLLM_AI_URL:-}"
     local D_AI_MODEL="${VLLM_AI_MODEL:-}"
     local D_REPORT="${VLLM_REPORT:-}"
+    local D_AUTOUPD="${VLLM_AUTOUPDATE-}" D_UPDCHK="${VLLM_UPDATE_CHECK:-j}"
 
     echo
-    local ip targets bind port https="n" ans ollama stt lmstudio dcgm ai_url ai_model report_when
+    local ip targets bind port https="n" ans ollama stt lmstudio dcgm ai_url ai_model report_when autoupd updchk
     while true; do
         ip="$(ask "Ziel-IP des vLLM-Hosts" "$D_IP")"
         if valid_ip "$ip"; then break; fi
@@ -199,6 +423,13 @@ do_install() {
     [ -n "$ai_url" ] && report_when="$(ask "Geplanter KI-Schicht-Report? systemd OnCalendar (z.B. '*-*-* 06,14,22:00', leer=aus)" "$D_REPORT")"
     bind="$(ask "Dashboard-Bind (0.0.0.0=Netz, 127.0.0.1=nur lokal)" "$D_BIND")"
     port="$(ask "Dashboard-Port" "$D_PORT")"
+    updchk="$(ask "Update-Hinweis im Dashboard (prüft GitHub alle 6 h)? [j/n]" "$D_UPDCHK")"
+    [[ "${updchk,,}" == j* || "${updchk,,}" == y* ]] && updchk="j" || updchk="n"
+    if [ -d "$DIR/.git" ]; then
+        autoupd="$(ask_calendar "Automatisches Update von GitHub? systemd OnCalendar (z.B. '*-*-* 03:30', '-'=aus)" "$D_AUTOUPD")"
+    else
+        autoupd=""; warn "Kein git-Checkout – automatisches Update nicht möglich (git clone verwenden)."
+    fi
     # Zertifikat muss auf die Adresse lauten, die der BROWSER aufruft (Dashboard-Host)
     local dash_ip="$bind"
     [ "$bind" = "0.0.0.0" ] && dash_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -216,19 +447,22 @@ do_install() {
     fi
 
     # merken
+    # gequotet: OnCalendar-Ausdrücke enthalten Leerzeichen
     cat > "$CONF" <<EOF
-VLLM_HOST=$ip
-VLLM_TARGETS=$targets
-VLLM_OLLAMA=$ollama
-VLLM_STT=$stt
-VLLM_LMSTUDIO=$lmstudio
-VLLM_DCGM=$dcgm
-VLLM_AI_URL=$ai_url
-VLLM_AI_MODEL=$ai_model
-VLLM_REPORT=$report_when
-VLLM_BIND=$bind
-VLLM_PORT=$port
-VLLM_HTTPS=$https
+VLLM_HOST='$ip'
+VLLM_TARGETS='$targets'
+VLLM_OLLAMA='$ollama'
+VLLM_STT='$stt'
+VLLM_LMSTUDIO='$lmstudio'
+VLLM_DCGM='$dcgm'
+VLLM_AI_URL='$ai_url'
+VLLM_AI_MODEL='$ai_model'
+VLLM_REPORT='$report_when'
+VLLM_AUTOUPDATE='$autoupd'
+VLLM_UPDATE_CHECK='$updchk'
+VLLM_BIND='$bind'
+VLLM_PORT='$port'
+VLLM_HTTPS='$https'
 EOF
 
     mkdir -p "$UNIT_DIR"
@@ -269,6 +503,8 @@ EOF
 
     local tls_env=""
     [ "$https" = "j" ] && tls_env="Environment=VLLM_TLS_CERT=$CERT"$'\n'"Environment=VLLM_TLS_KEY=$KEY"
+    local upd_env=""
+    [ "$updchk" = "n" ] && upd_env="Environment=VLLM_UPDATE_CHECK=0"
     local ai_env=""
     [ -n "$ai_url" ] && ai_env="Environment=VLLM_AI_URL=$ai_url"$'\n'"Environment=VLLM_AI_MODEL=$ai_model"$'\n'"Environment=VLLM_AI_NO_THINK=1"
 
@@ -283,6 +519,7 @@ WorkingDirectory=$DIR
 Environment=VLLM_LABEL=$ip
 ${tls_env}
 ${ai_env}
+${upd_env}
 ExecStart=$PY $DIR/vllm_dashboard.sh $port $bind
 Restart=always
 RestartSec=10
@@ -334,6 +571,8 @@ EOF
         return 1
     fi
 
+    write_update_timer "$autoupd"
+
     # Autostart ohne Login
     if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
         if sudo loginctl enable-linger "$USER" 2>/dev/null; then
@@ -365,11 +604,12 @@ do_uninstall() {
     fi
 
     systemctl --user disable --now "${SERVICES[@]}" 2>/dev/null
-    systemctl --user disable --now vllm-report.timer 2>/dev/null
+    systemctl --user disable --now vllm-report.timer "$UPD_UNIT.timer" 2>/dev/null
     for s in "${SERVICES[@]}"; do rm -f "$UNIT_DIR/$s"; done
-    rm -f "$UNIT_DIR/vllm-report.service" "$UNIT_DIR/vllm-report.timer"
+    rm -f "$UNIT_DIR/vllm-report.service" "$UNIT_DIR/vllm-report.timer" \
+          "$UNIT_DIR/$UPD_UNIT.service" "$UNIT_DIR/$UPD_UNIT.timer" "$UPD_STATUS"
     systemctl --user daemon-reload
-    systemctl --user reset-failed "${SERVICES[@]}" vllm-report.timer 2>/dev/null
+    systemctl --user reset-failed "${SERVICES[@]}" vllm-report.timer "$UPD_UNIT.service" "$UPD_UNIT.timer" 2>/dev/null
     ok "Dienste gestoppt, deaktiviert und Unit-Dateien entfernt."
 
     local a
@@ -427,6 +667,20 @@ do_status() {
         echo "  ${DIM}Ziel: ${VLLM_HOST:-?}  URL: ${sch}://…:${VLLM_PORT:-?}  Bind: ${VLLM_BIND:-?}${N}"
     fi
     [ -f "$CERT" ] && ok "TLS-Zertifikat vorhanden ($CERT)" || echo "  ${DIM}Kein TLS-Zertifikat.${N}"
+    echo "  ${DIM}Version: $(ver_of < "$DIR/vllm_dashboard.sh")${N}"
+    if [ -f "$UNIT_DIR/$UPD_UNIT.timer" ]; then
+        ok "Auto-Update: $(sed -n 's/^OnCalendar=//p' "$UNIT_DIR/$UPD_UNIT.timer")" \
+           "– nächster Lauf: $(systemctl --user show -p NextElapseUSecRealtime --value "$UPD_UNIT.timer" 2>/dev/null)"
+    else
+        echo "  ${DIM}Auto-Update aus.${N}"
+    fi
+    [ -f "$UPD_STATUS" ] && [ -n "$PY" ] && "$PY" - "$UPD_STATUS" <<'EOF' 2>/dev/null
+import json, sys, time
+st = json.load(open(sys.argv[1], encoding="utf-8"))
+if st.get("ts"):
+    print("  Letzter Update-Lauf %s: %s%s" % (time.strftime("%d.%m.%Y %H:%M", time.localtime(st["ts"])),
+          "" if st.get("ok") else "FEHLER – ", st.get("message", "")))
+EOF
 }
 
 # ---------------------------------------------------------------------------
@@ -443,6 +697,8 @@ menu() {
         echo "  3) Status anzeigen"
         echo "  4) Abhängigkeiten prüfen"
         echo "  5) TLS-Zertifikat (neu) erzeugen"
+        echo "  6) Aktualisieren (neue Version von GitHub)"
+        echo "  7) Automatisches Update einrichten/ändern"
         echo "  0) Beenden"
         local c ipp; read -rp "Auswahl: " c || exit 0
         echo
@@ -454,10 +710,20 @@ menu() {
             5) [ -f "$CONF" ] && . "$CONF" 2>/dev/null
                ipp="$(ask "IP/Hostname für das Zertifikat" "${VLLM_HOST:-127.0.0.1}")"; gen_cert "$ipp"
                warn "Nach dem Erzeugen ggf. neu installieren (Punkt 1) und HTTPS wählen."; pause;;
+            6) do_update; pause;;
+            7) do_autoupdate_cfg; pause;;
             0) exit 0;;
             *) warn "Ungültige Auswahl.";;
         esac
     done
 }
 
-menu
+case "${1:-}" in
+    install)     do_install ;;
+    update)      do_update ;;
+    auto-update) do_auto_update ;;
+    status)      do_status ;;
+    uninstall)   do_uninstall ;;
+    "")          menu ;;
+    *) echo "Aufruf: $0 [install|update|auto-update|status|uninstall]   (ohne Argument: Menü)"; exit 1 ;;
+esac

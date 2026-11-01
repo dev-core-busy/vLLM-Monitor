@@ -27,6 +27,7 @@ import sys
 import ssl
 import json
 import math
+import re
 import time
 import html
 import hmac
@@ -39,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 
-__version__ = "0.32.0"
+__version__ = "0.33.0"
 
 DB_PATH = os.environ.get("VLLM_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "vllm_metrics.db")
@@ -70,6 +71,18 @@ ALERT_OFFLINE_MIN = float(os.environ.get("VLLM_ALERT_OFFLINE_MIN", "1"))
 REPORT_DIR = os.environ.get("VLLM_REPORT_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "reports")
 REPORT_RANGE = int(os.environ.get("VLLM_REPORT_RANGE", str(8 * 3600)))
+
+# Update-Prüfung: vergleicht __version__ mit dem Stand auf GitHub – nur ein
+# Hinweis, installiert wird nichts. Aktualisiert wird per setup.sh bzw.
+# docker_setup.sh (update / Auto-Update-Timer); beide legen den Zeitplan des
+# Timers („auto") und das Ergebnis des letzten Laufs in UPDATE_STATUS_FILE ab,
+# damit ein gescheitertes Auto-Update im Dashboard auffällt.
+UPDATE_CHECK = os.environ.get("VLLM_UPDATE_CHECK", "1").lower() not in ("0", "false", "no", "off", "")
+UPDATE_REPO = os.environ.get("VLLM_UPDATE_REPO", "dev-core-busy/vLLM-Monitor")
+UPDATE_BRANCH = os.environ.get("VLLM_UPDATE_BRANCH", "main")
+UPDATE_EVERY = int(os.environ.get("VLLM_UPDATE_EVERY", str(6 * 3600)))
+UPDATE_STATUS_FILE = os.environ.get("VLLM_UPDATE_STATUS_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(DB_PATH)), "update_status.json")
 
 # --- Authentifizierung: lokale Nutzer + optional LDAP/AD; alles in auth.json ---
 # Auth ist IMMER aktiv (Default-Konto admin/admin, Passwortwechsel erzwungen).
@@ -592,7 +605,7 @@ def build_energy(range_s=None, start=None, end=None, everything=False):
 
 def build_config():
     if not os.path.exists(DB_PATH):
-        return {"instances": []}
+        return {"instances": [], "update": update_public()}
     now = int(time.time())
     conn = _connect()
     inst = []
@@ -672,7 +685,7 @@ def build_config():
     # ausgeliefert – nur, ob einer gesetzt ist.
     return {"now": now * 1000, "instances": inst, "ai": ai_public(),
             "thresholds": load_thresholds(), "collector": collector,
-            "history": build_history()}
+            "history": build_history(), "update": update_public()}
 
 
 def build_history():
@@ -693,6 +706,62 @@ def build_history():
     finally:
         conn.close()
     return res
+
+
+_update = {"latest": None, "checked": None, "error": None}
+_update_lock = threading.Lock()
+
+
+def _ver_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+
+
+def check_update():
+    """Liest __version__ aus dem Kopf von vllm_dashboard.sh auf GitHub. Per
+    Range-Header nur die ersten 8 KB – die Datei selbst ist mehrere 100 KB groß.
+    Anders als bei den überwachten Servern wird das Zertifikat hier geprüft."""
+    url = "https://raw.githubusercontent.com/%s/%s/vllm_dashboard.sh" % (UPDATE_REPO, UPDATE_BRANCH)
+    req = urlrequest.Request(url, headers={"Range": "bytes=0-8191",
+                                           "User-Agent": "vllm-monitor/" + __version__})
+    latest, err = None, None
+    try:
+        with urlrequest.urlopen(req, timeout=15) as r:
+            head = r.read(8192).decode("utf-8", "replace")
+        m = re.search(r'^__version__ = "([^"]+)"', head, re.M)
+        if m:
+            latest = m.group(1)
+        else:
+            err = "keine Versionsangabe gefunden"
+    except Exception as e:
+        err = str(getattr(e, "reason", None) or e)[:200]
+    with _update_lock:
+        if latest:
+            _update["latest"] = latest
+        _update["error"] = err
+        _update["checked"] = int(time.time())
+
+
+def _read_update_status():
+    try:
+        with open(UPDATE_STATUS_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def update_public():
+    with _update_lock:
+        u = dict(_update)
+    lat = u["latest"]
+    run = _read_update_status() or {}
+    docker = os.path.exists("/.dockerenv")
+    return {"enabled": UPDATE_CHECK, "current": __version__, "latest": lat,
+            "available": bool(lat) and _ver_tuple(lat) > _ver_tuple(__version__),
+            "checked": u["checked"] * 1000 if u["checked"] else None, "error": u["error"],
+            "url": "https://github.com/%s/blob/%s/CHANGELOG.md" % (UPDATE_REPO, UPDATE_BRANCH),
+            "command": "sudo ./docker_setup.sh update" if docker else "./setup.sh update",
+            "auto": run.get("auto") or None, "last_run": run if run.get("ts") else None}
 
 
 _tokens_cache = None      # (erzeugt_ts, ergebnis) – teure Volltabellen-Aggregation cachen
@@ -2648,6 +2717,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "ungültige Anfrage"})
                 return
             self._json(ai_test(body))
+        elif parsed.path == "/api/update/check":
+            check_update()
+            self._json(update_public())
         elif parsed.path == "/api/annotations":
             body = self._read_body()
             if body is None:
@@ -3030,7 +3102,8 @@ PAGE = r"""<!DOCTYPE html>
   <label class="ctl" id="hostfilterwrap" title="Auf einen Host filtern (Instanzen, KPI-Karten, Diagramme)." style="display:none">Host
     <select id="hostfilter"><option value="">Alle Hosts</option></select>
   </label>
-  <span style="font-size:11px;color:var(--muted)">v__VERSION__</span>
+  <span id="verlbl" style="font-size:11px;color:var(--muted)">v__VERSION__</span>
+  <span id="updstat" style="font-size:11px"></span>
   <span id="collstat" title="Status des Metrik-Collectors (Self-Monitoring)" style="font-size:11px"></span>
   <label class="ctl" title="Zeitfenster, das in allen Diagrammen dargestellt wird. Bei großen Fenstern werden die Daten automatisch verdichtet (Downsampling).">Zeitraum
     <select id="range" title="Zeitfenster der Diagramme (15 min bis 7 Tage; „heute“ = seit Mitternacht, „seit Beginn“ = älteste noch gespeicherte Messung)">
@@ -4189,7 +4262,46 @@ function renderCollector(){
     +(c.errors?(" · "+c.errors+" Fehler"):"");
   el.style.color="var(--bad)";
 }
-async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderHostFilter();renderInstances();renderKPIs();renderCollector();renderHistory();}catch(e){}}
+// Update-Hinweis: neuere Version auf GitHub bzw. gescheitertes Auto-Update.
+// Installiert wird nichts – der Tooltip nennt den Befehl auf dem Server.
+function renderUpdate(u){
+  const lbl=document.getElementById("verlbl"), el=document.getElementById("updstat");
+  if(!lbl||!el)return;
+  u=u||(lastConfig&&lastConfig.update);
+  if(!u){ el.innerHTML=""; return; }
+  const run=u.last_run, t=[];
+  if(!u.enabled) t.push("Update-Prüfung abgeschaltet (VLLM_UPDATE_CHECK=0)");
+  else if(u.error&&!u.latest) t.push("Update-Prüfung fehlgeschlagen: "+u.error);
+  else if(u.latest) t.push(u.available?("Neue Version "+u.latest+" verfügbar"):"Aktuell (GitHub: "+u.latest+")");
+  if(u.checked) t.push("geprüft "+fmtTime(u.checked));
+  t.push(u.auto?("Auto-Update aktiv: "+u.auto):"Auto-Update aus");
+  if(run&&run.ts) t.push("letzter Update-Lauf "+fmtTime(run.ts*1000)+": "+(run.message||(run.ok?"ok":"Fehler")));
+  if(document.body.classList.contains("is-admin")) t.push("Klick: jetzt prüfen");
+  lbl.title=t.join("\n");
+  lbl.style.cursor=document.body.classList.contains("is-admin")?"pointer":"";
+  el.innerHTML="";
+  if(run&&run.ok===false){
+    const w=document.createElement("span");
+    w.textContent="⚠ Auto-Update fehlgeschlagen"; w.style.color="var(--bad)";
+    w.title=(run.message||"")+"\n"+fmtTime(run.ts*1000);
+    el.appendChild(w);
+  } else if(u.available){
+    const a=document.createElement("a");
+    a.href=u.url; a.target="_blank"; a.rel="noopener";
+    a.textContent="⬆ "+u.latest+" verfügbar"; a.style.color="var(--accent)";
+    a.title="Neue Version "+u.latest+" (installiert: "+u.current+") – Klick öffnet das Changelog.\n"
+      +"Aktualisieren auf dem Server: "+u.command+(u.auto?("\nAuto-Update läuft: "+u.auto):"");
+    el.appendChild(a);
+  }
+}
+document.getElementById("verlbl").addEventListener("click",async()=>{
+  if(!document.body.classList.contains("is-admin"))return;
+  const lbl=document.getElementById("verlbl"); lbl.style.opacity=".5";
+  try{ const u=await(await fetch("/api/update/check",{method:"POST"})).json();
+    if(lastConfig) lastConfig.update=u; renderUpdate(u); }catch(e){}
+  lbl.style.opacity="";
+});
+async function fetchConfig(){try{lastConfig=await(await fetch("/api/config")).json();renderHostFilter();renderInstances();renderKPIs();renderCollector();renderUpdate();renderHistory();}catch(e){}}
 // 'YYYY-MM-DD' bzw. Epoch-ms -> „01.10.2026" (Mittag, damit keine Zeitzone den Tag verschiebt)
 function fmtDay(v){ const d=typeof v==="number"?new Date(v):new Date(v+"T12:00:00");
   return d.toLocaleDateString("de-DE",{day:"2-digit",month:"2-digit",year:"numeric"}); }
@@ -5937,6 +6049,15 @@ def main():
                 print("  [!] Tagesarchiv fehlgeschlagen: %s" % e)
             time.sleep(ARCHIVE_EVERY)
     threading.Thread(target=_archiver, name="tagesarchiv", daemon=True).start()
+
+    def _updater():
+        while True:
+            check_update()
+            if _update["error"]:
+                print("  [!] Update-Prüfung (%s) fehlgeschlagen: %s" % (UPDATE_REPO, _update["error"]))
+            time.sleep(UPDATE_EVERY)
+    if UPDATE_CHECK:
+        threading.Thread(target=_updater, name="update-pruefung", daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

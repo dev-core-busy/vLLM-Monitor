@@ -4,6 +4,40 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.33.0] – 2026-11-01
+
+### Neu
+- **Update von GitHub.** `./setup.sh update` bzw. `sudo ./docker_setup.sh update`
+  zeigen installierte und neue Version samt neuen Commits und spielen den Stand
+  per `git` (nur Fast-Forward) ein. Danach starten sie die Dienste neu, bei
+  Docker wird das Image neu gebaut und die Container werden ersetzt. Beides
+  geschieht nur, wenn sich die betroffenen Dateien tatsächlich geändert haben.
+  `setup.sh` hatte bisher gar keinen Update-Weg; bei `docker_setup.sh` war das
+  `git pull` nur eine Rückfrage mit Vorgabe „nein“.
+- **Automatisches Update** nach systemd-Zeitplan (`OnCalendar`, Vorgabe
+  `*-*-* 03:30`). Es wird bei der Installation abgefragt oder über den neuen
+  Menüpunkt 7 eingerichtet: User-Timer `vllm-update.timer` bzw. Host-Timer
+  `vllm-monitor-update.timer`. Eingespielt wird nur eine neue Version, nicht
+  jeder Commit. Bei lokalen Änderungen, eigenen Commits oder einem anderen
+  Branch setzt es aus. Ist SSH ohne Agent nicht nutzbar, holt es das öffentliche
+  Repo per HTTPS.
+- **Update-Hinweis im Dashboard.** Der Server vergleicht alle 6 h die eigene
+  Version mit `main` auf GitHub; dafür lädt er nur die ersten 8 KB einer Datei.
+  Neben der Versionsnummer erscheint dann „⬆ x.y.z verfügbar“ mit Link zum
+  Changelog, ein gescheiterter Auto-Update-Lauf als „⚠ Auto-Update
+  fehlgeschlagen“ mit Grund. Admins können per Klick auf die Versionsnummer
+  sofort prüfen (`POST /api/update/check`). `/api/config` liefert das unter
+  `update`. Abschaltbar mit `VLLM_UPDATE_CHECK=0` (wird bei der Installation
+  abgefragt).
+- `update_status.json` (neben der DB bzw. in `/data`) hält Zeitplan und
+  Ergebnis des letzten Update-Laufs fest. `setup.sh status` und
+  `docker_setup.sh status` zeigen beides an.
+
+### Behoben
+- `setup.sh` schrieb seine gemerkten Antworten ungequotet. Ein Report-Zeitplan
+  mit Leerzeichen (`*-*-* 06,14,22:00`) ließ sich deshalb nicht wieder einlesen
+  und ging als Vorgabe verloren.
+
 ## [0.32.0] – 2026-10-31
 
 ### Neu

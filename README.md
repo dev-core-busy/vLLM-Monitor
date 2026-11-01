@@ -30,6 +30,7 @@ KV-Cache-Auslastung, Requests, Token-Durchsatz, Latenzen und Cache-Hit-Rate.
 - [Dashboard](#dashboard)
 - [Als Dienst betreiben (systemd)](#als-dienst-betreiben-systemd)
 - [Als Docker-Container betreiben (Debian 13)](#als-docker-container-betreiben-debian-13)
+- [Aktualisieren](#aktualisieren)
 - [Datenbank](#datenbank)
 - [Discovery- und Inspektions-Tools](#discovery--und-inspektions-tools)
 - [Einschränkungen & Roadmap](#einschränkungen--roadmap)
@@ -233,6 +234,10 @@ Dashboard:
 | `VLLM_AUTH_TTL` | `300` | Sekunden, wie lange eine erfolgreiche Basic-Auth-Prüfung (Scraper) server-seitig gecacht wird. |
 | `VLLM_AUTH_COOKIE_DAYS` | `7` | Gültigkeit des persistenten Session-Cookies (gleitend verlängert) – kein wiederholtes Login. |
 | `VLLM_AUTH_SECRET` | *(auto)* | HMAC-Secret für die Session-Cookies; ohne Angabe wird eins in `.auth_secret` erzeugt/gespeichert. |
+| `VLLM_UPDATE_CHECK` | `1` | Update-Hinweis: prüft regelmäßig die Version auf GitHub (`0` = aus, dann geht keine Anfrage nach außen). Siehe [Aktualisieren](#aktualisieren). |
+| `VLLM_UPDATE_REPO` / `_BRANCH` | `dev-core-busy/vLLM-Monitor` / `main` | Woher Update-Hinweis und `setup.sh update` den neuen Stand holen |
+| `VLLM_UPDATE_EVERY` | `21600` | Prüfintervall des Update-Hinweises in Sekunden (6 h) |
+| `VLLM_UPDATE_STATUS_FILE` | `update_status.json` (neben der DB) | Zeitplan und Ergebnis des letzten Update-Laufs; schreiben `setup.sh`/`docker_setup.sh`, das Dashboard zeigt es an |
 
 **Geplanter KI-Schicht-Report:** `python3 vllm_dashboard.sh report [sekunden]`
 erzeugt einen deutschen Betriebs-Report (Kennzahlen + Alarme + KI-Bewertung) und
@@ -298,9 +303,11 @@ scrape_configs:
 
 Das Menü bietet: **Abhängigkeitsprüfung**, **Installation** (fragt Ziel-IP,
 Instanzen, Bind und Port ab, legt beide systemd-**User**-Services an, startet sie
-und aktiviert Linger für Autostart nach Reboot) sowie **vollständige
-Deinstallation** (Dienste entfernen, optional Datenbank/Einstellungen/Linger).
-Zuletzt genutzte Werte werden als Vorgabe gemerkt.
+und aktiviert Linger für Autostart nach Reboot), **Aktualisieren** und
+**automatisches Update** (siehe [Aktualisieren](#aktualisieren)) sowie
+**vollständige Deinstallation** (Dienste entfernen, optional
+Datenbank/Einstellungen/Linger). Zuletzt genutzte Werte werden als Vorgabe
+gemerkt. Ohne Menü: `./setup.sh install | update | auto-update | status | uninstall`.
 
 Alternativ von Hand — Beispiel für den Collector:
 
@@ -340,7 +347,7 @@ Alternativ zu den systemd-User-Diensten läuft der Monitor als zwei Container
 
 ```bash
 sudo ./docker_setup.sh            # Menü: Installieren, Aktualisieren, Status, Logs, …
-sudo ./docker_setup.sh install    # oder direkt: install | update | status | logs | uninstall
+sudo ./docker_setup.sh install    # oder direkt: install | update | auto-update | status | logs | uninstall
 ```
 
 Das Skript installiert bei Bedarf Docker (Debian-Paket `docker.io`), fragt
@@ -373,6 +380,38 @@ docker logs -f vllm-monitor-collector
 docker exec vllm-monitor-dashboard /app/docker-entrypoint.sh annotate "Deploy v2"
 docker exec -it vllm-monitor-dashboard python3 /app/monitor.sh 192.168.1.10 8000
 ```
+
+## Aktualisieren
+
+Voraussetzung ist eine per `git clone` angelegte Arbeitskopie auf dem Branch
+`main`. Aktualisiert wird immer per **Fast-Forward**; lokale Commits oder
+Änderungen werden nie überschrieben.
+
+| | systemd (`setup.sh`) | Docker (`docker_setup.sh`) |
+|---|---|---|
+| Von Hand | `./setup.sh update` (Menü 6) | `sudo ./docker_setup.sh update` (Menü 2) |
+| Automatisch | Menü 7 oder bei der Installation: User-Timer `vllm-update.timer` | Menü 7 oder bei der Installation: Host-Timer `vllm-monitor-update.timer` |
+| Danach | Collector + Dashboard neu starten (nur wenn sich ihre Skripte geändert haben) | Image neu bauen, Container ersetzen, Healthcheck abwarten (nur wenn sich eine Datei des Images geändert hat) |
+| Log | `journalctl --user -u vllm-update` | `journalctl -u vllm-monitor-update` |
+
+- **Von Hand** zeigt `update` die installierte und die neue Version mit den
+  neuen Commits an und fragt vor dem Einspielen nach. Bei Docker lässt sich das
+  Image auch ohne neuen Stand aus der lokalen Arbeitskopie neu bauen.
+- **Automatisch** läuft das Update nach einem frei wählbaren systemd-Zeitplan
+  (`OnCalendar`, Vorgabe `*-*-* 03:30`, ±15 min Streuung, verpasste Läufe werden
+  nachgeholt). Es spielt nur eine **neue Version** ein (höhere `__version__`),
+  nicht jeden Zwischen-Commit. Es setzt aus statt zu raten, wenn versionierte
+  Dateien lokal geändert sind, eigene Commits vorliegen oder ein anderer Branch
+  ausgecheckt ist. `origin` wird ohne Rückfrage angesprochen (SSH im
+  `BatchMode`). Klappt das nicht, etwa weil der SSH-Key eine Passphrase hat und
+  kein Agent läuft, wird das öffentliche Repo per HTTPS geholt.
+- **Im Dashboard** prüft der Server alle 6 h die Version auf GitHub. Gibt es eine
+  neuere, steht neben der Versionsnummer **„⬆ x.y.z verfügbar“** (Link zum
+  Changelog, der Tooltip nennt den Befehl). Ein gescheitertes Auto-Update
+  erscheint als **„⚠ Auto-Update fehlgeschlagen“** mit dem Grund. Der Tooltip der
+  Versionsnummer zeigt den Zeitplan und den letzten Lauf; Admins prüfen per Klick
+  darauf sofort. Das Dashboard selbst installiert nichts. `VLLM_UPDATE_CHECK=0`
+  (bei der Installation abgefragt) schaltet die Prüfung ab.
 
 ## Datenbank
 
@@ -464,8 +503,11 @@ CORS/OPTIONS, Embeddings/Rerank …) und stellt sie je nach erkanntem Servertyp
 - **Nur mit HTTPS betreiben** – sonst gehen Zugangsdaten im Klartext übers Netz.
   Bei Bind an `0.0.0.0` zusätzlich per Firewall/Reverse-Proxy absichern.
 - Die Tools senden **keine** Metrikdaten nach außen; alles bleibt lokal in der
-  SQLite-DB. (Ausnahme: die optionale KI-Auswertung ruft den konfigurierten
-  Chat-Endpunkt auf, und die LDAP-Anmeldung spricht mit dem Domain-Controller.)
+  SQLite-DB. (Ausnahmen: die optionale KI-Auswertung ruft den konfigurierten
+  Chat-Endpunkt auf, die LDAP-Anmeldung spricht mit dem Domain-Controller, und
+  der Update-Hinweis lädt alle 6 h die ersten 8 KB von `vllm_dashboard.sh` von
+  `raw.githubusercontent.com`. Dabei wird nichts übertragen außer der
+  installierten Version im User-Agent; `VLLM_UPDATE_CHECK=0` schaltet das ab.)
 
 ### HTTPS
 

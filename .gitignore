@@ -26,3 +26,5 @@ auth.json
 settings.json
 prefs.json
 prefs.json.tmp
+update_status.json
+update_status.json.tmp

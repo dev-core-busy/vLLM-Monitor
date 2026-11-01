@@ -419,6 +419,27 @@ is a separate collector source. **TODO (deferred):** GPU→model attribution
 (calendar-day buckets). `.dockerignore` is an allow-list — **new scripts that
 belong in the image must be added there and to the `COPY` line.**
 
+**Updates from GitHub.** `setup.sh update` / `docker_setup.sh update` (menu,
+or `auto-update` for the systemd timer `vllm-update.timer` (user) /
+`vllm-monitor-update.timer` (host)) share one `run_update manual|auto`
+implementation (duplicated in both scripts): fetch into `FETCH_HEAD` — `origin`
+with SSH `BatchMode`, falling back to the public HTTPS URL because a timer has no
+ssh-agent —, then **fast-forward only**. Auto mode only takes a higher
+`__version__` (not every commit) and refuses on dirty tracked files, local
+commits or another branch. Services are restarted / the image rebuilt only when
+files they contain changed (`UPD_RUNTIME` / `UPD_IMAGE`). `docker_setup.sh` runs
+as root, so every git call goes through `g()` → `runuser` as the checkout's owner
+(git's "dubious ownership" check, owner's SSH key). Both write
+`update_status.json` next to the DB (`upd_status key=value …`; `auto` = timer
+schedule, `ok`/`message`/`ts` = last run). The dashboard never installs
+anything: `check_update()` (thread, every `VLLM_UPDATE_EVERY`, off with
+`VLLM_UPDATE_CHECK=0`) reads `__version__` from the first 8 KB of
+`raw.githubusercontent.com/…/vllm_dashboard.sh` (Range header, **verified** TLS),
+`update_public()` merges it with the status file into `/api/config.update`, and
+`renderUpdate()` shows "⬆ x.y.z verfügbar" or "⚠ Auto-Update fehlgeschlagen"
+next to `#verlbl` (admins click it → `POST /api/update/check`). Setup answers in
+`.vllm_monitor_setup` are now single-quoted (OnCalendar values contain spaces).
+
 `session.sh` is not a tool — it is a one-line helper that resumes a specific
 Claude Code session (`claude --resume <uuid>`).
 
