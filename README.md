@@ -390,7 +390,8 @@ Voraussetzung ist eine per `git clone` angelegte Arbeitskopie auf dem Branch
 | | systemd (`setup.sh`) | Docker (`docker_setup.sh`) |
 |---|---|---|
 | Von Hand | `./setup.sh update` (Menü 6) | `sudo ./docker_setup.sh update` (Menü 2) |
-| Automatisch | Menü 7 oder bei der Installation: User-Timer `vllm-update.timer` | **bei einer neuen Installation an** (Vorgabe `*-*-* 03:30`, mit `-` abwählbar), ändern über Menü 7: Host-Timer `vllm-monitor-update.timer` |
+| Automatisch | User-Timer `vllm-update.timer` | Host-Timer `vllm-monitor-update.timer` |
+| Vorgabe | **bei einer neuen Installation an** (`*-*-* 03:30`, mit `-` abwählbar), ändern über Menü 7 | dito |
 | Danach | Collector + Dashboard neu starten (nur wenn sich ihre Skripte geändert haben) | Image neu bauen, Container ersetzen, Healthcheck abwarten (nur wenn sich eine Datei des Images geändert hat) |
 | Log | `journalctl --user -u vllm-update` | `journalctl -u vllm-monitor-update` |
 

@@ -4,6 +4,14 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 die Versionierung an [Semantic Versioning](https://semver.org/lang/de/).
 
+## [0.33.2] – 2026-11-01
+
+### Geändert
+- **systemd: Auto-Update ist bei einer neuen Installation ebenfalls an.**
+  `setup.sh` schlägt wie `docker_setup.sh` den Zeitplan `*-*-* 03:30` vor;
+  Enter übernimmt ihn, `-` schaltet ab. Ein bewusst abgeschaltetes
+  Auto-Update bleibt aus. Die Abhängigkeitsprüfung meldet ein fehlendes `git`.
+
 ## [0.33.1] – 2026-11-01
 
 ### Geändert

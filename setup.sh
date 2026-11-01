@@ -91,6 +91,14 @@ check_deps() {
         warn "openssl fehlt – HTTPS/Zertifikat nicht verfügbar (HTTP funktioniert weiterhin)"
     fi
 
+    if [ -d "$DIR/.git" ]; then
+        if command -v git >/dev/null 2>&1; then
+            ok "git vorhanden (für Updates von GitHub)"
+        else
+            warn "git fehlt – Updates von GitHub nicht möglich (sudo apt-get install git)"
+        fi
+    fi
+
     local missing=0
     for f in vllm_collector.sh vllm_dashboard.sh; do
         if [ -f "$DIR/$f" ]; then ok "$f vorhanden"; else bad "$f fehlt in $DIR"; missing=1; fi
@@ -400,7 +408,9 @@ do_install() {
     local D_AI_URL="${VLLM_AI_URL:-}"
     local D_AI_MODEL="${VLLM_AI_MODEL:-}"
     local D_REPORT="${VLLM_REPORT:-}"
-    local D_AUTOUPD="${VLLM_AUTOUPDATE-}" D_UPDCHK="${VLLM_UPDATE_CHECK:-j}"
+    # Auto-Update ist bei einer neuen Installation an; ein bewusst
+    # abgeschaltetes (VLLM_AUTOUPDATE='' in $CONF) bleibt aus.
+    local D_AUTOUPD="${VLLM_AUTOUPDATE-*-*-* 03:30}" D_UPDCHK="${VLLM_UPDATE_CHECK:-j}"
 
     echo
     local ip targets bind port https="n" ans ollama stt lmstudio dcgm ai_url ai_model report_when autoupd updchk
@@ -426,7 +436,7 @@ do_install() {
     updchk="$(ask "Update-Hinweis im Dashboard (prüft GitHub alle 6 h)? [j/n]" "$D_UPDCHK")"
     [[ "${updchk,,}" == j* || "${updchk,,}" == y* ]] && updchk="j" || updchk="n"
     if [ -d "$DIR/.git" ]; then
-        autoupd="$(ask_calendar "Automatisches Update von GitHub? systemd OnCalendar (z.B. '*-*-* 03:30', '-'=aus)" "$D_AUTOUPD")"
+        autoupd="$(ask_calendar "Automatisches Update von GitHub? systemd OnCalendar ('-'=aus)" "$D_AUTOUPD")"
     else
         autoupd=""; warn "Kein git-Checkout – automatisches Update nicht möglich (git clone verwenden)."
     fi
